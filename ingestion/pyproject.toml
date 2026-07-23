@@ -1,0 +1,62 @@
+[project]
+name = "conveyer-ingestion"
+version = "0.1.0"
+description = "Conveyer data ingestion module — delivery ledger, registration, s3-push / sftp-pull drivers, absence detection. Build spec: design/002.1_data_ingestion_lld.md."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "pydantic>=2.7",
+    "boto3>=1.34",
+    "pyiceberg[glue,pyarrow]>=0.7",
+    "paramiko>=3.4",
+    "PyYAML>=6",
+]
+
+[dependency-groups]
+dev = [
+    "pytest",
+    "pytest-cov",
+    "hypothesis",
+    "moto[s3,dynamodb,events,secretsmanager]>=5",
+    "ruff",
+    "mypy",
+    "sqlalchemy",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["ingestion"]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+src = ["ingestion", "tools", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B"]
+
+[tool.mypy]
+python_version = "3.12"
+packages = ["ingestion"]
+
+# Strict on the pure core (LLD §12.6). mypy's `strict` flag is global-only, so
+# the per-module equivalent is spelled out.
+[[tool.mypy.overrides]]
+module = "ingestion.core.*"
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+disallow_untyped_calls = true
+disallow_untyped_decorators = true
+disallow_any_generics = true
+disallow_subclassing_any = true
+check_untyped_defs = true
+warn_return_any = true
+warn_unused_ignores = true
+no_implicit_reexport = true
+strict_equality = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

@@ -1,0 +1,17 @@
+feed_id: carrier-x/commission-statements
+driver: sftp-pull
+pipeline: pipelines/commissions
+connection:
+  secret_ref: arn:aws:secretsmanager:us-east-1:000000000000:secret:conveyer-dev/sftp/carrier-x/commission-statements   # placeholder; real ARN post-apply
+  remote_path: /outbound/commissions/
+  file_pattern: "COMM_*"
+trigger:
+  schedule: "cron(0 13 ? * MON-FRI *)"
+  timezone: America/New_York
+expectation:
+  expected: weekdays
+  by: "06:00"
+  timezone: America/New_York
+completeness:
+  mode: manifest
+  manifest_pattern: "*.manifest.json"
