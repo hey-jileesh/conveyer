@@ -23,3 +23,8 @@ dist/
 *.db
 .beads-credential-key
 .beads/proxieddb/
+
+# Machine-local symlinks into agent-dot-files (created by its setup.sh)
+.claude/agents
+.claude/skills
+.claude/commands
