@@ -1,0 +1,7 @@
+{
+  "database": "dolt",
+  "backend": "dolt",
+  "dolt_mode": "embedded",
+  "dolt_database": "conveyer",
+  "project_id": "26d9ac4b-18ac-4817-b9b7-ac71920cede6"
+}
