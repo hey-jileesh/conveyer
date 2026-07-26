@@ -1,0 +1,64 @@
+{
+  "additionalProperties": false,
+  "properties": {
+    "batch_id": {
+      "title": "Batch Id",
+      "type": "string"
+    },
+    "content_hash": {
+      "title": "Content Hash",
+      "type": "string"
+    },
+    "delivery_id": {
+      "title": "Delivery Id",
+      "type": "string"
+    },
+    "delivery_key": {
+      "title": "Delivery Key",
+      "type": "string"
+    },
+    "feed_id": {
+      "title": "Feed Id",
+      "type": "string"
+    },
+    "object_uris": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Object Uris",
+      "type": "array"
+    },
+    "pipeline": {
+      "title": "Pipeline",
+      "type": "string"
+    },
+    "received_at": {
+      "format": "date-time",
+      "title": "Received At",
+      "type": "string"
+    },
+    "schema_version": {
+      "const": 1,
+      "default": 1,
+      "title": "Schema Version",
+      "type": "integer"
+    },
+    "size_bytes": {
+      "title": "Size Bytes",
+      "type": "integer"
+    }
+  },
+  "required": [
+    "feed_id",
+    "delivery_id",
+    "batch_id",
+    "delivery_key",
+    "content_hash",
+    "size_bytes",
+    "object_uris",
+    "received_at",
+    "pipeline"
+  ],
+  "title": "DeliveryRegisteredV1",
+  "type": "object"
+}

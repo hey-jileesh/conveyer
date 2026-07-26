@@ -1,0 +1,20 @@
+{
+  "manifest_version": 1,
+  "manifest_id": "comm-2026-07-24",
+  "feed_id": "carrier-x/commission-statements",
+  "files": [
+    {
+      "name": "COMM_part1.csv",
+      "bytes": 32,
+      "sha256": "357ec26a8db97019be228432681f6c3483a58b1adafa1516595979c4e605bf29",
+      "record_count": 1
+    },
+    {
+      "name": "COMM_part2.csv",
+      "bytes": 32,
+      "sha256": "5e7910d155f230995ebc9f87128bb8bc3b094ab598bfd8f48bfc3296beaa4456",
+      "record_count": 1
+    }
+  ],
+  "created_at": "2026-07-24T09:05:00Z"
+}
