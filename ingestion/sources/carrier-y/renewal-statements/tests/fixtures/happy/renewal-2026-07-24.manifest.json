@@ -1,0 +1,26 @@
+{
+  "manifest_version": 1,
+  "manifest_id": "renewal-2026-07-24",
+  "feed_id": "carrier-y/renewal-statements",
+  "files": [
+    {
+      "name": "part1.csv",
+      "bytes": 30,
+      "sha256": "ad5817329ea54eeb57073bb547583dd070bfb032e916063192410464986039ff",
+      "record_count": 1
+    },
+    {
+      "name": "part2.csv",
+      "bytes": 30,
+      "sha256": "1efb8589ea43a74e7c011fc50d3197f99193b59ba292b3f3ca49f7a29f2feb1a",
+      "record_count": 1
+    },
+    {
+      "name": "part3.csv",
+      "bytes": 30,
+      "sha256": "5685f99f3da03e5dcfd578f311f010d8d983b37516d9022661a4bf1ec13358ae",
+      "record_count": 1
+    }
+  ],
+  "created_at": "2026-07-24T09:00:00Z"
+}

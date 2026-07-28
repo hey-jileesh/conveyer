@@ -28,3 +28,7 @@ dist/
 .claude/agents
 .claude/skills
 .claude/commands
+
+# Agent scratch notes. Durable knowledge belongs in beads (`bd remember`),
+# not in MEMORY.md files — see CLAUDE.md.
+**/.claude/agent-memory/

@@ -60,3 +60,25 @@ strict_equality = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+# LLD §12.5 coverage gate: core/ >= 95% branch; overall >= 85%. `make coverage`
+# (Makefile) runs the suite with `branch = true` in effect, then checks both
+# thresholds via two separate `coverage report --fail-under=...` calls (one
+# bare, one `--include='ingestion/core/*'`) against the SAME collected data.
+[tool.coverage.run]
+branch = true
+source = ["ingestion"]
+# "Adapters excluded from the gate only where moto cannot simulate (document
+# each exclusion inline)" -- `effects/sftp.py`'s own module docstring already
+# documents that real paramiko/SFTP has no moto counterpart and therefore no
+# `tests/integration` file exists for it (covered instead by the in-memory
+# `SftpFx` test double used throughout the golden suite). This is the one
+# module-wide (not just a few lines) case; every other partially-untestable
+# adapter (e.g. `effects/ledger.py`'s glue-catalog branch, `maintenance/
+# optimize.py`'s real Athena calls) is mostly test-covered and stays IN the
+# gate, so a regression there still fails the build.
+omit = ["ingestion/effects/sftp.py"]
+
+[tool.coverage.report]
+precision = 1
+show_missing = true

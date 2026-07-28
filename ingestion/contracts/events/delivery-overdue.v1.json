@@ -1,0 +1,38 @@
+{
+  "additionalProperties": false,
+  "properties": {
+    "checked_at": {
+      "format": "date-time",
+      "title": "Checked At",
+      "type": "string"
+    },
+    "expectation_date": {
+      "format": "date",
+      "title": "Expectation Date",
+      "type": "string"
+    },
+    "expected_by": {
+      "format": "date-time",
+      "title": "Expected By",
+      "type": "string"
+    },
+    "feed_id": {
+      "title": "Feed Id",
+      "type": "string"
+    },
+    "schema_version": {
+      "const": 1,
+      "default": 1,
+      "title": "Schema Version",
+      "type": "integer"
+    }
+  },
+  "required": [
+    "feed_id",
+    "expectation_date",
+    "expected_by",
+    "checked_at"
+  ],
+  "title": "DeliveryOverdueV1",
+  "type": "object"
+}

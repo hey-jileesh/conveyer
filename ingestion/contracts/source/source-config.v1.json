@@ -1,0 +1,262 @@
+{
+  "$defs": {
+    "Completeness": {
+      "additionalProperties": false,
+      "properties": {
+        "manifest_pattern": {
+          "default": "*.manifest.json",
+          "title": "Manifest Pattern",
+          "type": "string"
+        },
+        "mode": {
+          "enum": [
+            "manifest",
+            "trailer",
+            "timer"
+          ],
+          "title": "Mode",
+          "type": "string"
+        },
+        "timer": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TimerSpec"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "trailer": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TrailerSpec"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        }
+      },
+      "required": [
+        "mode"
+      ],
+      "title": "Completeness",
+      "type": "object"
+    },
+    "Expectation": {
+      "additionalProperties": false,
+      "properties": {
+        "by": {
+          "title": "By",
+          "type": "string"
+        },
+        "expected": {
+          "title": "Expected",
+          "type": "string"
+        },
+        "timezone": {
+          "title": "Timezone",
+          "type": "string"
+        }
+      },
+      "required": [
+        "expected",
+        "by",
+        "timezone"
+      ],
+      "title": "Expectation",
+      "type": "object"
+    },
+    "JsonValue": {},
+    "S3PushConnection": {
+      "additionalProperties": false,
+      "properties": {
+        "partner_principal_arns": {
+          "items": {
+            "type": "string"
+          },
+          "minItems": 1,
+          "title": "Partner Principal Arns",
+          "type": "array"
+        }
+      },
+      "required": [
+        "partner_principal_arns"
+      ],
+      "title": "S3PushConnection",
+      "type": "object"
+    },
+    "SftpConnection": {
+      "additionalProperties": false,
+      "properties": {
+        "file_pattern": {
+          "default": "*",
+          "title": "File Pattern",
+          "type": "string"
+        },
+        "remote_path": {
+          "title": "Remote Path",
+          "type": "string"
+        },
+        "secret_ref": {
+          "title": "Secret Ref",
+          "type": "string"
+        }
+      },
+      "required": [
+        "secret_ref",
+        "remote_path"
+      ],
+      "title": "SftpConnection",
+      "type": "object"
+    },
+    "TimerSpec": {
+      "additionalProperties": false,
+      "properties": {
+        "accepted_risk": {
+          "minLength": 20,
+          "title": "Accepted Risk",
+          "type": "string"
+        },
+        "quiet_window_minutes": {
+          "maximum": 1440,
+          "minimum": 1,
+          "title": "Quiet Window Minutes",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "quiet_window_minutes",
+        "accepted_risk"
+      ],
+      "title": "TimerSpec",
+      "type": "object"
+    },
+    "TrailerSpec": {
+      "additionalProperties": false,
+      "properties": {
+        "count_group": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Count Group"
+        },
+        "pattern": {
+          "title": "Pattern",
+          "type": "string"
+        }
+      },
+      "required": [
+        "pattern"
+      ],
+      "title": "TrailerSpec",
+      "type": "object"
+    },
+    "Trigger": {
+      "additionalProperties": false,
+      "properties": {
+        "schedule": {
+          "title": "Schedule",
+          "type": "string"
+        },
+        "timezone": {
+          "default": "UTC",
+          "title": "Timezone",
+          "type": "string"
+        }
+      },
+      "required": [
+        "schedule"
+      ],
+      "title": "Trigger",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "properties": {
+    "completeness": {
+      "$ref": "#/$defs/Completeness"
+    },
+    "connection": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/SftpConnection"
+        },
+        {
+          "$ref": "#/$defs/S3PushConnection"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Connection"
+    },
+    "driver": {
+      "enum": [
+        "s3-push",
+        "sftp-pull",
+        "api-pull",
+        "db-unload"
+      ],
+      "title": "Driver",
+      "type": "string"
+    },
+    "expectation": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/Expectation"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    },
+    "feed_id": {
+      "pattern": "^[a-z0-9][a-z0-9-]*/[a-z0-9][a-z0-9-]*$",
+      "title": "Feed Id",
+      "type": "string"
+    },
+    "format_hints": {
+      "additionalProperties": {
+        "$ref": "#/$defs/JsonValue"
+      },
+      "default": {},
+      "title": "Format Hints",
+      "type": "object"
+    },
+    "pipeline": {
+      "title": "Pipeline",
+      "type": "string"
+    },
+    "trigger": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/Trigger"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    }
+  },
+  "required": [
+    "feed_id",
+    "driver",
+    "pipeline",
+    "completeness"
+  ],
+  "title": "FeedConfig",
+  "type": "object"
+}
