@@ -1,17 +1,17 @@
 # Runner Spine
-## Execution Context & Stage Protocol — Architecture Description (Target)
+## From `delivery-registered` to `batch-completed` — Architecture Description (Target)
 
-**Status:** Draft v1.0 · **Parent:** *001 Batch Data Processing Architecture* (§3.5, §5) · **Plan:** 003 §3.1 · **Position:** consumes `delivery-registered` (002.1 §6.4); owns the stage sequence `land → publish` · **Pattern:** context-enriching flow over one Spark job; pure core, effects at the edge
+**Status:** Draft v1.1 (editorial revision of v1.0 — decisions unchanged) · **Parent:** *001 Batch Data Processing Architecture* (§3.5, §5) · **Plan:** 003 §3.1 · **Position:** consumes `delivery-registered` (002.1 §6.4); owns the stage sequence `land → publish` · **Pattern:** context-enriching flow over one Spark job; pure core, effects at the edge
 
-> **Conventions.** Positions are recorded as decisions **D-1…D-13** so 005–008 can cite them; all are settled as of v1.0. Detail that belongs to a stage-cluster doc is named and deferred, not sketched here. v1 means *reviewed and binding*, not final — friction from drafting 005–008 lands as v1.x revisions with decision-record updates (003 §3).
+> **Conventions.** Positions are recorded as decisions **D-1…D-13** in Y-statement form (*in the context of… facing… we chose… and rejected… to achieve… accepting…*) so 005–008 can cite both the choice and its cost; all are settled as of v1.0. Every section after the decision record opens with the problem it answers. Detail that belongs to a stage-cluster doc is named and deferred, not sketched here. v1 means *reviewed and binding*, not final — friction from drafting 005–008 lands as v1.x revisions with decision-record updates (003 §3).
 
 ---
 
 ## 1. Context — Closing the Open Seam
 
-Ingestion ends at `delivery-registered`: a durable raw delivery, a minted `batch_id`, an event nobody consumes (003 §0). The spine is the consumer. An EventBridge rule routes on the event's `pipeline` field to a Step Functions execution, which runs **one Spark job** executing all eight stages for that batch.
+**The problem.** Ingestion ends at `delivery-registered`: a durable raw delivery, a minted `batch_id`, and an event nobody consumes (003 §0). Everything downstream of that event — eight stages, from landing raw rows to announcing a completed batch — is unbuilt, and docs 005–008 cannot describe those stages precisely until something defines what a stage *is*, what it receives, and what it may do. This document is that something.
 
-The stages are not services. They are **functions sharing one execution context** (001 §3.5) — their seams are data contracts, not deployment boundaries. This document defines the two contracts everything else writes against: the **context** (what each stage receives and adds) and the **stage protocol** (how framework stages and pipeline-pure stages plug into one sequence). Docs 005–008 fill in stage behavior; they may not alter these contracts.
+The spine is the consumer of `delivery-registered`. An EventBridge rule routes on the event's `pipeline` field to a Step Functions execution, which runs **one Spark job** executing all eight stages for that batch. The stages are not services. They are **functions sharing one execution context** (001 §3.5) — their seams are data contracts, not deployment boundaries. This document defines the two contracts everything else writes against: the **context** (what each stage receives and adds, §5) and the **stage protocol** (how framework stages and pipeline-pure stages plug into one sequence, §6). Docs 005–008 fill in stage behavior; they may not alter these contracts.
 
 ### 1.1 The shape at a glance
 
@@ -45,6 +45,8 @@ flowchart TB
 
 ## 2. Scope & Non-Goals
 
+**The problem.** A spine doc that answers everything answers nothing precisely — it has to refuse most questions to be authoritative on the few it keeps.
+
 **This doc owns:** context shape, stage protocol and pipeline binding, orchestration shape, failure/restart semantics, batch lifecycle timing, observability (run ledger, metrics, logs), runner packaging, test substrate, purity enforcement.
 
 **Deferred to cluster docs:** raw/quarantine schemas and verbatim semantics (005), co-effect declaration granularity and `apply`/`post_check` authoring surface (006), fact canonicalization, dedup, and the fold contract (007), `batch-completed` payload and maintenance (008), package contract (009).
@@ -53,25 +55,52 @@ flowchart TB
 
 ## 3. Decision Record
 
-| # | Decision | Rationale (short) |
-|---|---|---|
-| **D-1** | **One Spark job executes `land → publish`. Step Functions wraps the whole job as the unit of retry.** Per-stage SFN states rejected. | Per-stage states force serialization at seven boundaries — the context stops being a value and becomes paths + materialized intermediates. That buys restart granularity we don't need, because restart-from-the-top is already always correct (D-4) and batches tolerate minutes. Flow stays uncomplected from orchestration middleware. |
-| **D-2** | **The context is an in-memory accreting value** — a frozen dataclass holding lazy DataFrames (logical plans, not materialized data — §5.1). Never serialized, never persisted. Fields are only added, never removed or mutated. | 001 §3.5 taken literally. The context is driver-side metadata, kilobytes regardless of batch size; datasets stay on executors. Durable mid-flight state is the erosion vector D-1 closes. |
-| **D-3** | **The commit boundary rule: downstream of `commit`, stages consume committed facts by name** (fact table filtered on `batch_id`), never the in-memory candidates. Candidates are discarded at the boundary. | Makes restart after a successful `commit` convergent even if co-effects drifted between attempts: `fold` folds what was durably recorded, not what this attempt recomputed. The value's name replaces the value. |
-| **D-4** | **Every effectful stage is one presence-guarded atomic Iceberg commit** keyed on `batch_id` (plus stage, where a table takes writes from two stages). Restart is always from stage 1; each effect self-guards; the sequence converges. There is no restart-from-stage-N. | Iceberg commits are per-table atomic: a stage's write either fully happened or didn't. Presence of `batch_id` is therefore a sound guard. One rule covers land, pre_check, commit, fold — no per-stage special cases. |
-| **D-5** | **`batch-started` emits immediately after `land`'s commit.** The only coherence guarantee is: gate on `batch-completed`. | Facts become physically visible at `commit` (stage 6) — Iceberg does not hide them. Honesty over mechanism: the contract states what consumers may assume (§9), not how tables behave mid-batch. |
-| **D-6** | **The runner is a second package (`spine/`), same implementation idiom as ingestion (002.1 §7.0 D-17): values + functions, effects as records of functions, decide-then-do.** Shared artifacts: purity linter, hash canonicalization, event envelope conventions. **No shared kernel.** | Lambda and Spark runtimes should share the *idiom* and a few genuine values, not convenience code that couples their release cycles. |
-| **D-7** | **Test substrate is local Spark** (+ local-filesystem Iceberg catalog). DuckDB rejected for golden tests. | Transforms are written against the Spark DataFrame API. Running them on DuckDB requires a dataframe-abstraction layer — logic complected with representation, an ORM in lakehouse costume. Cost accepted: CI minutes (§11). |
-| **D-8** | **One purity linter, per-package configuration.** Ingestion's `tools/purity_linter.py` is promoted to a shared tool; the runner config adds Spark I/O bans for pipeline transforms. | Same enforcement idea, one implementation, two ban lists. |
-| **D-9** | **The pipeline surface is exactly 001 §5's pure signatures.** Pipeline authors never see the context type, the effects record, or the runner internals. | The small interface is the whole point (001 §8). Two protocols, not one: internal (framework stages) and external (pipeline functions) — §6. |
-| **D-10** | **Single-flight per batch: Step Functions execution name = `batch_id`** (settled). A thin router Lambda starts the execution and treats `ExecutionAlreadyExists` as success — that return *is* the dedup of at-least-once delivery (002.1 D-14). Single-flight is a **declared invariant with its own test** (duplicate `delivery-registered` → exactly one execution), not a naming convention buried in Terraform. **Migration obligation:** if the orchestrator ever changes, this property must be explicitly re-provided. Deliberate re-runs: SFN redrive, or a fresh execution named `{batch_id}--rN` — safe either way, D-4 makes sequential re-execution a no-op. | Ingestion's CAS turnstile (002.1 §8.4) rejected for this workload on mechanics, not taste: a claim TTL must *infer* claimant liveness, and for minutes-to-hours Spark jobs every TTL value is wrong — long blocks legitimate retry, short sweeps a live claim and recreates the concurrent-duplicate race. SFN *owns* execution liveness as ground truth; its claim is coextensive with the run. One principle platform-wide: single-flight at the front door, owned by whichever component owns liveness of the critical section — the turnstile for unorchestrated Lambdas, the orchestrator for orchestrated jobs. |
-| **D-11** | **Observability is a first-class characteristic: the run is reified as data.** Three channels, one job each (§13): EMF metrics for alarms/dashboards, structured logs for forensics, and an append-only **run ledger** in Iceberg — one row per stage transition per attempt. Run facts are pure projections of the context, emitted by the sequence driver; stages carry zero instrumentation. **Observability never gates the data path**: run-ledger appends are best-effort. | Reified process — the lane's own discipline applied to itself (ingestion's delivery ledger, extended to runs). Gives per-stage visibility without reopening D-1, and turns the phase-gate invariants ("rerun appends zero facts") into queries instead of folklore. |
-| **D-12** | **Concurrent batches of one feed run in parallel by default** (settled). Correctness rests on the order-insensitive fold (007) plus Iceberg conflict-retry as mechanical backstop — not on serialization. Serialization exists only as a **declared per-pipeline property** (`serialize: true` in `pipeline.yaml`, 009) for pipelines whose `apply` reads their own current state and cannot tolerate stale-sibling perception. | Serialization cannot produce the *right* order anyway: arrival order ≠ business order (the late-file case), so the fold must order by keys carried *in the facts* regardless. Once it does, serialization's only remaining purchase is perception coherence for self-referential pipelines — a per-pipeline property, not a lane property. Parallel default keeps backfills (013) parallelizable. |
-| **D-13** | **No shared code between ingestion and the spine — tools as tools, contracts as values** (settled). The linter is repo-level tooling (D-8). Event contracts are shared as **golden JSON fixtures** with contract tests on both sides: ingestion's emit must produce them, the spine's parse must accept them; each package owns its own emit/parse models. A `conveyer-contracts` code package is **rejected, not deferred**. `canonical_content_hash` is not shared at all: the spine treats the delivery `content_hash` as opaque lineage, and the fact-side hash is a *different function* owned by 007. | The seam between the packages is the JSON on the wire — data. A shared pydantic class makes the seam a language-specific artifact and entangles releases; fixtures give the same drift protection as *values* — language-independent, diffable in PRs, trivially fabricated. Also keeps Track A unencumbered: contract governance shouldn't have to unwind a de-facto owner-in-code. |
+Thirteen decisions, each in Y-statement form. The *accepting* clauses are gathered again in §15 for the skim reader.
+
+**D-1 — One job, one retry unit.**
+In the context of executing the eight-stage sequence, facing the choice of orchestration granularity, we chose **one Spark job running `land → publish`, with Step Functions wrapping the whole job as the unit of retry**, and rejected per-stage SFN states, to achieve a context that remains an in-memory value and a single restart rule, accepting recomputation of pure stages on every retry. Per-stage states would force serialization at seven boundaries — the context stops being a value and becomes paths plus materialized intermediates, buying restart granularity that D-4 makes unnecessary.
+
+**D-2 — The context is an in-memory accreting value.**
+In the context of what the stages share, facing the need to pass work along the sequence without middleware, we chose **a frozen dataclass holding lazy DataFrames — logical plans, not materialized data (§5.1) — never serialized, never persisted, fields only ever added**, and rejected any durable mid-flight representation, to achieve 001 §3.5 taken literally at kilobytes of driver memory regardless of batch size, accepting that the context dies with the process — by design, since D-4 makes that loss free.
+
+**D-3 — The commit boundary rule.**
+In the context of stages downstream of `commit`, facing co-effect drift between attempts, we chose **`fold` and `publish` consuming committed facts by name (fact table filtered on `batch_id`)**, and rejected passing in-memory candidates across the commit boundary, to achieve convergent restarts even when a rerun perceives different current state, accepting one extra read-back scan of the fact table per batch. The value's name replaces the value; candidates are scaffolding, discarded at the boundary.
+
+**D-4 — Presence-guarded atomic commits; restart from the top.**
+In the context of every effectful stage, facing a job that can die at any instruction, we chose **one presence-guarded atomic Iceberg commit per stage, keyed on `batch_id` (plus stage where a table takes two writers), with restart always from stage 1**, and rejected restart-from-stage-N with durable checkpoints, to achieve convergence under any failure through a single rule with no per-stage special cases, accepting re-execution of already-completed stages — each a guarded no-op. Sound because Iceberg commits are per-table atomic: a stage's write either fully happened or didn't, so presence of `batch_id` is a truthful guard.
+
+**D-5 — `batch-started` after `land`; coherence only by gating.**
+In the context of the batch lifecycle events, facing the fact that Iceberg makes committed facts visible before the fold has run, we chose **emitting `batch-started` immediately after `land`'s commit and promising coherence only to consumers who gate on `batch-completed`**, and rejected pretending tables are hidden mid-batch, to achieve an honest contract instead of a comfortable fiction, accepting that ungated readers get no guarantee (§9).
+
+**D-6 — A second package, same idiom, no shared kernel.**
+In the context of runner packaging, facing the gravitational pull toward shared code with ingestion, we chose **a second package (`spine/`) sharing the implementation idiom — values + functions, effects as records of functions, decide-then-do (002.1 §7.0)** — and rejected a shared kernel, to achieve independent release cycles for two genuinely different runtimes (Lambda vs. Spark), accepting some duplicated idiom boilerplate. What *is* shared, and in what form, is D-13.
+
+**D-7 — Local Spark as the test substrate.**
+In the context of CI for golden tests, facing slow-but-faithful local Spark against fast-but-foreign DuckDB, we chose **local Spark plus a filesystem Iceberg catalog**, and rejected DuckDB, to achieve zero engine-divergence risk — CI runs the engine production runs — accepting CI wall-time (§11). The DuckDB path would require a dataframe-abstraction layer: logic complected with representation, an ORM in lakehouse costume.
+
+**D-8 — One purity linter, per-package configuration.**
+In the context of purity enforcement across two packages, facing fork-vs-share, we chose **promoting ingestion's `tools/purity_linter.py` to repo level with per-package ban lists**, and rejected a forked copy, to achieve one implementation of enforcement with two configurations, accepting the linter as a tool-time coupling point (tools coupling at build time is what tools are for).
+
+**D-9 — The pipeline surface is exactly 001 §5.**
+In the context of the authoring surface, facing pressure to expose runner internals for "flexibility," we chose **exactly the pure signatures of 001 §5 — pipeline authors never see `BatchContext`, `RunnerFx`, or the runner**, and rejected any richer interface, to achieve an implementation surface small enough for agents to generate and humans to review (001 §8), accepting that new authoring needs must arrive as contract changes, never as a peek behind the curtain.
+
+**D-10 — Single-flight via SFN execution naming.**
+In the context of at-least-once delivery of `delivery-registered` (002.1 D-14), facing the risk of two concurrent runs of one batch appending duplicate facts, we chose **Step Functions execution name = `batch_id`, started by a thin router that treats `ExecutionAlreadyExists` as success, reified as a declared invariant with its own test**, and rejected reusing ingestion's CAS turnstile (002.1 §8.4), to achieve mutual exclusion owned by the component that owns execution liveness as ground truth, accepting that the property is coupled to the orchestrator — with a recorded **migration obligation**: change orchestrators and single-flight must be explicitly re-provided. The turnstile was rejected on mechanics, not taste: a claim TTL must *infer* liveness, and for minutes-to-hours Spark jobs every TTL is wrong — long blocks legitimate retry, short sweeps a live claim and recreates the race. Platform principle: single-flight at the front door, owned by whoever owns liveness of the critical section — turnstile for unorchestrated Lambdas, orchestrator for orchestrated jobs. Deliberate re-runs: SFN redrive, or a fresh execution named `{batch_id}--rN`; both safe under D-4.
+
+**D-11 — Observability first-class: the run reified as data.**
+In the context of operating the lane, facing bolted-on telemetry versus the lane's own discipline applied to itself, we chose **three channels with one job each (§13) — EMF metrics, structured logs, and an append-only run ledger (one row per stage transition per attempt), each run fact a pure projection of the context emitted by the sequence driver** — and rejected instrumentation inside stages, to achieve per-stage visibility without reopening D-1 and phase-gate invariants as standing queries instead of folklore, accepting best-effort ledger writes that never gate the data path (§13.4).
+
+**D-12 — Parallel same-feed batches by default.**
+In the context of two batches of one feed in flight simultaneously, facing fold collisions and stale perception, we chose **parallel-by-default, with correctness resting on the order-insensitive fold (007) plus Iceberg conflict-retry as mechanical backstop, and serialization only as a declared per-pipeline property (`serialize: true`, 009)**, and rejected lane-wide serialization, to achieve parallel backfills and ordering correctness living where the late-file case forces it anyway — in the fold contract — accepting stale-sibling perception for self-referential pipelines that don't opt in (§7.3). Serialization cannot produce the *right* order regardless: arrival order ≠ business order.
+
+**D-13 — Tools as tools, contracts as values, no shared code.**
+In the context of code both packages appear to want, facing copy-versus-extract, we chose **the linter at repo level (D-8) and event contracts as golden JSON fixtures with contract tests on both sides — ingestion's emit must produce them, the spine's parse must accept them, each package owning its own models** — and rejected (not deferred) a `conveyer-contracts` code package, to achieve a seam that stays what it is — JSON on the wire, language-independent, diffable — accepting the absence of a single typed definition per event. `canonical_content_hash` is not shared at all: the spine treats the delivery's `content_hash` as opaque lineage, and the fact-side hash is a *different function*, owned by 007. Keeps Track A unencumbered: contract governance shouldn't have to unwind a de-facto owner-in-code.
 
 ---
 
 ## 4. Information Model
+
+**The problem.** Before any mechanism gets designed, the information has to be named: what are the facts here, what are the identities, and who perceives what? Most spine questions dissolve once these three are stated.
 
 **The facts:** a batch run *happened* — its raw rows, its quarantine rows, its recorded facts, each stamped `batch_id`. These are the durable values; everything the runner holds in memory is scaffolding for producing them.
 
@@ -82,6 +111,8 @@ flowchart TB
 ---
 
 ## 5. The Execution Context
+
+**The problem.** Eight functions must share work along one sequence without becoming services (no middleware between them) and without becoming a mutable bag (no stage corrupting another's inputs). What, exactly, is the thing they share — and what happens when the datasets it describes are bigger than any machine's memory?
 
 ### 5.1 Shape
 
@@ -113,6 +144,8 @@ Field-level details (types, exact names) harden in 004.1; the *rows* of this tab
 ---
 
 ## 6. Stage Protocol
+
+**The problem.** Two kinds of author meet in one sequence: the framework engineer writing effectful stages, and the pipeline author writing pure transforms. Each needs a protocol shaped for its job, and neither may see the other's world — the framework's effects must be invisible to pipelines, and pipeline internals irrelevant to the framework. One protocol would serve both badly; so there are two.
 
 ### 6.1 Internal protocol — framework stages
 
@@ -160,23 +193,37 @@ Pipeline code imports neither `BatchContext` nor `RunnerFx` — enforced by the 
 
 ## 7. Orchestration
 
-- **Trigger:** EventBridge rule on `delivery-registered` (matched on `pipeline`) → **router Lambda** → `StartExecution(name=batch_id, input=detail)` → Glue job (EMR Serverless later; same runner library, config change — 001 §6). The router exists because EventBridge's direct SFN target cannot set a custom execution name; it is wiring only — parse, start, treat `ExecutionAlreadyExists` as success. Any logic in the router is a review defect (002.1 §7.1).
-- **Why the name is already agreed on:** `batch_id` is minted once at registration — `uuid5(namespace, delivery identity)`, a pure function of the delivery's content (002.1 §6.5–6.6) — and carried in the event payload. Duplicate deliveries of the event are copies of one payload; a duplicate *registration* re-mints the identical id. Content decides identity, identity decides the name, the name makes duplicates collide at `StartExecution`. Coordination appears exactly once in the chain, at the execution boundary; everything upstream is computation over values.
-- **Shape (D-1):** one SFN execution per batch; one state that runs the job; retry policy retries the *whole job*.
-- **Entrypoint discipline:** the Glue script is wiring only — parse arguments, `fx = make_runner_fx(...)`, call `spine.run(seed_ctx, fx)`. Any logic in an entrypoint is a review defect (mirrors 002.1 §7.1).
-- **Concurrent batches of one feed (D-12): parallel by default.** The apparent conflict decomposes into three problems, separately owned:
-  1. **Mechanical** — two `fold` MERGEs collide on the current-state table. Iceberg optimistic concurrency aborts the loser; retry with a fresh snapshot. Backstop, not strategy.
-  2. **Semantic** — folds apply in arrival order, which is not business order: a late Monday file folds *after* Tuesday's on-time file even under strict serialization. Only the fold contract can fix this: ordering keys live in the facts, and the merge updates a state row only if the incoming fact wins the (sequence/event-time, source timestamp, record hash) comparison. Serialization is not a substitute and never was.
-  3. **Perceptual** — a batch's `pull` may not see a concurrent sibling's not-yet-committed fold. This matters *only* for pipelines that declare their **own current state** as a co-effect. Those pipelines declare `serialize: true` (009); the honoring mechanics (SQS FIFO per pipeline + task-token, or a semaphore) are designed when the first such pipeline appears — not built speculatively.
+**The problem.** Something must start the job, guarantee that exactly one run exists per batch despite at-least-once event delivery, and decide what happens when two batches of one feed overlap — all without the orchestrator leaking into the programming model.
 
-  **Obligations handed downstream — record in the receiving doc's decision record:**
-  - **006 (`pull`/`apply`):** self-reference must be *visible in the declaration* — reading the pipeline's own current-state table is a distinct, flagged co-effect kind, because it is what activates the `serialize` question. 006 also states the perception contract `apply` may assume: the folds of all batches *completed* before this batch's `pull`; nothing about concurrent siblings unless serialized.
-  - **007 (`fold`):** order-insensitivity is **load-bearing, not optional**. State rows carry their ordering key; the merge is conditional on winning the ordering comparison; the proof obligation `fold(all facts) ≡ incremental folds in any arrival order` is exercised by both the late-file and the concurrent-sibling case. A custom fold that cannot meet it is rejected, or demoted to full-rebuild-only mode.
-  - **009 (`pipeline.yaml`):** `serialize: bool` (default `false`) enters the package contract alongside the co-effect declarations.
+### 7.1 The trigger path — one agreed name
+
+EventBridge rule on `delivery-registered` (matched on `pipeline`) → **router Lambda** → `StartExecution(name=batch_id, input=detail)` → Glue job (EMR Serverless later; same runner library, config change — 001 §6). The router exists because EventBridge's direct SFN target cannot set a custom execution name; it is wiring only — parse, start, treat `ExecutionAlreadyExists` as success. Any logic in the router is a review defect (002.1 §7.1).
+
+Why the name needs no negotiation: `batch_id` is minted once at registration — `uuid5(namespace, delivery identity)`, a pure function of the delivery's content (002.1 §6.5–6.6) — and carried in the event payload. Duplicate deliveries of the event are copies of one payload; a duplicate *registration* re-mints the identical id. Content decides identity, identity decides the name, the name makes duplicates collide at `StartExecution`. Coordination appears exactly once in the chain, at the execution boundary; everything upstream is computation over values.
+
+### 7.2 The execution shape
+
+One SFN execution per batch (D-10); one state that runs the job; the retry policy retries the *whole job* (D-1). The Glue entrypoint is wiring only — parse arguments, `fx = make_runner_fx(...)`, call `spine.run(seed_ctx, fx)`. Any logic in an entrypoint is a review defect (mirrors 002.1 §7.1).
+
+### 7.3 Concurrent batches of one feed (D-12)
+
+Parallel by default. The apparent conflict decomposes into three problems, separately owned:
+
+1. **Mechanical** — two `fold` MERGEs collide on the current-state table. Iceberg optimistic concurrency aborts the loser; retry with a fresh snapshot. Backstop, not strategy.
+2. **Semantic** — folds apply in arrival order, which is not business order: a late Monday file folds *after* Tuesday's on-time file even under strict serialization. Only the fold contract can fix this: ordering keys live in the facts, and the merge updates a state row only if the incoming fact wins the (sequence/event-time, source timestamp, record hash) comparison. Serialization is not a substitute and never was.
+3. **Perceptual** — a batch's `pull` may not see a concurrent sibling's not-yet-committed fold. This matters *only* for pipelines that declare their **own current state** as a co-effect. Those pipelines declare `serialize: true` (009); the honoring mechanics (SQS FIFO per pipeline + task-token, or a semaphore) are designed when the first such pipeline appears — not built speculatively.
+
+**Obligations handed downstream — record in the receiving doc's decision record:**
+
+- **006 (`pull`/`apply`):** self-reference must be *visible in the declaration* — reading the pipeline's own current-state table is a distinct, flagged co-effect kind, because it is what activates the `serialize` question. 006 also states the perception contract `apply` may assume: the folds of all batches *completed* before this batch's `pull`; nothing about concurrent siblings unless serialized.
+- **007 (`fold`):** order-insensitivity is **load-bearing, not optional**. State rows carry their ordering key; the merge is conditional on winning the ordering comparison; the proof obligation `fold(all facts) ≡ incremental folds in any arrival order` is exercised by both the late-file and the concurrent-sibling case. A custom fold that cannot meet it is rejected, or demoted to full-rebuild-only mode.
+- **009 (`pipeline.yaml`):** `serialize: bool` (default `false`) enters the package contract alongside the co-effect declarations.
 
 ---
 
 ## 8. Failure & Idempotency — the Per-Stage Map
+
+**The problem.** A Spark job can die at any instruction — mid-append, between stages, during publish. The design question is not "how do we resume" but "what must be true of every stage so that the answer to *any* failure is the same: run it again."
 
 The restart story in one sentence: **kill the job anywhere, run it again from stage 1, and the durable state converges — because every effect is one atomic, presence-guarded commit (D-4) and everything downstream of `commit` reads durable values by name (D-3).**
 
@@ -203,13 +250,17 @@ Notes:
 
 ## 9. Batch Lifecycle — the Consumer Contract
 
+**The problem.** Consumers need to know when a batch's outputs are safe to read — but Iceberg makes committed facts physically visible before the fold has run, so any promise of mid-batch invisibility would be a lie. The contract must state what consumers may actually assume.
+
 - `batch-started` — emitted after `land` commits (D-5). Payload: lineage seed fields + raw count. Audience: ops, run tracking. It is **not** a gate.
 - `batch-completed` — emitted by `publish`; payload owned by 008.
-- **The contract, stated precisely:** between the two events, facts for batch N may be physically present in the fact table (commit precedes publish, and Iceberg does not hide committed snapshots). A consumer that reads fact or current-state tables without gating on `batch-completed` gets no coherence guarantee — it may observe facts whose fold has not run. Batch-coherent perception is *only* available by gating. Consumers needing as-of reads use the snapshot ids carried in `batch-completed` (008).
+- **The contract, stated precisely:** between the two events, facts for batch N may be physically present in the fact table (commit precedes publish, and Iceberg does not hide committed snapshots). A consumer that reads fact or current-state tables without gating on `batch-completed` gets no coherence guarantee — it may observe facts whose fold has not run. Batch-coherent perception is *only* available by gating. Consumers needing as-of reads use the snapshot ids carried in `batch-completed` (008). Pull-based readers (e.g., analysts in Athena) who cannot gate on an event must filter to completed batches or accept incoherence — the mechanics of knowing which batches are complete belong to 008.
 
 ---
 
 ## 10. Runner Packaging (D-6)
+
+**The problem.** Two packages now live in one repo, sharing a discipline but not a runtime. The layout must make the idiom obvious to a new reader, and the sharing question — what crosses between the packages, in what form — needs an answer that doesn't couple their release cycles.
 
 ```
 spine/
@@ -231,6 +282,8 @@ Same idiom, restated as law for `spine/`: frozen dataclasses and functions only;
 
 ## 11. Test Substrate (D-7)
 
+**The problem.** Golden tests must verify pipeline behavior without AWS, and the phase gate's claims — reruns are no-ops, kills converge — must be *executable*, not aspirational. The temptation is a faster engine than Spark; the question is what fidelity that speed costs.
+
 - **Golden tests (pipeline packages):** fixture raw + co-effect snapshots → expected facts, expected state. Run `apply`/`post_check`/`fold` on **local Spark**; no AWS, no catalog.
 - **Spine integration tests:** full eight-stage run against local Spark + filesystem Iceberg catalog; the standing scenarios from 003's phase gate become test ids: rerun-yields-zero-new-facts, kill-at-each-stage-then-restart-converges (parameterized over all seven kill points), quarantine-never-drops, run-ledger-records-every-stage (including `skipped-guard` rows on rerun), duplicate-event-single-flight (two `delivery-registered` copies → exactly one run; router treats `ExecutionAlreadyExists` as success — substrate for this one decided in 004.1, stub or deployed), out-of-order-folds-converge (an older-business-time batch folds after a newer one; current state reflects event-time order, not arrival order — exercises 007's D-12 obligation).
 - **Accepted divergence risk:** none by construction — CI runs the engine production runs. The cost is CI wall-time; mitigations (shared SparkSession per test module, tiny fixtures) live in 004.1.
@@ -238,6 +291,8 @@ Same idiom, restated as law for `spine/`: frozen dataclasses and functions only;
 ---
 
 ## 12. Purity Enforcement (D-8)
+
+**The problem.** "Pipeline code physically cannot perform I/O" (001 §3.4) is a claim about artifacts, and it's only as true as its mechanical enforcement. What exactly is banned, where, and by what?
 
 One AST/import linter, two configs:
 
@@ -247,6 +302,8 @@ One AST/import linter, two configs:
 ---
 
 ## 13. Observability — The Run Reified as Data (D-11)
+
+**The problem.** A batch lane fails quietly by default: a job dies, a retry succeeds, and nobody can answer "what happened to batch N last Tuesday" without grepping driver logs. Operators need per-stage visibility, auditors need "what did attempt N perceive," and D-1 forbids buying either with orchestration granularity.
 
 Observability here is not instrumentation sprinkled into logic; it is a **projection of values already flowing through the context**. Because the context accretes everything a stage learns (§5.2), the accretion map *is* the instrumentation surface — if something is worth observing and isn't in the context, the fix is to accrete it, not to log it ad hoc.
 
@@ -285,7 +342,7 @@ Alarms (thresholds → 004.1): SFN execution failed post-retry; `batch-started` 
 
 ## 14. What to Defend Against
 
-Erosion vectors, named now so reviews can cite them:
+**The problem.** Architecture erodes through reasonable-sounding requests, one accommodation at a time. Naming the erosion vectors now gives future reviews something to cite besides taste.
 
 1. **Per-stage orchestration creeping back** ("we want per-stage retries/visibility") — that is D-1 being reopened; the answer is observability (§13), not orchestration granularity.
 2. **The context becoming a mutable bag** — a stage that overwrites or removes a field breaks 001 §3.5 and every downstream stage's assumptions silently.
@@ -298,6 +355,8 @@ Erosion vectors, named now so reviews can cite them:
 ---
 
 ## 15. Trade-offs, Named
+
+The *accepting* clauses of §3, gathered where a skim can find them.
 
 | Chosen | Given up | Why it's fine |
 |---|---|---|
