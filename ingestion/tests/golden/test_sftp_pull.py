@@ -33,6 +33,7 @@ not otherwise reachable by the six required golden IDs.
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 import json
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -55,8 +56,9 @@ from ingestion.core.model import (
     Trigger,
     Window,
 )
+from ingestion.core.windows import RemoteFile
 from ingestion.drivers import sftp_pull
-from ingestion.effects.records import Effects
+from ingestion.effects.records import Effects, SftpFx
 from tests.conftest import SftpStore
 
 _FEED_ID = "carrier-x/commission-statements"
@@ -96,6 +98,23 @@ def _trailer_feed() -> FeedConfig:
     )
 
 
+def _trailer_feed_with_pattern(file_pattern: str) -> FeedConfig:
+    """Like `_trailer_feed` but with a caller-chosen `file_pattern` --
+    conveyer-nvh.48.11's listing-cleanliness tests need a pattern that a
+    hostile traversal name (e.g. `../evil.csv`) actually MATCHES (unlike the
+    default `COMM_*`), so the assertion isolates the step-0 cleanliness
+    filter rather than the ordinary pattern filter.
+    """
+    return FeedConfig(
+        feed_id=_FEED_ID,
+        driver="sftp-pull",
+        pipeline="pipelines/commissions",
+        connection=_sftp_connection(file_pattern),
+        trigger=_trigger(),
+        completeness=Completeness(mode="trailer", trailer=TrailerSpec(pattern=r"TOTAL:\d+")),
+    )
+
+
 def _timer_feed(quiet_minutes: int = 30) -> FeedConfig:
     return FeedConfig(
         feed_id=_FEED_ID,
@@ -122,6 +141,56 @@ def _manifest_feed() -> FeedConfig:
         trigger=_trigger(),
         completeness=Completeness(mode="manifest"),
     )
+
+
+# --- test doubles for the conveyer-nvh.48 traversal-name regression --------
+
+
+def _sftp_fx_with_injected_listing_entry(
+    fx: Effects, extra_name: str, extra_bytes: bytes, mtime: datetime
+) -> Effects:
+    """Wraps `fx.sftp_fx_for` so the listing it returns ALSO carries one
+    synthetic `RemoteFile` entry named `extra_name` -- bypassing
+    `tests/conftest.py::_fake_sftp_fx`'s own `listdir` filter (`"/" not in`
+    the remainder), which correctly mirrors a WELL-BEHAVED real SFTP server
+    (a genuine directory-listing entry cannot itself contain "/"). A
+    malicious or misbehaving server is not bound by that -- the SFTP
+    protocol does not forbid "/" in a returned filename -- so this
+    reproduces that server-side threat directly, entirely test-side,
+    without touching `drivers/sftp_pull.py` or `core/windows.py` (out of
+    THIS bead's scope, conveyer-nvh.48.11).
+    """
+    real_sftp_fx_for = fx.sftp_fx_for
+
+    def wrapped(secret_ref: str) -> SftpFx:
+        real = real_sftp_fx_for(secret_ref)
+
+        def listdir(path: str) -> list[RemoteFile]:
+            return [
+                *real.listdir(path),
+                RemoteFile(name=extra_name, bytes=len(extra_bytes), mtime=mtime),
+            ]
+
+        return SftpFx(listdir=listdir, read_chunks=real.read_chunks)
+
+    return dataclasses.replace(fx, sftp_fx_for=wrapped)
+
+
+def _counting_stream_upload(fx: Effects) -> tuple[Effects, list[tuple[str, str]]]:
+    """Wraps `fx.store.stream_upload` to record every `(bucket, key)` call
+    -- proves the traversal-name manifest is rejected by `parse_manifest`
+    BEFORE any bytes ever move (the sharpest assertion: parse precedes all
+    writes), without changing behavior.
+    """
+    calls: list[tuple[str, str]] = []
+    real_stream_upload = fx.store.stream_upload
+
+    def counting_stream_upload(chunks: Any, bucket: str, key: str) -> tuple[str, int]:
+        calls.append((bucket, key))
+        return real_stream_upload(chunks, bucket, key)
+
+    new_store = dataclasses.replace(fx.store, stream_upload=counting_stream_upload)
+    return dataclasses.replace(fx, store=new_store), calls
 
 
 # --- sftp_store seeding ------------------------------------------------------
@@ -445,6 +514,146 @@ def test_sftp_manifest_missing_part_yields_incomplete_without_streaming(
         Bucket=fx.config.landing_bucket, Prefix=f"{_FEED_ID}/received_at="
     )
     assert "Contents" not in listing  # no canonical objects created
+
+
+# --- conveyer-nvh.48 (security-gate): a manifest declaring a path-y --------
+# `files[0].name`, where the CURRENT remote listing ALSO happens to carry an
+# entry under that exact hostile name (so the pre-stream "declared part
+# present?" check, if ever reached, would find a match and proceed) -- must
+# still be rejected as `unreadable` at `parse_manifest` (the `ManifestFile`
+# field validator, nvh.46's producer-side companion), before ANY bytes are
+# streamed. This is the sharpest assertion in the epic: parse must precede
+# all writes -- zero `stream_upload` calls, for the manifest itself or any
+# declared part.
+
+
+def test_sftp_manifest_declared_traversal_name_rejected_before_any_stream_upload(
+    local_effects: Effects, sftp_store: SftpStore, queue_url: str
+) -> None:
+    fx = local_effects
+    feed = _manifest_feed()
+    hostile_name = "../../x.csv"
+    hostile_bytes = b"attacker-controlled-bytes"
+    raw_manifest = json.dumps(
+        {
+            "manifest_version": 1,
+            "manifest_id": "hostile-manifest",
+            "feed_id": _FEED_ID,
+            "files": [
+                {
+                    "name": hostile_name,
+                    "bytes": len(hostile_bytes),
+                    "sha256": hashlib.sha256(hostile_bytes).hexdigest(),
+                }
+            ],
+        }
+    ).encode("utf-8")
+    # The remote manifest file itself has an ordinary, matching name.
+    _seed_remote(sftp_store, "hostile.manifest.json", raw_manifest, fx.now())
+
+    # The CURRENT listing also carries an entry under the exact hostile
+    # name the manifest declares -- so if `parse_manifest` did NOT reject
+    # this manifest first, the pre-stream "declared part present?" check
+    # would find it "present" and this candidate would proceed straight to
+    # streaming.
+    fx_hostile_listing = _sftp_fx_with_injected_listing_entry(
+        fx, hostile_name, hostile_bytes, fx.now()
+    )
+    fx_counting, upload_calls = _counting_stream_upload(fx_hostile_listing)
+
+    outcomes = sftp_pull.acquire(feed, Window(None, None), fx_counting, "run-hostile")
+
+    assert len(outcomes) == 1
+    assert outcomes[0].disposition == "unreadable"
+
+    rows = fx.ledger.scan_feed(_FEED_ID, None)
+    assert len(rows) == 1
+    assert rows[0].disposition == "unreadable"
+    assert "files.0.name" in (rows[0].notes or "")
+    assert hostile_name not in (rows[0].notes or "")
+
+    # Parse precedes ALL writes: not one byte was ever streamed, for the
+    # manifest's declared part or for the manifest object itself.
+    assert upload_calls == []
+
+    assert _drain_events(fx, queue_url) == []
+
+
+# --- conveyer-nvh.48.11 (security-gate): windows.select_candidates' step-0 --
+# cleanliness filter, exercised end-to-end through the real driver. Unlike
+# the manifest-CONTENT test above (a hostile name declared INSIDE a
+# manifest's `files[]`), this is a hostile LISTING ENTRY -- the remote
+# directory listing itself carries a traversal-shaped name -- caught before
+# any bytes ever move, with no ledger row for the dropped entry at all (not
+# even `record_nondelivery`; see `core/windows.py`'s step-0 docstring for
+# why: an untrusted listing must never be able to spam attacker-controlled
+# `delivery_key` values into the append-only ledger).
+
+
+def test_sftp_hostile_listing_entry_dropped_trailer_mode_clean_sibling_registers(
+    local_effects: Effects, sftp_store: SftpStore, queue_url: str
+) -> None:
+    """A hostile listing entry `../evil.csv` -- only reachable here via
+    `_sftp_fx_with_injected_listing_entry`, since a well-behaved server's own
+    listdir cannot literally return a name containing "/" the way
+    `tests/conftest.py::_fake_sftp_fx` models it -- is dropped by
+    `windows.select_candidates`'s step-0 filter before ever being streamed
+    or registered, while a clean sibling in the SAME listing is unaffected.
+    `file_pattern="*.csv"` (not the default `COMM_*`) so the hostile name
+    actually MATCHES the pattern -- isolating the cleanliness filter from
+    the ordinary pattern filter.
+    """
+    fx = local_effects
+    feed = _trailer_feed_with_pattern("*.csv")
+    clean_content = b"policy_id,premium\nP1,100.00\nTOTAL:1\n"
+    _seed_remote(sftp_store, "ok.csv", clean_content, fx.now())
+
+    fx_hostile = _sftp_fx_with_injected_listing_entry(
+        fx, "../evil.csv", b"attacker-controlled-bytes", fx.now()
+    )
+    fx_counting, upload_calls = _counting_stream_upload(fx_hostile)
+
+    outcomes = sftp_pull.acquire(feed, Window(None, None), fx_counting, "run-hostile-listing")
+
+    assert len(outcomes) == 1
+    assert outcomes[0].disposition == "registered"
+
+    rows = fx.ledger.scan_feed(_FEED_ID, None)
+    assert len(rows) == 1
+    assert rows[0].delivery_key == "ok.csv"
+
+    # Only the clean sibling was ever streamed -- the hostile entry never
+    # reached `_acquire_trailer_or_timer_candidate`, let alone `stream_upload`.
+    assert len(upload_calls) == 1
+    assert all("evil" not in key for _bucket, key in upload_calls)
+
+
+def test_sftp_manifest_mode_hostile_listing_entry_never_selected_no_row(
+    local_effects: Effects, sftp_store: SftpStore, queue_url: str
+) -> None:
+    """A path-y manifest OBJECT name in the remote LISTING (as opposed to a
+    hostile name declared inside a manifest's content, covered above) --
+    dropped by `windows.select_manifests`'s step-0 filter before the
+    candidate is ever read, parsed, or registered.
+    """
+    fx = local_effects
+    feed = _manifest_feed()
+    hostile_name = "../evil.manifest.json"
+
+    fx_hostile = _sftp_fx_with_injected_listing_entry(
+        fx, hostile_name, b"irrelevant-bytes-never-read", fx.now()
+    )
+    fx_counting, upload_calls = _counting_stream_upload(fx_hostile)
+
+    outcomes = sftp_pull.acquire(
+        feed, Window(None, None), fx_counting, "run-hostile-manifest-listing"
+    )
+
+    assert outcomes == []
+    rows = fx.ledger.scan_feed(_FEED_ID, None)
+    assert rows == []
+    assert upload_calls == []
+    assert _drain_events(fx, queue_url) == []
 
 
 # --- bonus: §9.3 stuck-claim sweep resume (step 0) ---------------------------

@@ -46,6 +46,8 @@ from pydantic import (
     model_validator,
 )
 
+from ingestion.core.naming import is_clean_object_name
+
 FEED_ID_PATTERN = r"^[a-z0-9][a-z0-9-]*/[a-z0-9][a-z0-9-]*$"
 _SECRET_ARN_RE = re.compile(r"^arn:aws:secretsmanager:[a-z0-9-]+:\d{12}:secret:.+$")
 # H-3 (security-gate): `partner_principal_arns` is the single field controlling EXTERNAL
@@ -315,10 +317,21 @@ class DeliveryRecord(BaseModel):
 
 class ManifestFile(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    name: str  # basename, must be unique within the manifest (enforced in evaluate, M1)
+    name: str  # a single clean object-name segment (`is_clean_object_name`, conveyer-nvh.46/
+    # nvh.48) -- never a path: no '/', '\', '%', and not '.'/'..'/''. Must also be unique
+    # within the manifest (enforced in evaluate, M1).
     bytes: int = Field(ge=0)
     sha256: str  # 64 lowercase hex
     record_count: int | None = None
+
+    @field_validator("name")
+    @classmethod
+    def _check_name(cls, value: str) -> str:
+        if not is_clean_object_name(value):
+            raise ValueError(
+                f"name must be a single clean object-name segment, not a path: {value!r}"
+            )
+        return value
 
     @field_validator("sha256")
     @classmethod

@@ -4,12 +4,18 @@ Covers `select_candidates` (pattern filter, acquired/defective drop, force
 bypass, timer quiet-window, sort order) and `select_manifests` (acquired
 drop, force bypass, non-final re-examination is implicit — manifests never
 enter `acquired` until they are final).
+
+The step-0 cleanliness-filter tests below (conveyer-nvh.48.11) import the
+15-case rejected-traversal corpus from `tests/unit/test_naming.py` rather
+than redefining it, so the two suites can never silently drift apart.
 """
 
 from datetime import UTC, datetime, timedelta
 
+import pytest
 from ingestion.core import windows
 from ingestion.core.model import Completeness, TimerSpec, TrailerSpec
+from tests.unit.test_naming import _REJECTED_CORPUS, _REJECTED_IDS
 
 NOW = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
 TRAILER_COMPLETENESS = Completeness(mode="trailer", trailer=TrailerSpec(pattern=".*"))
@@ -147,3 +153,61 @@ def test_select_manifests_non_final_manifest_is_never_acquired_so_always_reexami
     listing = [_rf("stuck.manifest.json", 5, NOW - timedelta(days=3))]
     result = windows.select_manifests(listing, frozenset(), "*.manifest.json")
     assert [f.name for f in result] == ["stuck.manifest.json"]
+
+
+# --- step 0: cleanliness filter (conveyer-nvh.48.11) ------------------------
+# `force` never bypasses this step -- it is applied BEFORE the force branch
+# in both functions, so both a plain call and a `force=True` call must drop
+# every unclean corpus entry identically, while a clean sibling in the same
+# listing survives.
+
+
+@pytest.mark.parametrize("name", _REJECTED_CORPUS, ids=_REJECTED_IDS)
+def test_select_candidates_drops_unclean_names_even_with_force(name: str) -> None:
+    listing = [
+        _rf(name, 10, NOW - timedelta(hours=1)),
+        _rf("COMM_clean.csv", 10, NOW - timedelta(hours=1)),
+    ]
+    plain = windows.select_candidates(
+        listing, frozenset(), frozenset(), "*", TRAILER_COMPLETENESS, NOW
+    )
+    forced = windows.select_candidates(
+        listing, frozenset(), frozenset(), "*", TRAILER_COMPLETENESS, NOW, force=True
+    )
+    assert [f.name for f in plain] == ["COMM_clean.csv"]
+    assert [f.name for f in forced] == ["COMM_clean.csv"]
+
+
+@pytest.mark.parametrize("name", _REJECTED_CORPUS, ids=_REJECTED_IDS)
+def test_select_manifests_drops_unclean_names_even_with_force(name: str) -> None:
+    listing = [
+        _rf(name, 10, NOW - timedelta(hours=1)),
+        _rf("clean.manifest.json", 10, NOW - timedelta(hours=1)),
+    ]
+    plain = windows.select_manifests(listing, frozenset(), "*")
+    forced = windows.select_manifests(listing, frozenset(), "*", force=True)
+    assert [f.name for f in plain] == ["clean.manifest.json"]
+    assert [f.name for f in forced] == ["clean.manifest.json"]
+
+
+def test_select_candidates_unclean_name_matching_pattern_still_dropped() -> None:
+    """`../x.csv` matches the fnmatch pattern `*.csv` (fnmatch has no
+    slash-awareness), so the pattern filter alone would let it through --
+    the step-0 cleanliness filter must still drop it, force or not."""
+    listing = [_rf("../x.csv", 10, NOW), _rf("x.csv", 10, NOW)]
+    plain = windows.select_candidates(
+        listing, frozenset(), frozenset(), "*.csv", TRAILER_COMPLETENESS, NOW
+    )
+    forced = windows.select_candidates(
+        listing, frozenset(), frozenset(), "*.csv", TRAILER_COMPLETENESS, NOW, force=True
+    )
+    assert [f.name for f in plain] == ["x.csv"]
+    assert [f.name for f in forced] == ["x.csv"]
+
+
+def test_select_manifests_unclean_name_matching_pattern_still_dropped() -> None:
+    listing = [_rf("../x.manifest.json", 10, NOW), _rf("x.manifest.json", 10, NOW)]
+    plain = windows.select_manifests(listing, frozenset(), "*.manifest.json")
+    forced = windows.select_manifests(listing, frozenset(), "*.manifest.json", force=True)
+    assert [f.name for f in plain] == ["x.manifest.json"]
+    assert [f.name for f in forced] == ["x.manifest.json"]

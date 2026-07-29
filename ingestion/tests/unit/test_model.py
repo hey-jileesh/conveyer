@@ -9,6 +9,7 @@ the broader unit-level companion.
 """
 
 import dataclasses
+import json
 from datetime import UTC, date, datetime
 from typing import Any
 
@@ -33,6 +34,7 @@ from ingestion.core.model import (
     Window,
 )
 from pydantic import ValidationError
+from tests.unit.test_naming import _REJECTED_CORPUS, _REJECTED_IDS
 
 NOW = datetime(2026, 7, 24, 12, 0, 0, tzinfo=UTC)
 
@@ -376,6 +378,45 @@ def test_manifest_file_sha256_must_be_64_lowercase_hex() -> None:
     with pytest.raises(ValidationError) as exc_info:
         ManifestFile(name="a.csv", bytes=1, sha256="NOTHEX")
     assert _error_messages(exc_info.value) == ["sha256 must be 64 lowercase hex characters"]
+
+
+# --- ManifestFile.name — clean object-name grammar (conveyer-nvh.46/nvh.48) -
+# Imports the 15-case rejected-traversal corpus from `test_naming.py` rather
+# than redefining it, so the two suites can never silently drift apart.
+# Every rejected name must surface as a `("name",)`-located, `value_error`-
+# typed violation (H-4: (loc, type) only, never the raw offending string, in
+# whatever reason string gets built from these errors downstream in
+# `completeness.py::parse_manifest`).
+
+
+@pytest.mark.parametrize("name", _REJECTED_CORPUS, ids=_REJECTED_IDS)
+def test_manifest_file_name_rejects_traversal_corpus(name: str) -> None:
+    with pytest.raises(ValidationError) as exc_info:
+        ManifestFile(name=name, bytes=1, sha256="a" * 64)
+    (err,) = exc_info.value.errors()
+    assert err["loc"] == ("name",)
+    assert err["type"] == "value_error"
+
+
+def test_manifest_file_name_accepts_clean_basename() -> None:
+    manifest_file = ManifestFile(name="statement-2026-07.csv", bytes=1, sha256="a" * 64)
+    assert manifest_file.name == "statement-2026-07.csv"
+
+
+def test_manifest_v1_model_validate_json_surfaces_hostile_name_defect_at_files_0_name() -> None:
+    raw = json.dumps(
+        {
+            "manifest_version": 1,
+            "manifest_id": "m1",
+            "feed_id": "carrier-x/commission-statements",
+            "files": [{"name": "../../incoming/attacker.csv", "bytes": 1, "sha256": "a" * 64}],
+        }
+    ).encode("utf-8")
+    with pytest.raises(ValidationError) as exc_info:
+        ManifestV1.model_validate_json(raw)
+    (err,) = exc_info.value.errors()
+    assert err["loc"] == ("files", 0, "name")
+    assert err["type"] == "value_error"
 
 
 def test_manifest_v1_allows_extra_fields() -> None:
