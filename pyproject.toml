@@ -2,11 +2,24 @@
 name = "conveyer"
 version = "0.1.0"
 description = "Conveyer — large-volume batch data processing lane (immutable-fact pipeline on Iceberg). See design/001_batch_data_processing_architecture.md."
-requires-python = ">=3.12"
+# Loosened from >=3.12 (workspace floor forces every member's requires-python
+# to permit any interpreter used anywhere in the workspace): the spine member
+# targets Python 3.11 for Glue 5.0 parity (LLD 004.1 I-1) via
+# `uv run -p 3.11 --package conveyer-spine`, which uv checks against ALL
+# member declarations, not just spine's -- ingestion's floor loosened to
+# match for the same reason (see its pyproject.toml comment). The default
+# workspace interpreter (this project's own venv, ingestion's CI) stays 3.12.
+requires-python = ">=3.11"
 dependencies = []
 
 [tool.uv]
 package = false
 
 [tool.uv.workspace]
-members = ["ingestion"]
+members = ["ingestion", "spine"]
+
+[dependency-groups]
+dev = [
+    "ipykernel>=7.3.0",
+    "jupyter-client>=8.9.1",
+]

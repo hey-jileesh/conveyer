@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "pipeline": "pipelines/identity",
+  "feed_id": "feed/identity",
+  "batch_id": "00000000-0000-5000-8000-000000000001",
+  "delivery_id": "00000000-0000-4000-8000-000000000001",
+  "raw_count": 2,
+  "pre_quarantined": 0,
+  "post_quarantined": 0,
+  "fact_count": 2,
+  "fact_snapshot_id": 1002,
+  "state_snapshot_id": 1003,
+  "completed_at": "2026-07-25T09:00:05Z"
+}

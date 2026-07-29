@@ -2,8 +2,8 @@
 # CI = `make lint schemas registry test coverage`; that sequence green is the definition of mergeable.
 UV := uv run
 
-.PHONY: setup lint schemas registry test test-unit test-golden test-integration coverage \
-        package push-image bootstrap-ledger plan apply put-secret smoke
+.PHONY: setup lint schemas registry test test-unit test-golden test-integration test-contracts \
+        coverage package push-image bootstrap-ledger plan apply put-secret smoke
 
 setup:
 	uv sync --all-packages
@@ -12,7 +12,7 @@ lint:
 	$(UV) ruff check .
 	$(UV) ruff format --check .
 	$(UV) mypy
-	$(UV) python tools/purity_linter.py  # M0 deliverable (LLD §12.2)
+	$(UV) python ../tools/purity_linter.py ingestion  # promoted engine, config-as-data (LLD 004.1 I-15/§12.3)
 
 schemas:  ## regenerate contracts/*.json from core/model.py; fail on drift (LLD §6)
 	$(UV) python -m tools.export_schemas  # M0 deliverable
@@ -30,7 +30,10 @@ test-golden:
 test-integration:
 	$(UV) pytest tests/integration
 
-test: test-unit test-golden test-integration
+test-contracts:  ## producer-side exactness against contracts/fixtures/events/** (LLD 004.1 I-16)
+	$(UV) pytest tests/contracts
+
+test: test-unit test-golden test-integration test-contracts
 
 # LLD §12.5 gate: core/ >= 95% branch; overall >= 85% (`pyproject.toml`'s
 # [tool.coverage.run] sets `branch = true` + the one whole-file adapter

@@ -304,4 +304,188 @@ run "security_fixes" {
     ])
     error_message = "M-6 completion: the DLQ resource policy must grant events.amazonaws.com sqs:SendMessage, scoped to this account, or EventBridge rule targets' dead_letter_config is silently inert."
   }
+
+  # --- LLD 004.1 I-17 [E-7, S-12]: maintenance role's delete grant is
+  # EXACTLY the ledger prefix + the spine run-ledger prefix -- never a
+  # `${p}-lake/*` wildcard. Verified to catch a regression: temporarily
+  # widening the resource to `"${aws_s3_bucket.lake.arn}/*"` fails this
+  # assertion (checked manually, then reverted).
+  assert {
+    condition = anytrue([
+      for s in jsondecode(data.aws_iam_policy_document.maintenance.json).Statement :
+      s.Sid == "LedgerObjectsReadWriteDelete" &&
+      toset(flatten([s.Resource])) == toset([
+        "${aws_s3_bucket.lake.arn}/ledger/*",
+        "${aws_s3_bucket.lake.arn}/spine/run_ledger/*",
+      ]) &&
+      toset(flatten([s.Action])) == toset(["s3:GetObject", "s3:PutObject", "s3:DeleteObject"])
+    ])
+    error_message = "I-17/E-7/S-12: the maintenance role's LedgerObjectsReadWriteDelete statement must grant delete on EXACTLY the ingestion ledger prefix and the spine run_ledger prefix -- no wildcard, no other resources."
+  }
+
+  # --- LLD 004.1 S12.6(3)/I-17: CONVEYER_MAINTENANCE_TABLES defaults to the
+  # single ingestion ledger identifier when `spine_run_ledger_identifier` is
+  # unset (this run's `variables{}` block never sets it) -- existing
+  # behavior unchanged.
+  assert {
+    condition     = aws_lambda_function.maintenance.environment[0].variables["CONVEYER_MAINTENANCE_TABLES"] == "conveyer_test_ingestion.delivery_ledger"
+    error_message = "S12.6(3): CONVEYER_MAINTENANCE_TABLES must default to exactly the single ingestion ledger identifier when the spine run-ledger identifier input is unset."
+  }
+}
+
+# --- LLD 004.1 S12.6(3)/I-17: with the spine run-ledger identifier wired,
+# the maintenance Lambda's table list carries BOTH identifiers, and the
+# delete grant (asserted above) is unchanged -- proving the grant is not
+# conditioned on the table-list var (it must exist regardless, per I-17).
+run "maintenance_table_list_with_spine" {
+  command = apply
+
+  variables {
+    spine_run_ledger_identifier = "conveyer_test_spine.run_ledger"
+  }
+
+  override_data {
+    target = data.aws_caller_identity.current
+    values = {
+      account_id = "123456789012"
+      arn        = "arn:aws:iam::123456789012:root"
+      user_id    = "AIDAEXAMPLE"
+    }
+  }
+
+  override_resource {
+    target = aws_s3_bucket.landing
+    values = { id = "conveyer-test-landing", arn = "arn:aws:s3:::conveyer-test-landing" }
+  }
+  override_resource {
+    target = aws_s3_bucket.lake
+    values = { id = "conveyer-test-lake", arn = "arn:aws:s3:::conveyer-test-lake" }
+  }
+  override_resource {
+    target = aws_s3_bucket.artifacts
+    values = { id = "conveyer-test-artifacts", arn = "arn:aws:s3:::conveyer-test-artifacts" }
+  }
+  override_resource { target = aws_s3_bucket_server_side_encryption_configuration.landing }
+  override_resource { target = aws_s3_bucket_server_side_encryption_configuration.lake }
+  override_resource { target = aws_s3_bucket_server_side_encryption_configuration.artifacts }
+  override_resource { target = aws_s3_bucket_public_access_block.landing }
+  override_resource { target = aws_s3_bucket_public_access_block.lake }
+  override_resource { target = aws_s3_bucket_public_access_block.artifacts }
+  override_resource { target = aws_s3_bucket_versioning.landing }
+  override_resource { target = aws_s3_bucket_notification.landing }
+  override_resource { target = aws_s3_bucket_lifecycle_configuration.landing }
+  override_resource { target = aws_s3_bucket_lifecycle_configuration.artifacts }
+  override_resource { target = aws_s3_bucket_policy.landing }
+  override_resource { target = aws_s3_bucket_policy.lake }
+  override_resource { target = aws_s3_bucket_policy.artifacts }
+  override_resource { target = aws_s3_object.feeds_json }
+  override_resource {
+    target = aws_dynamodb_table.cas
+    values = { name = "conveyer-test-ingestion-cas", arn = "arn:aws:dynamodb:us-east-1:123456789012:table/conveyer-test-ingestion-cas" }
+  }
+  override_resource { target = aws_glue_catalog_database.ingestion }
+  override_resource {
+    target = aws_athena_workgroup.ingestion
+    values = { id = "conveyer-test-ingestion", name = "conveyer-test-ingestion", arn = "arn:aws:athena:us-east-1:123456789012:workgroup/conveyer-test-ingestion" }
+  }
+  override_resource { target = aws_athena_named_query.current_dispositions }
+  override_resource { target = aws_athena_named_query.feed_watermarks }
+  override_resource { target = aws_athena_named_query.duplicate_rate_30d }
+  override_resource { target = aws_athena_named_query.deliveries_for_batch }
+  override_resource {
+    target = aws_cloudwatch_event_bus.ingestion
+    values = { name = "conveyer-test-bus", arn = "arn:aws:events:us-east-1:123456789012:event-bus/conveyer-test-bus" }
+  }
+  override_resource {
+    target = aws_cloudwatch_log_group.events
+    values = { name = "/conveyer/test/ingestion/events", arn = "arn:aws:logs:us-east-1:123456789012:log-group:/conveyer/test/ingestion/events" }
+  }
+  override_resource {
+    target = aws_cloudwatch_log_group.registrar
+    values = { name = "/aws/lambda/conveyer-test-registrar", arn = "arn:aws:logs:us-east-1:123456789012:log-group:/aws/lambda/conveyer-test-registrar" }
+  }
+  override_resource {
+    target = aws_cloudwatch_log_group.absence
+    values = { name = "/aws/lambda/conveyer-test-absence", arn = "arn:aws:logs:us-east-1:123456789012:log-group:/aws/lambda/conveyer-test-absence" }
+  }
+  override_resource {
+    target = aws_cloudwatch_log_group.maintenance
+    values = { name = "/aws/lambda/conveyer-test-maintenance", arn = "arn:aws:logs:us-east-1:123456789012:log-group:/aws/lambda/conveyer-test-maintenance" }
+  }
+  override_resource {
+    target = aws_cloudwatch_event_rule.observability
+    values = { name = "conveyer-test-ingestion-observability", arn = "arn:aws:events:us-east-1:123456789012:rule/conveyer-test-bus/conveyer-test-ingestion-observability" }
+  }
+  override_resource { target = aws_cloudwatch_event_target.observability_logs }
+  override_resource { target = aws_cloudwatch_log_resource_policy.events }
+  override_resource {
+    target = aws_sqs_queue.dlq
+    values = {
+      id   = "https://sqs.us-east-1.amazonaws.com/123456789012/conveyer-test-ingestion-dlq"
+      name = "conveyer-test-ingestion-dlq"
+      arn  = "arn:aws:sqs:us-east-1:123456789012:conveyer-test-ingestion-dlq"
+    }
+  }
+  override_resource { target = aws_sqs_queue_policy.dlq }
+  override_resource {
+    target = aws_iam_role.registrar
+    values = { name = "conveyer-test-registrar", arn = "arn:aws:iam::123456789012:role/conveyer-test-registrar" }
+  }
+  override_resource {
+    target = aws_iam_role.absence
+    values = { name = "conveyer-test-absence", arn = "arn:aws:iam::123456789012:role/conveyer-test-absence" }
+  }
+  override_resource {
+    target = aws_iam_role.maintenance
+    values = { name = "conveyer-test-maintenance", arn = "arn:aws:iam::123456789012:role/conveyer-test-maintenance" }
+  }
+  override_resource {
+    target = aws_iam_role.scheduler
+    values = { name = "conveyer-test-scheduler", arn = "arn:aws:iam::123456789012:role/conveyer-test-scheduler" }
+  }
+  override_resource { target = aws_iam_role_policy_attachment.registrar_basic }
+  override_resource { target = aws_iam_role_policy_attachment.absence_basic }
+  override_resource { target = aws_iam_role_policy_attachment.maintenance_basic }
+  override_resource { target = aws_iam_role_policy.registrar }
+  override_resource { target = aws_iam_role_policy.absence }
+  override_resource { target = aws_iam_role_policy.maintenance }
+  override_resource { target = aws_iam_role_policy.scheduler }
+  override_resource {
+    target = aws_lambda_function.registrar
+    values = { arn = "arn:aws:lambda:us-east-1:123456789012:function:conveyer-test-registrar", function_name = "conveyer-test-registrar" }
+  }
+  override_resource {
+    target = aws_lambda_function.absence
+    values = { arn = "arn:aws:lambda:us-east-1:123456789012:function:conveyer-test-absence", function_name = "conveyer-test-absence" }
+  }
+  override_resource {
+    target = aws_lambda_function.maintenance
+    values = { arn = "arn:aws:lambda:us-east-1:123456789012:function:conveyer-test-maintenance", function_name = "conveyer-test-maintenance" }
+  }
+  override_resource { target = aws_ecr_repository.ingestion }
+  override_resource { target = aws_ecr_lifecycle_policy.ingestion }
+  override_resource { target = aws_scheduler_schedule.absence }
+  override_resource { target = aws_scheduler_schedule.maintenance }
+  override_resource { target = aws_cloudwatch_metric_alarm.dlq_messages_visible }
+  override_resource { target = aws_cloudwatch_metric_alarm.function_errors }
+  override_resource { target = aws_cloudwatch_metric_alarm.unreadable }
+  override_resource { target = aws_cloudwatch_metric_alarm.stuck_claims_recovered }
+  override_resource { target = aws_cloudwatch_metric_alarm.overdue_emitted }
+
+  assert {
+    condition     = aws_lambda_function.maintenance.environment[0].variables["CONVEYER_MAINTENANCE_TABLES"] == "conveyer_test_ingestion.delivery_ledger,conveyer_test_spine.run_ledger"
+    error_message = "S12.6(3): CONVEYER_MAINTENANCE_TABLES must carry both the ingestion ledger and the spine run-ledger identifiers when the latter is wired in."
+  }
+
+  assert {
+    condition = anytrue([
+      for s in jsondecode(data.aws_iam_policy_document.maintenance.json).Statement :
+      s.Sid == "LedgerObjectsReadWriteDelete" &&
+      toset(flatten([s.Resource])) == toset([
+        "${aws_s3_bucket.lake.arn}/ledger/*",
+        "${aws_s3_bucket.lake.arn}/spine/run_ledger/*",
+      ])
+    ])
+    error_message = "I-17: the delete grant must stay EXACTLY these two prefixes even once the spine identifier is wired into the table list -- it is not conditioned on that var."
+  }
 }

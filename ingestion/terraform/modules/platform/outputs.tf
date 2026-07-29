@@ -137,6 +137,19 @@ output "registrar_function_arn" {
   value = aws_lambda_function.registrar.arn
 }
 
+# --- IAM roles that hold events:PutEvents on the shared bus (LLD 004.1 I-22:
+# the spine-platform module's bus resource policy needs these ARNs, via the
+# env root, to keep ingestion's own producers working once that policy is
+# applied) -------------------------------------------------------------------
+
+output "registrar_role_arn" {
+  value = aws_iam_role.registrar.arn
+}
+
+output "absence_role_arn" {
+  value = aws_iam_role.absence.arn
+}
+
 # --- scheduler role -- every per-feed pull schedule (S10.7) reuses this ---
 
 output "scheduler_role_arn" {

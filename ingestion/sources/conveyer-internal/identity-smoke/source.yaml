@@ -1,0 +1,10 @@
+feed_id: conveyer-internal/identity-smoke
+driver: s3-push
+pipeline: pipelines/identity
+connection:
+  partner_principal_arns:
+    - arn:aws:iam::000000000000:role/conveyer-dev-deploy   # placeholder; the smoke script's own uploader principal, dev only
+completeness:
+  mode: trailer
+  trailer:
+    pattern: "TOTAL:\\d+"

@@ -129,7 +129,14 @@ resource "aws_lambda_function" "maintenance" {
   }
 
   environment {
-    variables = local.base_env
+    # `CONVEYER_MAINTENANCE_TABLES` -- LLD 004.1 S12.6(3)/I-17 [E-7]: the
+    # OPTIMIZE+VACUUM table list, additive to `RuntimeConfig`/`base_env`
+    # (parsed by `ingestion.config._parse_maintenance_tables`; unset default
+    # there resolves to the single ledger identifier this var itself always
+    # includes).
+    variables = merge(local.base_env, {
+      CONVEYER_MAINTENANCE_TABLES = join(",", local.maintenance_tables)
+    })
   }
 
   dead_letter_config {

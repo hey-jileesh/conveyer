@@ -1,0 +1,85 @@
+{
+  "additionalProperties": false,
+  "properties": {
+    "batch_id": {
+      "title": "Batch Id",
+      "type": "string"
+    },
+    "completed_at": {
+      "format": "date-time",
+      "title": "Completed At",
+      "type": "string"
+    },
+    "delivery_id": {
+      "title": "Delivery Id",
+      "type": "string"
+    },
+    "fact_count": {
+      "title": "Fact Count",
+      "type": "integer"
+    },
+    "fact_snapshot_id": {
+      "anyOf": [
+        {
+          "type": "integer"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "title": "Fact Snapshot Id"
+    },
+    "feed_id": {
+      "title": "Feed Id",
+      "type": "string"
+    },
+    "pipeline": {
+      "title": "Pipeline",
+      "type": "string"
+    },
+    "post_quarantined": {
+      "title": "Post Quarantined",
+      "type": "integer"
+    },
+    "pre_quarantined": {
+      "title": "Pre Quarantined",
+      "type": "integer"
+    },
+    "raw_count": {
+      "title": "Raw Count",
+      "type": "integer"
+    },
+    "schema_version": {
+      "const": 1,
+      "default": 1,
+      "title": "Schema Version",
+      "type": "integer"
+    },
+    "state_snapshot_id": {
+      "anyOf": [
+        {
+          "type": "integer"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "title": "State Snapshot Id"
+    }
+  },
+  "required": [
+    "pipeline",
+    "feed_id",
+    "batch_id",
+    "delivery_id",
+    "raw_count",
+    "pre_quarantined",
+    "post_quarantined",
+    "fact_count",
+    "fact_snapshot_id",
+    "state_snapshot_id",
+    "completed_at"
+  ],
+  "title": "BatchCompletedV1",
+  "type": "object"
+}

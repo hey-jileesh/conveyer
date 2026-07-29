@@ -44,6 +44,16 @@ locals {
   s3_push_feeds   = [for f in local.feeds : f if f.driver == "s3-push"]
   sftp_pull_feeds = [for f in local.feeds : f if f.driver == "sftp-pull"]
 
+  # LLD 004.1 S12.6(3)/I-17 [E-7]: the maintenance Lambda's table-list env
+  # var -- the ingestion ledger, always, plus the spine run ledger's
+  # identifier when the env root has wired `var.spine_run_ledger_identifier`
+  # (empty by default, so a standalone apply of this module is unaffected).
+  # `compact()` drops the empty-string entry.
+  maintenance_tables = compact([
+    "${local.glue_database}.${local.ledger_table}",
+    var.spine_run_ledger_identifier,
+  ])
+
   # CONVEYER_* env vars every function needs (S7.2); `CONVEYER_FEED_ID` is
   # added only by modules/feed's per-feed driver functions.
   base_env = {

@@ -39,6 +39,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
+from ingestion import config as config_module
 from ingestion.bootstrap.create_ledger import bootstrap_ledger
 from ingestion.config import RuntimeConfig
 from ingestion.core import decisions
@@ -82,7 +83,9 @@ def _row(
     )
 
 
-def _runtime_config(tmp_path: Path) -> RuntimeConfig:
+def _runtime_config(
+    tmp_path: Path, *, maintenance_tables: tuple[str, ...] | None = None
+) -> RuntimeConfig:
     return RuntimeConfig(
         env="test",
         aws_region="us-east-1",
@@ -96,17 +99,20 @@ def _runtime_config(tmp_path: Path) -> RuntimeConfig:
         registry_uri="s3://artifacts/registry/feeds.json",
         athena_workgroup="conveyer-test-workgroup",
         athena_output_uri="s3://artifacts/athena-output/",
+        maintenance_tables=maintenance_tables or (f"{_GLUE_DATABASE}.{_LEDGER_TABLE}",),
         feed_id=None,
     )
 
 
-def _bare_ledger_effects(tmp_path: Path, now: datetime) -> Effects:
+def _bare_ledger_effects(
+    tmp_path: Path, now: datetime, *, maintenance_tables: tuple[str, ...] | None = None
+) -> Effects:
     """A real `SqlCatalog` ledger, no moto -- same lightweight construction
     style as `tests/integration/test_ledger_fx.py`. Every other `Effects`
     field is `None`/unused: `optimize.py`'s functions under test here only
     ever touch `fx.ledger`, `fx.now`, and `fx.config`.
     """
-    config = _runtime_config(tmp_path)
+    config = _runtime_config(tmp_path, maintenance_tables=maintenance_tables)
     ledger_config = LedgerConfig(
         catalog_kind="sql",
         glue_database=_GLUE_DATABASE,
@@ -177,16 +183,28 @@ def test_run_query_raises_transient_error_on_timeout() -> None:
 # --- SQL builders ------------------------------------------------------------
 
 
-def test_optimize_sql_targets_configured_ledger(tmp_path: Path) -> None:
-    config = _runtime_config(tmp_path)
-    assert optimize.optimize_sql(config) == (
+def test_optimize_sql_targets_given_identifier() -> None:
+    assert optimize.optimize_sql(f"{_GLUE_DATABASE}.{_LEDGER_TABLE}") == (
         f"OPTIMIZE {_GLUE_DATABASE}.{_LEDGER_TABLE} REWRITE DATA USING BIN_PACK"
     )
 
 
-def test_vacuum_sql_targets_configured_ledger(tmp_path: Path) -> None:
-    config = _runtime_config(tmp_path)
-    assert optimize.vacuum_sql(config) == f"VACUUM {_GLUE_DATABASE}.{_LEDGER_TABLE}"
+def test_optimize_sql_targets_a_second_non_ledger_identifier() -> None:
+    assert optimize.optimize_sql("conveyer_dev_spine.run_ledger") == (
+        "OPTIMIZE conveyer_dev_spine.run_ledger REWRITE DATA USING BIN_PACK"
+    )
+
+
+def test_vacuum_sql_targets_given_identifier() -> None:
+    assert optimize.vacuum_sql(f"{_GLUE_DATABASE}.{_LEDGER_TABLE}") == (
+        f"VACUUM {_GLUE_DATABASE}.{_LEDGER_TABLE}"
+    )
+
+
+def test_vacuum_sql_targets_a_second_non_ledger_identifier() -> None:
+    assert optimize.vacuum_sql("conveyer_dev_spine.run_ledger") == (
+        "VACUUM conveyer_dev_spine.run_ledger"
+    )
 
 
 def test_live_duplicates_sql_shape(tmp_path: Path) -> None:
@@ -361,13 +379,24 @@ def test_reconcile_supersessions_second_call_with_unchanged_input_appends_nothin
 
 
 def _fake_athena_echoing_ledger(
-    scan_feed: Callable[[str, datetime | None], list[DeliveryRecord]], feed_id: str
+    scan_feed: Callable[[str, datetime | None], list[DeliveryRecord]],
+    feed_id: str,
+    *,
+    recorded_sql: list[str] | None = None,
 ) -> optimize.AthenaFx:
     """Every step SUCCEEDS immediately; the reconciliation query's results
     are computed FROM the same local ledger `run_maintenance` will append
     to, round-tripped through the real Athena row shape -- proves
     `run_maintenance` end to end without ever needing a real Athena.
+    `recorded_sql`, if given, accumulates every `start_query` SQL string in
+    call order -- lets a test assert the OPTIMIZE/VACUUM loop hit every
+    configured table identifier, not just the ledger.
     """
+
+    def start_query(sql: str) -> str:
+        if recorded_sql is not None:
+            recorded_sql.append(sql)
+        return "qid"
 
     def get_results(query_execution_id: str) -> list[dict[str, str | None]]:
         grouped = optimize.live_duplicates_from_rows(scan_feed(feed_id, None))
@@ -375,7 +404,7 @@ def _fake_athena_echoing_ledger(
         return [_to_athena_row(record) for record in flat]
 
     return optimize.AthenaFx(
-        start_query=lambda sql: "qid",
+        start_query=start_query,
         poll=lambda query_execution_id: "SUCCEEDED",
         get_results=get_results,
     )
@@ -396,6 +425,149 @@ def test_run_maintenance_full_orchestration_is_idempotent_on_second_run(tmp_path
     second = optimize.run_maintenance(fx, athena, sleep_fn=sleeps.append)
     assert second == ()
     assert len(fx.ledger.scan_feed("carrier-y/renewal-statements", None)) == 3
+
+
+def test_run_maintenance_loops_optimize_and_vacuum_over_every_configured_table(
+    tmp_path: Path,
+) -> None:
+    """LLD 004.1 §12.6(3)/I-17: `CONVEYER_MAINTENANCE_TABLES`-driven
+    multi-table loop. OPTIMIZE+VACUUM must run once per configured table
+    identifier (here: the ingestion ledger PLUS a stand-in spine run-ledger
+    identifier) -- but the supersession reconciliation query stays
+    ledger-only, never looped.
+    """
+    spine_identifier = "conveyer_dev_spine.run_ledger"
+    ledger_identifier = f"{_GLUE_DATABASE}.{_LEDGER_TABLE}"
+    fx = _bare_ledger_effects(
+        tmp_path,
+        NOW + timedelta(hours=1),
+        maintenance_tables=(ledger_identifier, spine_identifier),
+    )
+    old = _row("d-old", "k1", NOW - timedelta(days=1))
+    new = _row("d-new", "k1", NOW)
+    fx.ledger.append([old, new])
+
+    recorded_sql: list[str] = []
+    athena = _fake_athena_echoing_ledger(
+        fx.ledger.scan_feed, "carrier-y/renewal-statements", recorded_sql=recorded_sql
+    )
+    result = optimize.run_maintenance(fx, athena)
+
+    assert [r.delivery_id for r in result] == ["d-old"]
+    assert recorded_sql == [
+        optimize.optimize_sql(ledger_identifier),
+        optimize.vacuum_sql(ledger_identifier),
+        optimize.optimize_sql(spine_identifier),
+        optimize.vacuum_sql(spine_identifier),
+        optimize.live_duplicates_sql(fx.config),  # reconciliation: ledger-only, runs once
+    ]
+
+
+def test_run_maintenance_defaults_to_the_single_ledger_table_when_unconfigured(
+    tmp_path: Path,
+) -> None:
+    """Confirms EXISTING BEHAVIOR IS UNCHANGED: a `RuntimeConfig` built the
+    same way `from_env`'s default (`CONVEYER_MAINTENANCE_TABLES` unset)
+    resolves -- `maintenance_tables` carrying exactly one entry -- makes
+    `run_maintenance` OPTIMIZE+VACUUM the ledger once, same as before this
+    change.
+    """
+    ledger_identifier = f"{_GLUE_DATABASE}.{_LEDGER_TABLE}"
+    fx = _bare_ledger_effects(tmp_path, NOW + timedelta(hours=1))
+    assert fx.config.maintenance_tables == (ledger_identifier,)
+
+    recorded_sql: list[str] = []
+    athena = _fake_athena_echoing_ledger(
+        fx.ledger.scan_feed, "carrier-y/renewal-statements", recorded_sql=recorded_sql
+    )
+    optimize.run_maintenance(fx, athena)
+
+    assert recorded_sql == [
+        optimize.optimize_sql(ledger_identifier),
+        optimize.vacuum_sql(ledger_identifier),
+        optimize.live_duplicates_sql(fx.config),
+    ]
+
+
+# --- config: CONVEYER_MAINTENANCE_TABLES parsing (LLD 004.1 §12.6(3)) -------
+
+
+def test_parse_maintenance_tables_defaults_to_single_ledger_identifier_when_unset() -> None:
+    assert config_module._parse_maintenance_tables(
+        {}, glue_database="db", ledger_table="ledger"
+    ) == ("db.ledger",)
+
+
+def test_parse_maintenance_tables_defaults_when_env_var_is_blank() -> None:
+    assert config_module._parse_maintenance_tables(
+        {"CONVEYER_MAINTENANCE_TABLES": ""}, glue_database="db", ledger_table="ledger"
+    ) == ("db.ledger",)
+
+
+def test_parse_maintenance_tables_splits_comma_list() -> None:
+    assert config_module._parse_maintenance_tables(
+        {"CONVEYER_MAINTENANCE_TABLES": "db.ledger,spine_db.run_ledger"},
+        glue_database="db",
+        ledger_table="ledger",
+    ) == ("db.ledger", "spine_db.run_ledger")
+
+
+def test_parse_maintenance_tables_trims_whitespace_and_drops_blank_entries() -> None:
+    assert config_module._parse_maintenance_tables(
+        {"CONVEYER_MAINTENANCE_TABLES": " db.ledger , spine_db.run_ledger ,, "},
+        glue_database="db",
+        ledger_table="ledger",
+    ) == ("db.ledger", "spine_db.run_ledger")
+
+
+def test_from_env_maintenance_tables_defaults_to_single_ledger_identifier(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("CONVEYER_ENV", "test")
+    monkeypatch.setenv("CONVEYER_AWS_REGION", "us-east-1")
+    monkeypatch.setenv("CONVEYER_LANDING_BUCKET", "landing")
+    monkeypatch.setenv("CONVEYER_LAKE_BUCKET", "lake")
+    monkeypatch.setenv("CONVEYER_ARTIFACTS_BUCKET", "artifacts")
+    monkeypatch.setenv("CONVEYER_GLUE_DATABASE", _GLUE_DATABASE)
+    monkeypatch.setenv("CONVEYER_LEDGER_TABLE", _LEDGER_TABLE)
+    monkeypatch.setenv("CONVEYER_CAS_TABLE", "cas")
+    monkeypatch.setenv("CONVEYER_EVENT_BUS", "bus")
+    monkeypatch.setenv("CONVEYER_REGISTRY_URI", "s3://artifacts/registry/feeds.json")
+    monkeypatch.setenv("CONVEYER_ATHENA_WORKGROUP", "wg")
+    monkeypatch.setenv("CONVEYER_ATHENA_OUTPUT_URI", "s3://artifacts/athena-output/")
+    monkeypatch.delenv("CONVEYER_MAINTENANCE_TABLES", raising=False)
+    monkeypatch.delenv("CONVEYER_FEED_ID", raising=False)
+
+    resolved = config_module.from_env()
+    assert resolved.maintenance_tables == (f"{_GLUE_DATABASE}.{_LEDGER_TABLE}",)
+
+
+def test_from_env_maintenance_tables_reads_the_configured_list(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("CONVEYER_ENV", "test")
+    monkeypatch.setenv("CONVEYER_AWS_REGION", "us-east-1")
+    monkeypatch.setenv("CONVEYER_LANDING_BUCKET", "landing")
+    monkeypatch.setenv("CONVEYER_LAKE_BUCKET", "lake")
+    monkeypatch.setenv("CONVEYER_ARTIFACTS_BUCKET", "artifacts")
+    monkeypatch.setenv("CONVEYER_GLUE_DATABASE", _GLUE_DATABASE)
+    monkeypatch.setenv("CONVEYER_LEDGER_TABLE", _LEDGER_TABLE)
+    monkeypatch.setenv("CONVEYER_CAS_TABLE", "cas")
+    monkeypatch.setenv("CONVEYER_EVENT_BUS", "bus")
+    monkeypatch.setenv("CONVEYER_REGISTRY_URI", "s3://artifacts/registry/feeds.json")
+    monkeypatch.setenv("CONVEYER_ATHENA_WORKGROUP", "wg")
+    monkeypatch.setenv("CONVEYER_ATHENA_OUTPUT_URI", "s3://artifacts/athena-output/")
+    monkeypatch.setenv(
+        "CONVEYER_MAINTENANCE_TABLES",
+        f"{_GLUE_DATABASE}.{_LEDGER_TABLE},conveyer_dev_spine.run_ledger",
+    )
+    monkeypatch.delenv("CONVEYER_FEED_ID", raising=False)
+
+    resolved = config_module.from_env()
+    assert resolved.maintenance_tables == (
+        f"{_GLUE_DATABASE}.{_LEDGER_TABLE}",
+        "conveyer_dev_spine.run_ledger",
+    )
 
 
 # --- build_athena_fx: construction-only smoke test --------------------------

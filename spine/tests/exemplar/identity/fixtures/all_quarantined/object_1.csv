@@ -1,0 +1,3 @@
+domain_id,event_time,source_ts,content_hash,payload
+,2026-03-01T00:00:00Z,2026-03-01T00:00:00Z,h-201,zulu
+,2026-03-01T00:00:01Z,2026-03-01T00:00:01Z,h-202,yankee

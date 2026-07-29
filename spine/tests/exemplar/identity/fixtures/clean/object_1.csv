@@ -1,0 +1,3 @@
+domain_id,event_time,source_ts,content_hash,payload
+id-001,2026-01-01T00:00:00Z,2026-01-01T00:00:00Z,h-001,alpha
+id-002,2026-01-01T00:00:01Z,2026-01-01T00:00:01Z,h-002,bravo

@@ -305,6 +305,14 @@ resource "aws_s3_bucket_policy" "lake" {
 # --- artifacts: TLS-only, athena-results/ 30 d expiry, feeds.json object ---
 
 data "aws_iam_policy_document" "artifacts" {
+  # LLD 004.1 S10.1/I-23: merges the spine-platform module's `spine/*`
+  # protection statement (its `artifacts_spine_policy_document_json`
+  # output) in, via the env root's `extra_artifacts_policy_statements_json`
+  # -- this is the ONLY `aws_s3_bucket_policy` against the artifacts
+  # bucket; a second module must never create its own (single-writer
+  # cross-module hazard, see the platform module's own header note).
+  source_policy_documents = var.extra_artifacts_policy_statements_json
+
   statement {
     sid       = "DenyInsecureTransport"
     effect    = "Deny"

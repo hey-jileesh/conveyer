@@ -321,11 +321,18 @@ data "aws_iam_policy_document" "maintenance" {
     resources = local.glue_ledger_arns
   }
 
-  # The sole ledger-prefix Delete grant in the platform (D-9).
+  # The sole ledger-prefix Delete grant in the platform (D-9), extended by
+  # LLD 004.1 I-17 [E-7, S-12] with EXACTLY the spine run ledger's prefix --
+  # never a `${p}-lake/*` wildcard. This is the only principal anywhere
+  # (ingestion or spine) holding delete on `spine/run_ledger/*` (S10.3's
+  # "no spine role holds any delete permission").
   statement {
-    sid       = "LedgerObjectsReadWriteDelete"
-    actions   = ["s3:GetObject", "s3:PutObject", "s3:DeleteObject"]
-    resources = ["${aws_s3_bucket.lake.arn}/ledger/*"]
+    sid     = "LedgerObjectsReadWriteDelete"
+    actions = ["s3:GetObject", "s3:PutObject", "s3:DeleteObject"]
+    resources = [
+      "${aws_s3_bucket.lake.arn}/ledger/*",
+      "${aws_s3_bucket.lake.arn}/spine/run_ledger/*",
+    ]
   }
 
   statement {
