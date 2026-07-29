@@ -39,6 +39,7 @@ class RuntimeConfig:
     registry_uri: str
     athena_workgroup: str  # maintenance only
     athena_output_uri: str  # maintenance only
+    maintenance_tables: tuple[str, ...]  # maintenance only -- LLD 004.1 S12.6(3)/I-17
     feed_id: str | None  # set only on per-feed driver functions
 
 
@@ -50,9 +51,29 @@ def _required(env: Mapping[str, str], name: str, missing: list[str]) -> str:
     return value
 
 
+def _parse_maintenance_tables(
+    env: Mapping[str, str], *, glue_database: str, ledger_table: str
+) -> tuple[str, ...]:
+    """`CONVEYER_MAINTENANCE_TABLES` -- an ADDITIVE, optional env var (LLD
+    004.1 S12.6(3)/I-17 [E-7]): a comma-separated list of `<db>.<table>`
+    Glue-catalog identifiers for `maintenance/optimize.py`'s OPTIMIZE+VACUUM
+    loop. Unset or empty -> exactly the single ledger identifier this
+    module has always targeted, so EXISTING BEHAVIOR IS UNCHANGED for any
+    deployment that never sets this var. Entries are trimmed and blank
+    entries (stray commas) are dropped.
+    """
+    raw = env.get(f"{_ENV_PREFIX}MAINTENANCE_TABLES")
+    if not raw:
+        return (f"{glue_database}.{ledger_table}",)
+    return tuple(part.strip() for part in raw.split(",") if part.strip())
+
+
 def from_env() -> RuntimeConfig:
     env = os.environ
     missing: list[str] = []
+
+    glue_database = _required(env, "GLUE_DATABASE", missing)
+    ledger_table = _required(env, "LEDGER_TABLE", missing)
 
     config = RuntimeConfig(
         env=_required(env, "ENV", missing),
@@ -60,13 +81,16 @@ def from_env() -> RuntimeConfig:
         landing_bucket=_required(env, "LANDING_BUCKET", missing),
         lake_bucket=_required(env, "LAKE_BUCKET", missing),
         artifacts_bucket=_required(env, "ARTIFACTS_BUCKET", missing),
-        glue_database=_required(env, "GLUE_DATABASE", missing),
-        ledger_table=_required(env, "LEDGER_TABLE", missing),
+        glue_database=glue_database,
+        ledger_table=ledger_table,
         cas_table=_required(env, "CAS_TABLE", missing),
         event_bus=_required(env, "EVENT_BUS", missing),
         registry_uri=_required(env, "REGISTRY_URI", missing),
         athena_workgroup=_required(env, "ATHENA_WORKGROUP", missing),
         athena_output_uri=_required(env, "ATHENA_OUTPUT_URI", missing),
+        maintenance_tables=_parse_maintenance_tables(
+            env, glue_database=glue_database, ledger_table=ledger_table
+        ),
         feed_id=env.get(f"{_ENV_PREFIX}FEED_ID") or None,
     )
     if missing:

@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "feed_id": "carrier-y/renewal-statements",
+  "delivery_id": "c3d4e5f6-a7b8-4c3d-9e4f-5a6b7c8d9e0f",
+  "batch_id": "d4e5f6a7-b8c9-5d4e-8f5a-6b7c8d9e0f1a",
+  "delivery_key": "manifest-renewals-2026-08",
+  "content_hash": "sha256:10d88ef52e770c3cb94bd3608c74b61e713b67a6043d7128af15c77476057a76",
+  "size_bytes": 5120,
+  "object_uris": [
+    "s3://conveyer-dev-lake/carrier-y/renewal-statements/received_at=20260803T143000000000Z/dl-c3d4e5f6-a7b8-4c3d-9e4f-5a6b7c8d9e0f/renewals-part1.csv",
+    "s3://conveyer-dev-lake/carrier-y/renewal-statements/received_at=20260803T143000000000Z/dl-c3d4e5f6-a7b8-4c3d-9e4f-5a6b7c8d9e0f/renewals-part2.csv"
+  ],
+  "received_at": "2026-08-03T14:30:00Z",
+  "pipeline": "pipelines/renewals"
+}

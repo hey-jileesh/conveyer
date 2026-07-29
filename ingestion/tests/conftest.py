@@ -108,6 +108,7 @@ def runtime_config() -> RuntimeConfig:
         registry_uri=f"s3://{ARTIFACTS_BUCKET}/registry/feeds.json",
         athena_workgroup="conveyer-test-workgroup",
         athena_output_uri=f"s3://{ARTIFACTS_BUCKET}/athena-output/",
+        maintenance_tables=(f"{GLUE_DATABASE}.{LEDGER_TABLE}",),
         feed_id=None,
     )
 

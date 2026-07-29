@@ -6,12 +6,23 @@ only exception type in the codebase, `TransientError` -- §7.3) so Lambda's
 retry/DLQ/alarm path takes over (§9.4: "each polled to completion (failure ->
 raise -> alarm)"):
 
-1. `OPTIMIZE <db>.delivery_ledger REWRITE DATA USING BIN_PACK` (`optimize_sql`).
-2. `VACUUM <db>.delivery_ledger` (`vacuum_sql`) -- retention is governed
-   entirely by the `vacuum_max_snapshot_age_seconds` / `vacuum_min_snapshots_to_keep`
-   table properties `bootstrap/create_ledger.py` already set at bootstrap
-   (via `effects.ledger.LEDGER_TABLE_PROPERTIES`); nothing set here.
-3. Supersession reconciliation, repairing §8.3's named concurrent-correction
+1. `OPTIMIZE <identifier> REWRITE DATA USING BIN_PACK` (`optimize_sql`), once
+   per identifier in `config.maintenance_tables` (LLD 004.1 §12.6(3)/I-17
+   [E-7]) -- an additive, optional `CONVEYER_MAINTENANCE_TABLES` env var
+   (comma-separated `<db>.<table>` identifiers) that DEFAULTS to exactly the
+   single ingestion ledger identifier this module has always targeted, so
+   an unset var leaves behavior unchanged; when set, it also carries the
+   spine run ledger's identifier so ONE maintenance Lambda sweeps both.
+2. `VACUUM <identifier>` (`vacuum_sql`), same loop -- retention is governed
+   entirely by each table's own `vacuum_max_snapshot_age_seconds` /
+   `vacuum_min_snapshots_to_keep` properties set at its own bootstrap (e.g.
+   `effects.ledger.LEDGER_TABLE_PROPERTIES` for the ingestion ledger, I-17's
+   properties for the spine run ledger); nothing set here.
+3. Supersession reconciliation -- **ledger-only, NOT looped over
+   `maintenance_tables`**: this step's fixed subject is the ingestion
+   delivery ledger (`live_duplicates_sql`/`_ledger_identifier`), since the
+   `DeliveryRecord`/`plan_reconciliation` shape it reconciles is specific to
+   that table; repairing §8.3's named concurrent-correction
    race: find `delivery_key`s with more than one live `registered` delivery,
    feed the grouped rows to the ALREADY-BUILT pure planner
    `core.decisions.plan_reconciliation` (§8.3/§9.4, built by `m1-folds-planners`),
@@ -214,15 +225,21 @@ def _ledger_identifier(config: RuntimeConfig) -> str:
     return f"{config.glue_database}.{config.ledger_table}"
 
 
-def optimize_sql(config: RuntimeConfig) -> str:
-    return f"OPTIMIZE {_ledger_identifier(config)} REWRITE DATA USING BIN_PACK"
+def optimize_sql(identifier: str) -> str:
+    """`identifier` is a `<db>.<table>` Glue-catalog identifier -- one entry
+    of `config.maintenance_tables` (LLD 004.1 S12.6(3)/I-17). Pure string
+    builder: no config lookup here, so the same function serves every table
+    in the loop, not just the ledger.
+    """
+    return f"OPTIMIZE {identifier} REWRITE DATA USING BIN_PACK"
 
 
-def vacuum_sql(config: RuntimeConfig) -> str:
-    # Retention is governed by the table properties `create_ledger.py` set
-    # at bootstrap (`effects.ledger.LEDGER_TABLE_PROPERTIES`) -- nothing set
-    # here (LLD §9.4 step 2).
-    return f"VACUUM {_ledger_identifier(config)}"
+def vacuum_sql(identifier: str) -> str:
+    # Retention is governed by the table properties each table's own
+    # bootstrap sets (e.g. `effects.ledger.LEDGER_TABLE_PROPERTIES` for the
+    # ingestion ledger, I-17's properties for the spine run ledger) --
+    # nothing set here (LLD §9.4 step 2).
+    return f"VACUUM {identifier}"
 
 
 # --- LLD §9.4 step 3: supersession reconciliation ---------------------------
@@ -399,30 +416,34 @@ def run_maintenance(
     max_attempts: int = _DEFAULT_MAX_ATTEMPTS,
     poll_interval_s: float = _DEFAULT_POLL_INTERVAL_S,
 ) -> tuple[DeliveryRecord, ...]:
-    """The weekly maintenance job (LLD §9.4): OPTIMIZE, then VACUUM, then
-    supersession reconciliation via Athena. Any step's failure raises
+    """The weekly maintenance job (LLD §9.4, extended by 004.1 §12.6(3)):
+    OPTIMIZE+VACUUM every table in `config.maintenance_tables` (defaults to
+    the ingestion ledger alone), then supersession reconciliation via Athena
+    -- ledger-only, see module docstring step 3. Any step's failure raises
     (`run_query`) and aborts the remaining steps -- matching §9.4's "each
     polled to completion (failure -> raise -> alarm)"; the entrypoint adds
     no additional try/except (an uncaught exception here IS the alarm path).
     """
     config = fx.config
-    _logger.info("maintenance: starting OPTIMIZE on %s", _ledger_identifier(config))
-    run_query(
-        athena,
-        optimize_sql(config),
-        sleep_fn=sleep_fn,
-        max_attempts=max_attempts,
-        poll_interval_s=poll_interval_s,
-    )
-    _logger.info("maintenance: OPTIMIZE succeeded; starting VACUUM")
-    run_query(
-        athena,
-        vacuum_sql(config),
-        sleep_fn=sleep_fn,
-        max_attempts=max_attempts,
-        poll_interval_s=poll_interval_s,
-    )
-    _logger.info("maintenance: VACUUM succeeded; starting supersession reconciliation")
+    for identifier in config.maintenance_tables:
+        _logger.info("maintenance: starting OPTIMIZE on %s", identifier)
+        run_query(
+            athena,
+            optimize_sql(identifier),
+            sleep_fn=sleep_fn,
+            max_attempts=max_attempts,
+            poll_interval_s=poll_interval_s,
+        )
+        _logger.info("maintenance: OPTIMIZE succeeded on %s; starting VACUUM", identifier)
+        run_query(
+            athena,
+            vacuum_sql(identifier),
+            sleep_fn=sleep_fn,
+            max_attempts=max_attempts,
+            poll_interval_s=poll_interval_s,
+        )
+        _logger.info("maintenance: VACUUM succeeded on %s", identifier)
+    _logger.info("maintenance: starting supersession reconciliation")
     execution_id = run_query(
         athena,
         live_duplicates_sql(config),

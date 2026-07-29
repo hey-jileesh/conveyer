@@ -1,0 +1,2 @@
+domain_id,event_time,source_ts,content_hash,payload
+id-003,2026-01-01T00:00:02Z,2026-01-01T00:00:02Z,h-003,charlie

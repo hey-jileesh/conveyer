@@ -3,7 +3,13 @@ name = "conveyer-ingestion"
 version = "0.1.0"
 description = "Conveyer data ingestion module — delivery ledger, registration, s3-push / sftp-pull drivers, absence detection. Build spec: design/002.1_data_ingestion_lld.md."
 readme = "README.md"
-requires-python = ">=3.12"
+# Floor loosened from >=3.12 to >=3.11 by the spine workspace member (LLD
+# 004.1 I-1, bead conveyer-nvh.12): `uv run -p 3.11 --package conveyer-spine`
+# checks EVERY workspace member's `requires-python`, not just spine's, so
+# ingestion's own floor blocked the dual-interpreter workflow even though
+# ingestion's own CI/target-version/mypy python_version stay 3.12 (unchanged
+# below) -- this package is never actually run under 3.11.
+requires-python = ">=3.11"
 dependencies = [
     "pydantic>=2.7",
     "boto3>=1.34",

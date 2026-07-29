@@ -1,0 +1,58 @@
+{
+  "additionalProperties": false,
+  "properties": {
+    "batch_id": {
+      "title": "Batch Id",
+      "type": "string"
+    },
+    "delivery_id": {
+      "title": "Delivery Id",
+      "type": "string"
+    },
+    "feed_id": {
+      "title": "Feed Id",
+      "type": "string"
+    },
+    "land_snapshot_id": {
+      "anyOf": [
+        {
+          "type": "integer"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "title": "Land Snapshot Id"
+    },
+    "pipeline": {
+      "title": "Pipeline",
+      "type": "string"
+    },
+    "raw_count": {
+      "title": "Raw Count",
+      "type": "integer"
+    },
+    "schema_version": {
+      "const": 1,
+      "default": 1,
+      "title": "Schema Version",
+      "type": "integer"
+    },
+    "started_at": {
+      "format": "date-time",
+      "title": "Started At",
+      "type": "string"
+    }
+  },
+  "required": [
+    "pipeline",
+    "feed_id",
+    "batch_id",
+    "delivery_id",
+    "raw_count",
+    "land_snapshot_id",
+    "started_at"
+  ],
+  "title": "BatchStartedV1",
+  "type": "object"
+}

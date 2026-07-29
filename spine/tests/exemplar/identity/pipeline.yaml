@@ -1,0 +1,23 @@
+# Identity exemplar — deployed-shape PipelineSpec (LLD §12.2, §6.2).
+#
+# The DEPLOYED shape: real table names per §5's `<db>.<slug>__<suffix>`
+# convention. Scenario tests (tests/integration/test_scenarios_core.py)
+# construct their own `PipelineSpecModel` directly with per-test `unique_table`
+# names instead of loading this file (test isolation) — this file's only job
+# is to prove the deployed shape itself parses cleanly into `PipelineSpecModel`
+# (a dedicated test asserts exactly that), so both the "authored" and
+# "exercised" shapes stay honest with each other.
+pipeline: pipelines/identity
+transforms_module: pipelines.identity.transforms
+raw_table: conveyer_dev_lake.identity__raw
+quarantine_table: conveyer_dev_lake.identity__quarantine
+fact_table: conveyer_dev_lake.identity__facts
+state_table: conveyer_dev_lake.identity__state
+fold: default-lww
+domain_id_col: domain_id
+required_columns:
+  - domain_id
+co_effects: {}
+serialize: false
+read: {}
+sla_minutes: 480

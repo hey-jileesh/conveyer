@@ -1,0 +1,110 @@
+{
+  "$defs": {
+    "CoEffectDecl": {
+      "additionalProperties": false,
+      "properties": {
+        "own_state": {
+          "default": false,
+          "title": "Own State",
+          "type": "boolean"
+        },
+        "table": {
+          "title": "Table",
+          "type": "string"
+        }
+      },
+      "required": [
+        "table"
+      ],
+      "title": "CoEffectDecl",
+      "type": "object"
+    },
+    "JsonValue": {}
+  },
+  "additionalProperties": false,
+  "properties": {
+    "co_effects": {
+      "additionalProperties": {
+        "$ref": "#/$defs/CoEffectDecl"
+      },
+      "default": {},
+      "title": "Co Effects",
+      "type": "object"
+    },
+    "domain_id_col": {
+      "default": "domain_id",
+      "title": "Domain Id Col",
+      "type": "string"
+    },
+    "fact_table": {
+      "title": "Fact Table",
+      "type": "string"
+    },
+    "fold": {
+      "default": "default-lww",
+      "enum": [
+        "default-lww",
+        "custom"
+      ],
+      "title": "Fold",
+      "type": "string"
+    },
+    "pipeline": {
+      "title": "Pipeline",
+      "type": "string"
+    },
+    "quarantine_table": {
+      "title": "Quarantine Table",
+      "type": "string"
+    },
+    "raw_table": {
+      "title": "Raw Table",
+      "type": "string"
+    },
+    "read": {
+      "additionalProperties": {
+        "$ref": "#/$defs/JsonValue"
+      },
+      "default": {},
+      "title": "Read",
+      "type": "object"
+    },
+    "required_columns": {
+      "default": [],
+      "items": {
+        "type": "string"
+      },
+      "title": "Required Columns",
+      "type": "array"
+    },
+    "serialize": {
+      "default": false,
+      "title": "Serialize",
+      "type": "boolean"
+    },
+    "sla_minutes": {
+      "default": 480,
+      "title": "Sla Minutes",
+      "type": "integer"
+    },
+    "state_table": {
+      "title": "State Table",
+      "type": "string"
+    },
+    "transforms_module": {
+      "pattern": "^pipelines\\.[a-z0-9_]+(\\.[a-z0-9_]+)*$",
+      "title": "Transforms Module",
+      "type": "string"
+    }
+  },
+  "required": [
+    "pipeline",
+    "transforms_module",
+    "raw_table",
+    "quarantine_table",
+    "fact_table",
+    "state_table"
+  ],
+  "title": "PipelineSpecModel",
+  "type": "object"
+}

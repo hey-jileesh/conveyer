@@ -1,0 +1,88 @@
+[project]
+name = "conveyer-spine"
+version = "0.1.0"
+description = "Conveyer runner spine — BatchContext, eight-stage sequence driver, RunnerFx effects, router/SFN/Glue orchestration, Iceberg run ledger. Build spec: design/004.1_runner_spine_lld.md."
+readme = "README.md"
+# Glue 5.0 parity (LLD 004.1 I-1): the spine package targets Python 3.11 even
+# though the workspace default is 3.12. `uv run -p 3.11 --package
+# conveyer-spine` (spine/Makefile) confines the pin to this package's targets.
+requires-python = ">=3.11"
+dependencies = [
+    "pydantic>=2.7",
+    "boto3>=1.34",
+    "pyspark==3.5.*",
+    "pyiceberg[glue,pyarrow]>=0.7",
+    "PyYAML>=6",
+]
+
+[dependency-groups]
+dev = [
+    "pytest",
+    "pytest-cov",
+    "hypothesis",
+    "moto[events]>=5",
+    "sqlalchemy",
+    "ruff",
+    "mypy",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+# D-2: `pipelines` ships in the same wheel as `spine` — `PipelineSpecModel.
+# transforms_module` is namespace-constrained to `^pipelines\.` (LLD §6.2,
+# I-10), so the wheel installed on Glue must carry `pipelines` as a
+# top-level importable package alongside `spine` itself. `pipelines/` is a
+# placeholder namespace until the identity exemplar pipeline lands under it
+# (009/M3+, LLD §12.2); deciding the packaging shape now means no later
+# bead has to touch this file to make its pipeline importable.
+packages = ["spine", "pipelines"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+src = ["spine", "pipelines", "tools", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B"]
+
+[tool.mypy]
+python_version = "3.11"
+packages = ["spine", "pipelines"]
+
+# Strict on the pure core (LLD §7.2, mirrors ingestion 002.1 §12.5). mypy's
+# `strict` flag is global-only, so the per-module equivalent is spelled out.
+[[tool.mypy.overrides]]
+module = "spine.core.*"
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+disallow_untyped_calls = true
+disallow_untyped_decorators = true
+disallow_any_generics = true
+disallow_subclassing_any = true
+check_untyped_defs = true
+warn_return_any = true
+warn_unused_ignores = true
+no_implicit_reexport = true
+strict_equality = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+# LLD §7.2 coverage gate: core/ + frames/ >= 95% branch; overall >= 85%.
+# `make coverage` (Makefile) runs the suite with `branch = true` in effect,
+# then checks both thresholds via two separate `coverage report
+# --fail-under=...` calls (one bare, one `--include=...`) against the SAME
+# collected data (mirrors ingestion's pyproject.toml exactly).
+# No omissions yet (M0: no code) -- effects/ branches the local substrate
+# genuinely can't reach (e.g. the Glue-catalog path) get a documented
+# `omit` entry here once effects/ exists (M2, LLD §7.2).
+[tool.coverage.run]
+branch = true
+source = ["spine"]
+
+[tool.coverage.report]
+precision = 1
+show_missing = true
