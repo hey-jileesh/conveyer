@@ -78,7 +78,7 @@ from ingestion.core.model import (
     TrailerSpec,
     Window,
 )
-from ingestion.core.naming import canonical_prefix
+from ingestion.core.naming import canonical_prefix, is_clean_object_name
 from ingestion.core.naming import canonical_uri as _canonical_uri
 from ingestion.core.naming import split_s3_uri as _split_s3_uri
 from ingestion.core.windows import RemoteFile
@@ -126,7 +126,12 @@ def _remote_file_path(remote_path: str, name: str) -> str:
     a basename from `listdir`/manifest declaration -> the full remote path
     `read_chunks` expects (matches `effects/sftp.py::_read_chunks`'s
     `sftp.open(path, "rb")`, which resolves relative to the SFTP server's
-    own root, not a per-call cwd)."""
+    own root, not a per-call cwd). Every `name` reaching this function now
+    comes from a listing already filtered by `windows.select_candidates`/
+    `select_manifests`'s step-0 `is_clean_object_name` guard (conveyer
+    nvh.48.11), so remote-side path traversal via a hostile listing entry
+    (e.g. `../../etc/passwd`) is closed as a side effect of that filter,
+    without this function needing any check of its own."""
     base = remote_path if remote_path.endswith("/") else remote_path + "/"
     return base + name
 
@@ -162,6 +167,27 @@ def _log_carry_over(feed_id: str, remaining: int) -> None:
         extra={"feed_id": feed_id},
     )
     observability.emit_metric("DriverCarryOver", remaining, feed_id)
+
+
+def _log_unsafe_remote_names(feed_id: str, count: int) -> None:
+    """conveyer-nvh.48.11: `count` of THIS listing's entries failed
+    `is_clean_object_name`, counted pre-window (before the operator's
+    mtime window is applied) so a hostile or misbehaving remote server is
+    visible even on a windowed re-pull, rather than only reflecting
+    `windows.select_candidates`/`select_manifests`'s step-0 filter on the
+    narrowed listing -- logged/metered here (COUNT and `feed_id` ONLY,
+    never the hostile names themselves, same as `record_nondelivery`'s
+    (loc, type)-only notes for a manifest-declared traversal name) so an
+    operator can see the defect without any attacker-controlled string
+    ever reaching a log line or the ledger.
+    """
+    _logger.warning(
+        "sftp-pull listing contained %d unsafe/non-canonical remote name(s); "
+        "dropped before selection",
+        count,
+        extra={"feed_id": feed_id},
+    )
+    observability.emit_metric("UnsafeRemoteName", count, feed_id)
 
 
 def _read_capped(chunks: Iterator[bytes], max_bytes: int) -> bytes | Defect:
@@ -571,6 +597,9 @@ def acquire(
 
     sftp = fx.sftp_fx_for(connection.secret_ref)
     listing = sftp.listdir(connection.remote_path)
+    unsafe_count = sum(1 for f in listing if not is_clean_object_name(f.name))
+    if unsafe_count > 0:
+        _log_unsafe_remote_names(feed.feed_id, unsafe_count)
     if window.start is not None or window.end is not None:
         listing = [f for f in listing if _in_window(f.mtime, window)]
 

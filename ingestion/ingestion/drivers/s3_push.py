@@ -48,6 +48,7 @@ from ingestion.core.completeness import (
 from ingestion.core.decisions import RegistrationRequest
 from ingestion.core.model import DeliveryOutcome, FeedConfig, ManifestV1, StagedObject, TrailerSpec
 from ingestion.core.naming import canonical_uri as _canonical_uri
+from ingestion.core.naming import is_clean_object_name
 from ingestion.effects.records import Effects, ObjectSummary
 from ingestion.effects.registry import RegistryCache
 from ingestion.effects.registry import load_feed_registry as _load_feed_configs
@@ -390,6 +391,15 @@ def acquire(
     feed = _load_feed_configs(fx, cache).get(feed_id)
     if feed is None:
         _logger.error("misrouted event: no registered feed for feed_id %r (key %r)", feed_id, key)
+        return []
+
+    if not is_clean_object_name(_basename(key)):
+        # conveyer-nvh.48.11: the event-supplied key's basename is not a
+        # single clean object-name segment (e.g. a forged/misrouted event
+        # whose key ends in `incoming/..`). This is event-shaped noise, not
+        # a partner delivery -- same "log + return []" shape as the
+        # misroute guards above, no `record_nondelivery` (no ledger row).
+        _logger.error("misrouted event: key %r has an unsafe/non-canonical basename", key)
         return []
 
     _logger.info(

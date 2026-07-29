@@ -89,6 +89,25 @@ def test_parse_manifest_schema_violation_never_leaks_field_content_into_reason()
     assert "int_parsing" in result.reason
 
 
+def test_parse_manifest_path_y_declared_name_returns_defect_without_leaking_it() -> None:
+    # H-4 regression (conveyer-nvh.46/nvh.48): a manifest declaring a
+    # path-y `files[0].name` must be rejected by `ManifestFile`'s own
+    # `is_clean_object_name` field validator -- surfacing as a (loc, type)
+    # Defect, same shape as any other schema violation, never leaking the
+    # hostile string itself into `reason` (-> ledger `notes`, append-only,
+    # Athena-queryable forever).
+    hostile_name = "../../incoming/attacker.csv"
+    bad = _manifest_json(files=[{"name": hostile_name, "bytes": 10, "sha256": _SHA_A}])
+
+    result = completeness.parse_manifest(bad)
+
+    assert isinstance(result, completeness.Defect)
+    assert "files.0.name" in result.reason
+    assert "value_error" in result.reason
+    assert hostile_name not in result.reason
+    assert "attacker" not in result.reason
+
+
 def test_parse_manifest_reason_is_capped_regardless_of_manifest_size() -> None:
     # A 1000-file manifest (the schema's own cap) where every file is
     # defective would otherwise produce an unbounded `reason` string.

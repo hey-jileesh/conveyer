@@ -736,6 +736,79 @@ def test_h4_schema_invalid_manifest_never_leaks_pii_into_ledger_notes(
     assert _drain_events(fx, queue_url) == []
 
 
+# --- conveyer-nvh.48 (security-gate): a manifest declaring a path-y --------
+# `files[0].name` must be rejected as `unreadable` -- `ManifestFile`'s own
+# `is_clean_object_name` field validator (nvh.46's producer-side companion)
+# fires inside `parse_manifest`, before `evaluate_manifest`/any vestibule
+# listing or copy ever runs. Documented, accepted behavior change: this
+# scenario previously flipped `incomplete` (a coincidental vestibule-
+# basename mismatch, since no vestibule object is literally named
+# "../../incoming/attacker.csv") -- it is now `unreadable` (the manifest
+# itself is defective), judged more correct and now uniform with sftp-pull.
+
+
+def test_manifest_declared_traversal_name_rejected_and_leaks_nothing(
+    local_effects: Effects, s3_client: Any, queue_url: str
+) -> None:
+    fx = local_effects
+    _seed_registry(fx, s3_client)
+    hostile_name = "../../incoming/attacker.csv"
+    bad_manifest = json.dumps(
+        {
+            "manifest_version": 1,
+            "manifest_id": "hostile-manifest",
+            "feed_id": _FEED_ID,
+            "files": [{"name": hostile_name, "bytes": 1, "sha256": "a" * 64}],
+        }
+    ).encode("utf-8")
+    s3_client.put_object(
+        Bucket=fx.config.landing_bucket, Key=_VESTIBULE_PREFIX + _MANIFEST_NAME, Body=bad_manifest
+    )
+    event = _s3_event(fx.config.landing_bucket, _VESTIBULE_PREFIX + _MANIFEST_NAME)
+
+    outcome = s3_push.acquire(event, fx, "run-traversal", registry_cache={})[0]
+
+    assert outcome.disposition == "unreadable"
+    rows = fx.ledger.scan_feed(_FEED_ID, None)
+    assert len(rows) == 1
+    assert rows[0].disposition == "unreadable"
+    assert "files.0.name" in (rows[0].notes or "")
+    assert "attacker" not in (rows[0].notes or "")
+    assert hostile_name not in (rows[0].notes or "")
+
+    # No canonical-target StagedObject was ever composed/copied: nothing
+    # landed under this feed's canonical prefix at all.
+    listing = s3_client.list_objects_v2(
+        Bucket=fx.config.landing_bucket, Prefix=f"{_FEED_ID}/received_at="
+    )
+    assert "Contents" not in listing
+    assert _drain_events(fx, queue_url) == []
+
+
+# --- conveyer-nvh.48.11 (security-gate): event key basename fails ----------
+# `is_clean_object_name` (e.g. `incoming/..`) -- misroute-guard style (log
+# ERROR + return []), AFTER the feed lookup succeeds. Distinct from the
+# `feed_id is None`/foreign-bucket misroute guards above: the key parses to
+# a REAL, registered feed_id here, so only the basename itself is hostile.
+# This is event-shaped noise, not a partner delivery -- no
+# `record_nondelivery`, no ledger row.
+
+
+def test_traversal_basename_event_key_returns_empty_and_no_ledger_append(
+    local_effects: Effects, s3_client: Any, queue_url: str
+) -> None:
+    fx = local_effects
+    _seed_registry(fx, s3_client)
+    event = _s3_event(fx.config.landing_bucket, _VESTIBULE_PREFIX + "..")
+
+    outcomes = s3_push.acquire(event, fx, "run-traversal-basename", registry_cache={})
+
+    assert outcomes == []
+    rows = fx.ledger.scan_feed(_FEED_ID, None)
+    assert rows == []
+    assert _drain_events(fx, queue_url) == []
+
+
 # --- G-11: crash after claim -- TAKEN_OVER resumes the dead run's identity -
 
 
