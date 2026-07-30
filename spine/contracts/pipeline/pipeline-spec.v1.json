@@ -19,7 +19,184 @@
       "title": "CoEffectDecl",
       "type": "object"
     },
-    "JsonValue": {}
+    "ColumnSpec": {
+      "additionalProperties": false,
+      "properties": {
+        "allowed_values": {
+          "anyOf": [
+            {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Allowed Values"
+        },
+        "max": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Max"
+        },
+        "min": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Min"
+        },
+        "name": {
+          "maxLength": 128,
+          "pattern": "^[A-Za-z_][A-Za-z0-9_]*$",
+          "title": "Name",
+          "type": "string"
+        },
+        "nullable": {
+          "default": true,
+          "title": "Nullable",
+          "type": "boolean"
+        },
+        "pattern": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Pattern"
+        },
+        "required": {
+          "default": false,
+          "title": "Required",
+          "type": "boolean"
+        },
+        "type": {
+          "default": "string",
+          "pattern": "^(string|int|long|bool|decimal\\([1-9][0-9]?,(0|[1-9][0-9]?)\\)|date\\([^()]+\\)|timestamp\\([^()]+\\))$",
+          "title": "Type",
+          "type": "string"
+        }
+      },
+      "required": [
+        "name"
+      ],
+      "title": "ColumnSpec",
+      "type": "object"
+    },
+    "DialectModel": {
+      "additionalProperties": false,
+      "properties": {
+        "delimiter": {
+          "default": ",",
+          "title": "Delimiter",
+          "type": "string"
+        },
+        "format": {
+          "const": "csv",
+          "title": "Format",
+          "type": "string"
+        },
+        "header": {
+          "default": true,
+          "title": "Header",
+          "type": "boolean"
+        },
+        "multiline": {
+          "default": false,
+          "title": "Multiline",
+          "type": "boolean"
+        },
+        "quote": {
+          "default": "\"",
+          "title": "Quote",
+          "type": "string"
+        }
+      },
+      "required": [
+        "format"
+      ],
+      "title": "DialectModel",
+      "type": "object"
+    },
+    "RawContractModel": {
+      "additionalProperties": false,
+      "properties": {
+        "columns": {
+          "items": {
+            "$ref": "#/$defs/ColumnSpec"
+          },
+          "maxItems": 1024,
+          "minItems": 1,
+          "title": "Columns",
+          "type": "array"
+        },
+        "forbid_replacement_chars": {
+          "default": true,
+          "title": "Forbid Replacement Chars",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "columns"
+      ],
+      "title": "RawContractModel",
+      "type": "object"
+    },
+    "ReadSpecModel": {
+      "additionalProperties": false,
+      "properties": {
+        "charset": {
+          "const": "utf-8",
+          "default": "utf-8",
+          "title": "Charset",
+          "type": "string"
+        },
+        "compression": {
+          "default": "none",
+          "enum": [
+            "none",
+            "gzip",
+            "zstd"
+          ],
+          "title": "Compression",
+          "type": "string"
+        },
+        "dialect": {
+          "$ref": "#/$defs/DialectModel"
+        },
+        "skip_leading_lines": {
+          "default": 0,
+          "maximum": 4096,
+          "minimum": 0,
+          "title": "Skip Leading Lines",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "dialect"
+      ],
+      "title": "ReadSpecModel",
+      "type": "object"
+    }
   },
   "additionalProperties": false,
   "properties": {
@@ -57,25 +234,15 @@
       "title": "Quarantine Table",
       "type": "string"
     },
+    "raw_contract": {
+      "$ref": "#/$defs/RawContractModel"
+    },
     "raw_table": {
       "title": "Raw Table",
       "type": "string"
     },
     "read": {
-      "additionalProperties": {
-        "$ref": "#/$defs/JsonValue"
-      },
-      "default": {},
-      "title": "Read",
-      "type": "object"
-    },
-    "required_columns": {
-      "default": [],
-      "items": {
-        "type": "string"
-      },
-      "title": "Required Columns",
-      "type": "array"
+      "$ref": "#/$defs/ReadSpecModel"
     },
     "serialize": {
       "default": false,
@@ -103,7 +270,9 @@
     "raw_table",
     "quarantine_table",
     "fact_table",
-    "state_table"
+    "state_table",
+    "read",
+    "raw_contract"
   ],
   "title": "PipelineSpecModel",
   "type": "object"

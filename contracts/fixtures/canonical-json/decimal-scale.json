@@ -1,0 +1,74 @@
+[
+  {
+    "value": {
+      "amount": {
+        "$decimal": "1.20"
+      }
+    },
+    "canonical": "{\"amount\":\"1.20\"}",
+    "sha256": "10fbb0e3a42471a434fc54b3768b66682b46c62b22207fa1b1facb285f675f3f"
+  },
+  {
+    "value": {
+      "amount": {
+        "$decimal": "1.2"
+      }
+    },
+    "canonical": "{\"amount\":\"1.2\"}",
+    "sha256": "73d51ba73c0d63bf67c6dc33876f1c001d5906f519588c26a6f3c0df7f68b2a0"
+  },
+  {
+    "value": {
+      "amount": {
+        "$decimal": "0"
+      }
+    },
+    "canonical": "{\"amount\":\"0\"}",
+    "sha256": "192ec0d7b2ceec741afdbf1c01f3466aeed73bb426ad7aecd614729f2fdd0e43"
+  },
+  {
+    "value": {
+      "amount": {
+        "$decimal": "0.00"
+      }
+    },
+    "canonical": "{\"amount\":\"0.00\"}",
+    "sha256": "08f443eaa6f822e00f7f108a8ca932634fd3e6899922e259f0e33c82fb0b0f85"
+  },
+  {
+    "value": {
+      "amount": {
+        "$decimal": "-1.239"
+      }
+    },
+    "canonical": "{\"amount\":\"-1.239\"}",
+    "sha256": "c2d655cf7231768f7bd1af2e431cb0e5c739735a70d9c19cc35fe5a4fca390b2"
+  },
+  {
+    "value": {
+      "amount": {
+        "$decimal": "0.0000001"
+      }
+    },
+    "canonical": "{\"amount\":\"0.0000001\"}",
+    "sha256": "2d739709d967859ecf8856bcc9a74cf99f20acef6d8eea149d2986782f67ed8a"
+  },
+  {
+    "value": {
+      "amount": {
+        "$decimal": "12345678901234567890.1234567890123456"
+      }
+    },
+    "canonical": "{\"amount\":\"12345678901234567890.1234567890123456\"}",
+    "sha256": "43e32755e6c780aef04fa2ab7b0192aacd17fdd498a586a2723332849efe8b1a"
+  },
+  {
+    "value": {
+      "amount": {
+        "$decimal": "-0"
+      }
+    },
+    "canonical": "{\"amount\":\"-0\"}",
+    "sha256": "37dfa49f4265d0a8042f71e6acaa834209d81a2b0eef1d83010d42ea6f9dca47"
+  }
+]

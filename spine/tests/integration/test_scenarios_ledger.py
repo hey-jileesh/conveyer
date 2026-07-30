@@ -103,10 +103,23 @@ import pytest
 from pydantic import ValidationError
 from pyspark.sql import SparkSession
 from spine.binding import bind_transforms
+from spine.bootstrap.create_admission_tables import (
+    render_quarantine_create_table_sql,
+    render_raw_create_table_sql,
+)
 from spine.config import RunConfig, RunnerConfig
 from spine.context import BatchContext
 from spine.core import naming
-from spine.core.model import CoEffectDecl, DeliveryRegisteredV1, PipelineSpecModel
+from spine.core.contract import check_version, read_spec_version
+from spine.core.model import (
+    CoEffectDecl,
+    ColumnSpec,
+    DeliveryRegisteredV1,
+    DialectModel,
+    PipelineSpecModel,
+    RawContractModel,
+    ReadSpecModel,
+)
 from spine.core.run_facts import RunFact
 from spine.effects import ledger
 from spine.effects.records import RunnerFx, TransientError
@@ -151,14 +164,16 @@ def _bare(qualified_table: str) -> str:
 
 
 def _create_raw_table(spark: SparkSession, qualified_table: str) -> None:
-    spark.sql(f"CREATE TABLE {qualified_table} ({_ROW_DDL}) USING iceberg")
+    # 005.1 §4.4 DDL parity swap (bead conveyer-azr.19, n3-admission-cut):
+    # the SAME builder `bootstrap-admission` issues in production, not a
+    # hand-rolled `_ROW_DDL` shape -- see `scenario_helpers.py`'s own
+    # identical fix and this file's own docstring on why this module keeps
+    # its own copy rather than importing that one.
+    spark.sql(render_raw_create_table_sql(qualified_table, _IDENTITY_RAW_CONTRACT))
 
 
 def _create_quarantine_table(spark: SparkSession, qualified_table: str) -> None:
-    spark.sql(
-        f"CREATE TABLE {qualified_table} ({_ROW_DDL}, reason STRING, check_stage STRING) "
-        "USING iceberg"
-    )
+    spark.sql(render_quarantine_create_table_sql(qualified_table))
 
 
 def _create_fact_table(spark: SparkSession, qualified_table: str) -> None:
@@ -183,6 +198,23 @@ def _batch_id(n: int) -> str:
     return str(uuid.UUID(int=n, version=5))
 
 
+# 005.1 §3.4/A-12: mirrors, rather than imports (this file's own docstring),
+# `scenario_helpers.py`'s `IDENTITY_READ`/`IDENTITY_RAW_CONTRACT` -- same 5
+# non-framework `_ROW_DDL` columns, `domain_id` `required: true, nullable:
+# false` -- the one contract-declared constraint `stages/pre_check.py`'s
+# real `compile_contract` (§6.1) compiles into its `not-nullable` check.
+_IDENTITY_READ = ReadSpecModel(dialect=DialectModel(format="csv", header=True))
+_IDENTITY_RAW_CONTRACT = RawContractModel(
+    columns=[
+        ColumnSpec(name="domain_id", required=True, nullable=False),
+        ColumnSpec(name="event_time"),
+        ColumnSpec(name="source_ts"),
+        ColumnSpec(name="content_hash"),
+        ColumnSpec(name="payload"),
+    ]
+)
+
+
 def _make_spec(
     *,
     transforms_module: str,
@@ -199,7 +231,8 @@ def _make_spec(
         quarantine_table=quarantine_table,
         fact_table=fact_table,
         state_table=state_table,
-        required_columns=["domain_id"],
+        read=_IDENTITY_READ,
+        raw_contract=_IDENTITY_RAW_CONTRACT,
         co_effects=co_effects or {},
     )
 
@@ -222,6 +255,8 @@ def _make_seed(
         attempt_id="attempt-1",
         sfn_retry_count=0,
         sfn_redrive_count=0,
+        read_spec_version=read_spec_version(spec.read),
+        check_version=check_version(spec.raw_contract, spec.read),
     )
 
 
@@ -296,7 +331,16 @@ def _valid_spec_data(
         "quarantine_table": quarantine_table,
         "fact_table": fact_table,
         "state_table": state_table,
-        "required_columns": ["domain_id"],
+        "read": {"dialect": {"format": "csv", "header": True}},
+        "raw_contract": {
+            "columns": [
+                {"name": "domain_id", "required": True, "nullable": False},
+                {"name": "event_time"},
+                {"name": "source_ts"},
+                {"name": "content_hash"},
+                {"name": "payload"},
+            ]
+        },
     }
 
 
@@ -344,6 +388,8 @@ def _entrypoint_order(
         attempt_id="attempt-1",
         sfn_retry_count=0,
         sfn_redrive_count=0,
+        read_spec_version=read_spec_version(spec.read),
+        check_version=check_version(spec.raw_contract, spec.read),
     )
     return run_sequence(ctx, fx)
 

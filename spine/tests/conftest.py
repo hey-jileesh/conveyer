@@ -7,8 +7,12 @@ the whole spine suite (architect decision D-3): `local[2]`, driver 2 g,
 tmpdir warehouse), via `extra_conf` — never a second `SparkSession.builder`
 chain. `spark` is the pytest fixture every suite under `tests/` shares
 (session-scoped: one JVM for the whole run, §12.1's wall-time mitigation);
-it is lazily built — `pytest tests/unit` never touches Spark since no test
-there requests the fixture.
+it is lazily built — most of `tests/unit` never touches Spark since most
+tests there don't request the fixture (the one documented exception:
+`tests/unit/test_glue_main.py`'s `_assert_patterns_compile_in_jvm`/
+`_assert_temporal_bounds_bind` tests, bead conveyer-azr.18, validate against
+a real driver-side JVM by design and request `spark` like any integration
+test does).
 
 This module additionally builds (§12.1, §12.4):
 
@@ -84,12 +88,19 @@ from spine.bootstrap.create_run_ledger import create_run_ledger
 from spine.config import RunnerConfig
 from spine.effects import build, ledger
 from spine.effects.records import RunnerFx
+from spine.frames.checks import SESSION_PINS
 
 _BASE_CONF: Mapping[str, str] = {
     "spark.driver.memory": "2g",
     "spark.sql.shuffle.partitions": "2",
     "spark.sql.adaptive.enabled": "true",
     "spark.ui.enabled": "false",
+    # 005.1 §12.1/§6.2 (bead conveyer-azr.14): the one shared session-pins
+    # constant, wired identically into `entrypoints/glue_main.py::
+    # _catalog_conf`'s conf dict -- both MUST carry these, so `checks.
+    # SESSION_PINS` is the single authored source (`frames/checks.py`'s own
+    # docstring: "so they cannot drift apart").
+    **SESSION_PINS,
 }
 
 # LLD §7.1/§12.1: the exact Iceberg runtime jar coordinate. Resolved via

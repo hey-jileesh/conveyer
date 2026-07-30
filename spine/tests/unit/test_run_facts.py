@@ -21,6 +21,7 @@ from pydantic import ValidationError
 from spine import config, context
 from spine.binding import Transforms
 from spine.core import run_facts
+from spine.core.contract import check_version, read_spec_version
 from spine.core.model import PipelineSpecModel
 
 _T0 = datetime(2026, 7, 28, 10, 0, 0, tzinfo=UTC)
@@ -35,10 +36,13 @@ def _make_spec() -> PipelineSpecModel:
         quarantine_table="lake.commissions__quarantine",
         fact_table="lake.commissions__facts",
         state_table="lake.commissions__state",
+        read={"dialect": {"format": "csv"}},
+        raw_contract={"columns": [{"name": "id"}]},
     )
 
 
 def _make_seed(**overrides: object) -> context.BatchContext:
+    spec = _make_spec()
     base = dict(
         pipeline="pipelines/commissions",
         feed_id="carrier-x/commission-statements",
@@ -48,7 +52,7 @@ def _make_seed(**overrides: object) -> context.BatchContext:
         content_hash="sha256:" + "a" * 64,
         object_uris=("s3://bucket/statement.csv",),
         received_at=datetime(2026, 7, 25, 9, 0, 0, tzinfo=UTC),
-        spec=_make_spec(),
+        spec=spec,
         run=config.RunConfig(),
         transforms=Transforms(
             apply=lambda valid_df, co_effects: valid_df,
@@ -58,6 +62,8 @@ def _make_seed(**overrides: object) -> context.BatchContext:
         attempt_id="jr_abc123",
         sfn_retry_count=0,
         sfn_redrive_count=0,
+        read_spec_version=read_spec_version(spec.read),
+        check_version=check_version(spec.raw_contract, spec.read),
     )
     base.update(overrides)
     return context.BatchContext(**base)  # type: ignore[arg-type]
@@ -130,6 +136,77 @@ def test_pre_check_stage_fields() -> None:
     assert fact.pre_quarantined == 2
     assert fact.snapshot_id == 8
     assert fact.raw_count is None
+    assert fact.error_message is None  # no drift -- untouched
+
+
+# --- pre_check_drift -> ledger error_message (005.1 A-9, exact mirror of ---
+# --- post_check_drift below, bead conveyer-azr.18) --------------------------
+
+
+def test_pre_check_drift_set_folds_into_error_message_on_ok_outcome() -> None:
+    # A-9's door 2 ([DC-1] fact-presence demotion): the quarantine table's
+    # OWN guard was never present there, so this reaches `outcome="ok"`,
+    # not "skipped-guard" -- drift still folds into `error_message`.
+    seed = _make_seed()
+    after = dataclasses.replace(
+        seed,
+        pre_quarantined_count=0,
+        pre_quarantine_snapshot_id=None,
+        pre_check_drift=(
+            "pre_check drift: durable=0 recomputed=1 only_durable=0 only_recomputed=1 "
+            "admitted_cast_failures=0 check_version=abc123"
+        ),
+    )
+    fact = run_facts.transition("pre_check", seed, after, _T0, _T1)
+    assert fact.outcome == "ok"
+    assert fact.error_message == after.pre_check_drift
+
+
+def test_pre_check_drift_set_folds_into_error_message_on_skipped_guard_outcome() -> None:
+    # A-9's door 3 (guard-present subtraction): the quarantine table's own
+    # guard WAS present, so `guard_skips` accretes "pre_check" and this
+    # reaches "skipped-guard" -- drift still folds identically.
+    seed = _make_seed()
+    after = dataclasses.replace(
+        seed,
+        pre_quarantined_count=1,
+        pre_quarantine_snapshot_id=9,
+        pre_check_drift="pre_check drift: durable=1 recomputed=2 only_durable=0 only_recomputed=1",
+        guard_skips=seed.guard_skips + ("pre_check",),
+    )
+    fact = run_facts.transition("pre_check", seed, after, _T0, _T1)
+    assert fact.outcome == "skipped-guard"
+    assert fact.error_message == after.pre_check_drift
+
+
+def test_pre_check_drift_none_leaves_error_message_unset() -> None:
+    seed = _make_seed()
+    after = dataclasses.replace(
+        seed, pre_quarantined_count=0, pre_quarantine_snapshot_id=None, pre_check_drift=None
+    )
+    fact = run_facts.transition("pre_check", seed, after, _T0, _T1)
+    assert fact.error_message is None
+
+
+def test_pre_check_drift_set_but_failed_outcome_wins_no_drift_message() -> None:
+    # `failed()` never calls `_stage_fields` -- a stage-supplied
+    # `pre_check_drift` on `ctx` cannot leak into a genuinely failed
+    # transition's `error_message`, which is always `_error_message(exc)`.
+    seed = _make_seed()
+    ctx = dataclasses.replace(
+        seed,
+        pre_quarantined_count=1,
+        pre_quarantine_snapshot_id=9,
+        pre_check_drift="pre_check drift: durable=1 recomputed=2",
+    )
+    try:
+        raise ValueError("boom")
+    except ValueError as exc:
+        fact = run_facts.failed("pre_check", ctx, _T0, _T1, exc)
+    assert fact.outcome == "failed"
+    assert fact.error_type == "ValueError"
+    assert fact.error_message != ctx.pre_check_drift
+    assert "boom" not in (fact.error_message or "")
 
 
 def test_pull_stage_fields() -> None:
@@ -298,6 +375,8 @@ def test_failed_validation_error_strips_raw_input_value() -> None:
             quarantine_table="lake.x__quarantine",
             fact_table="lake.x__facts",
             state_table="lake.x__state",
+            read={"dialect": {"format": "csv"}},
+            raw_contract={"columns": [{"name": "id"}]},
         )
     except ValidationError as exc:
         fact = run_facts.failed("commit", seed, _T0, _T1, exc)

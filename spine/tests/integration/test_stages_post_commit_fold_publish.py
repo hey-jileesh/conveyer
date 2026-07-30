@@ -10,16 +10,24 @@ for `commit`/`fold`/`publish` tests, the upstream stage's own output)
 pre-populated — bypassing `land`/`pre_check`/`pull`/`apply` entirely, which
 is a different bead's file scope.
 
-Table shapes: the quarantine table carries exactly `shape_quarantine`'s own
-output columns (candidate columns + `reason` + `batch_id` + `check_stage` —
-**no** `delivery_id`/`feed_id`/`received_at`, since `post_check`'s violations
-are shaped straight from `candidate_facts_df`, never lineage-stamped); the
-fact table carries `stamp_fact_lineage`'s columns (`batch_id`, `delivery_id`,
-`feed_id`, `received_at`) in addition; the state table is the narrower
-domain/ordering/payload shape `frames.folds.default_lww_fold`'s ordering key
-needs, created with `write.merge.mode = merge-on-read` (the fold no-op
-detection precondition, `effects/spark.py`'s own documented empirical
-finding).
+Table shapes: the quarantine table is 005.1 §4.2's fixed, constant admission
+shape (`bootstrap.create_admission_tables.render_quarantine_create_table_
+sql` — the same builder `scenario_helpers.py`/`test_stages_land_pre_pull_
+apply.py` use, bead conveyer-azr.19 n3-admission-cut's DDL parity swap) —
+candidate-independent, `row_snapshot` carries a candidate row's own columns
+as a JSON blob; the fact table carries `stamp_fact_lineage`'s columns
+(`batch_id`, `delivery_id`, `feed_id`, `received_at`) in addition to the
+candidate's own 5; the state table is the narrower domain/ordering/payload
+shape `frames.folds.default_lww_fold`'s ordering key needs, created with
+`write.merge.mode = merge-on-read` (the fold no-op detection precondition,
+`effects/spark.py`'s own documented empirical finding).
+
+Every `post_check.run` call site now needs a REAL (possibly empty) fact
+table: `stages/post_check.py`'s own [R2-1] fact-presence probe
+(`table_has_batch(fact_table, batch_id, None)`) runs unconditionally, and an
+absent table raises `AnalysisException`, not `False` — the sentinel
+`"spine_test_tables.unused_fact"` string this file used before 005.1 no
+longer works for any test that calls `post_check.run` directly.
 """
 
 from __future__ import annotations
@@ -35,9 +43,11 @@ from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
 from snapshot_asserts import snapshot_delta, snapshot_ids
 from spine.binding import Transforms
+from spine.bootstrap.create_admission_tables import render_quarantine_create_table_sql
 from spine.config import RunConfig
 from spine.context import BatchContext
 from spine.core import run_facts
+from spine.core.contract import check_version, read_spec_version
 from spine.core.model import PipelineSpecModel
 from spine.effects.records import RunnerFx
 from spine.frames import folds
@@ -60,12 +70,7 @@ def _bare(qualified_table: str) -> str:
 
 
 def _create_quarantine_table(spark: SparkSession, qualified_table: str) -> None:
-    spark.sql(
-        f"CREATE TABLE {qualified_table} "
-        "(domain_id STRING, event_time TIMESTAMP, source_ts TIMESTAMP, "
-        "content_hash STRING, payload STRING, reason STRING, batch_id STRING, "
-        "check_stage STRING) USING iceberg"
-    )
+    spark.sql(render_quarantine_create_table_sql(qualified_table))
 
 
 def _create_fact_table(spark: SparkSession, qualified_table: str) -> None:
@@ -93,6 +98,10 @@ def _row(domain_id: str, dt: datetime, content_hash: str, payload: str) -> tuple
 
 
 def _make_spec(*, quarantine_table: str, fact_table: str, state_table: str) -> PipelineSpecModel:
+    # This bead's four stages (post_check/commit/fold/publish) never touch
+    # `spec.read`/`spec.raw_contract` (land/pre_check's own scope), so a
+    # minimal all-nullable one-column contract stands in (005.1 §3.4/A-12,
+    # bead conveyer-azr.13 -- required fields, no defaults).
     return PipelineSpecModel(
         pipeline="pipelines/m3-post-commit-fold-publish",
         transforms_module="pipelines.m3_post_commit_fold_publish",
@@ -100,6 +109,8 @@ def _make_spec(*, quarantine_table: str, fact_table: str, state_table: str) -> P
         quarantine_table=quarantine_table,
         fact_table=fact_table,
         state_table=state_table,
+        read={"dialect": {"format": "csv"}},
+        raw_contract={"columns": [{"name": "id"}]},
     )
 
 
@@ -151,6 +162,8 @@ def _make_ctx(
         attempt_id="attempt-1",
         sfn_retry_count=0,
         sfn_redrive_count=0,
+        read_spec_version=read_spec_version(spec.read),
+        check_version=check_version(spec.raw_contract, spec.read),
         raw_count=raw_count,
         co_effects={},
         candidate_facts_df=candidate_facts_df,
@@ -174,10 +187,12 @@ def test_post_check_fresh_zero_violations_admits_all_no_write(
     unique_table: Callable[[str], str],
 ) -> None:
     qtn_qt = unique_table("post_check_clean_qtn")
+    fact_qt = unique_table("post_check_clean_fact")
     _create_quarantine_table(spark, qtn_qt)
+    _create_fact_table(spark, fact_qt)
     spec = _make_spec(
         quarantine_table=_bare(qtn_qt),
-        fact_table="spine_test_tables.unused_fact",
+        fact_table=_bare(fact_qt),
         state_table="spine_test_tables.unused_state",
     )
     batch_id = _batch_id(1)
@@ -202,10 +217,12 @@ def test_post_check_fresh_with_violations_quarantines_and_holds_count_identity(
     unique_table: Callable[[str], str],
 ) -> None:
     qtn_qt = unique_table("post_check_dirty_qtn")
+    fact_qt = unique_table("post_check_dirty_fact")
     _create_quarantine_table(spark, qtn_qt)
+    _create_fact_table(spark, fact_qt)
     spec = _make_spec(
         quarantine_table=_bare(qtn_qt),
-        fact_table="spine_test_tables.unused_fact",
+        fact_table=_bare(fact_qt),
         state_table="spine_test_tables.unused_state",
     )
     batch_id = _batch_id(2)
@@ -215,7 +232,7 @@ def test_post_check_fresh_with_violations_quarantines_and_holds_count_identity(
 
     def _post_check(candidate_df: DataFrame, co_effects: object) -> DataFrame:
         return candidate_df.filter(F.col("domain_id") == "d").withColumn(
-            "reason", F.lit("bad payload")
+            "reason", F.lit("business/bad-payload")
         )
 
     ctx = _make_ctx(
@@ -235,16 +252,58 @@ def test_post_check_fresh_with_violations_quarantines_and_holds_count_identity(
     assert local_runner_fx.table_has_batch(_bare(qtn_qt), batch_id, "post_check") is True
 
 
+def test_post_check_fresh_nonconforming_reason_grammar_raises_a14(
+    spark: SparkSession,
+    local_runner_fx: RunnerFx,
+    unique_table: Callable[[str], str],
+) -> None:
+    """A-14/§8.2.1 (critique F1, bead conveyer-azr.30): the business-reason-
+    grammar check now runs HERE (`stages/post_check.py`, materializing
+    `quarantine.nonconforming_reasons`), not inside the pure
+    `shape_post_quarantine` -- a `reason` value that fails the grammar
+    raises the named `ValueError` BEFORE any quarantine append, no partial
+    write."""
+    qtn_qt = unique_table("post_check_badreason_qtn")
+    fact_qt = unique_table("post_check_badreason_fact")
+    _create_quarantine_table(spark, qtn_qt)
+    _create_fact_table(spark, fact_qt)
+    spec = _make_spec(
+        quarantine_table=_bare(qtn_qt),
+        fact_table=_bare(fact_qt),
+        state_table="spine_test_tables.unused_state",
+    )
+    batch_id = _batch_id(9)
+    candidate = spark.createDataFrame([_row("z", _T1, "h9", "payload-z")], list(_COLS))
+
+    def _bad_reason_post_check(candidate_df: DataFrame, co_effects: object) -> DataFrame:
+        return candidate_df.withColumn("reason", F.lit("not-a-valid-reason"))
+
+    ctx = _make_ctx(
+        spec=spec,
+        batch_id=batch_id,
+        candidate_facts_df=candidate,
+        post_check_fn=_bad_reason_post_check,
+    )
+    before = snapshot_ids(spark, qtn_qt)
+
+    with pytest.raises(ValueError, match="A-14"):
+        post_check.run(ctx, local_runner_fx)
+
+    assert snapshot_ids(spark, qtn_qt) == before  # loud failure -- no partial write
+
+
 def test_post_check_fresh_non_conforming_transform_raises_loudly(
     spark: SparkSession,
     local_runner_fx: RunnerFx,
     unique_table: Callable[[str], str],
 ) -> None:
     qtn_qt = unique_table("post_check_fabricated_qtn")
+    fact_qt = unique_table("post_check_fabricated_fact")
     _create_quarantine_table(spark, qtn_qt)
+    _create_fact_table(spark, fact_qt)
     spec = _make_spec(
         quarantine_table=_bare(qtn_qt),
-        fact_table="spine_test_tables.unused_fact",
+        fact_table=_bare(fact_qt),
         state_table="spine_test_tables.unused_state",
     )
     batch_id = _batch_id(3)
@@ -280,10 +339,12 @@ def test_post_check_guard_skip_uses_durable_quarantine_rows(
     unique_table: Callable[[str], str],
 ) -> None:
     qtn_qt = unique_table("post_check_rerun_qtn")
+    fact_qt = unique_table("post_check_rerun_fact")
     _create_quarantine_table(spark, qtn_qt)
+    _create_fact_table(spark, fact_qt)
     spec = _make_spec(
         quarantine_table=_bare(qtn_qt),
-        fact_table="spine_test_tables.unused_fact",
+        fact_table=_bare(fact_qt),
         state_table="spine_test_tables.unused_state",
     )
     batch_id = _batch_id(4)
@@ -293,7 +354,7 @@ def test_post_check_guard_skip_uses_durable_quarantine_rows(
 
     def _post_check(candidate_df: DataFrame, co_effects: object) -> DataFrame:
         return candidate_df.filter(F.col("domain_id") == "d").withColumn(
-            "reason", F.lit("bad payload")
+            "reason", F.lit("business/bad-payload")
         )
 
     ctx = _make_ctx(
@@ -322,17 +383,21 @@ def test_post_check_guard_skip_drift_sets_ctx_field_without_raising(
     WARNING + EMF `PostCheckDrift` emission that `record_run` now derives
     from the resulting `RunFact`."""
     qtn_qt = unique_table("post_check_drift_qtn")
+    fact_qt = unique_table("post_check_drift_fact")
     _create_quarantine_table(spark, qtn_qt)
+    _create_fact_table(spark, fact_qt)
     spec = _make_spec(
         quarantine_table=_bare(qtn_qt),
-        fact_table="spine_test_tables.unused_fact",
+        fact_table=_bare(fact_qt),
         state_table="spine_test_tables.unused_state",
     )
     batch_id = _batch_id(5)
     candidate = spark.createDataFrame([_row("f", _T1, "h6", "payload-f")], list(_COLS))
 
     def _flags_f(candidate_df: DataFrame, co_effects: object) -> DataFrame:
-        return candidate_df.filter(F.col("domain_id") == "f").withColumn("reason", F.lit("bad f"))
+        return candidate_df.filter(F.col("domain_id") == "f").withColumn(
+            "reason", F.lit("business/bad-f")
+        )
 
     ctx = _make_ctx(
         spec=spec, batch_id=batch_id, candidate_facts_df=candidate, post_check_fn=_flags_f
@@ -365,7 +430,11 @@ def test_post_check_guard_skip_drift_sets_ctx_field_without_raising(
     # row's `error_message` for this (non-failed) transition. The WARNING +
     # EMF `PostCheckDrift` emission itself now lives in `effects/ledger.py::
     # record_run` (critique F4), covered by `test_ledger.py`, not here.
-    assert second.post_check_drift == "post-check drift: durable=1 recomputed=2 subset=False"
+    # `recomputed=0` (not `candidate_count`, critique nit a, bead
+    # conveyer-azr.30's `_drift_message` grammar unification): THIS
+    # attempt's recomputed candidates ("g", "hh") hash-match nothing durable
+    # -- zero of them recompute as a violation, against durable=1 ("f").
+    assert second.post_check_drift == "post-check drift: durable=1 recomputed=0 subset=False"
     fact = run_facts.transition("post_check", rerun_ctx, second, _T1, _T1)
     assert fact.outcome == "skipped-guard"  # guard-skip rerun, never "failed" (I-12 [H-2])
     assert fact.error_message == second.post_check_drift
@@ -610,7 +679,9 @@ def test_publish_payload_is_durable_sourced_and_emits_event(
     )
 
     def _flags_d(candidate_df: DataFrame, co_effects: object) -> DataFrame:
-        return candidate_df.filter(F.col("domain_id") == "d").withColumn("reason", F.lit("bad d"))
+        return candidate_df.filter(F.col("domain_id") == "d").withColumn(
+            "reason", F.lit("business/bad-d")
+        )
 
     post_ctx = post_check.run(
         _make_ctx(

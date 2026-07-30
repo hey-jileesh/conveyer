@@ -47,9 +47,18 @@ def _stamp(df: DataFrame, stamp: LineageStamp) -> DataFrame:
     return stamped
 
 
-def stamp_raw_lineage(df: DataFrame, stamp: LineageStamp) -> DataFrame:
-    """Land's raw-table stamp (§7.5 land ②: `raw = frames.stamp_raw_lineage(df, stamp)`)."""
-    return _stamp(df, stamp)
+def stamp_raw_lineage(df: DataFrame, stamp: LineageStamp, read_spec_version: str) -> DataFrame:
+    """Land's raw-table stamp (§7.5 land ②: `raw = frames.stamp_raw_lineage(df, stamp,
+    ctx.read_spec_version)`).
+
+    `read_spec_version` (005.1 §3.5/§5.9, A-11) is RAW-ONLY (never stamped
+    onto facts, so it lives here rather than in `_lineage_literals`/`_stamp`,
+    which both stamp functions share) — **required, unconditionally stamped**
+    (bead conveyer-azr.19, n3-admission-cut: tightened away n1-quarantine's
+    interim `None`-default keyword, since `land.py`'s fresh path always has a
+    real `ctx.read_spec_version` in hand from the seed, §3.5)."""
+    stamped = _stamp(df, stamp)
+    return stamped.withColumn("read_spec_version", F.lit(read_spec_version))
 
 
 def stamp_fact_lineage(df: DataFrame, stamp: LineageStamp) -> DataFrame:

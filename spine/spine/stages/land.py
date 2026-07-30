@@ -2,10 +2,13 @@
 
 Steps ①–⑤ of §7.5's land algorithm, one code path with two entry branches:
 
-- **absent** (fresh): `fx.read_objects` the delivery (I-P1, provisional
-  reader), stamp raw lineage (`frames.lineage.stamp_raw_lineage`, `LineageStamp`
-  built from `ctx` per [C-5] — `frames/` never sees the context itself), one
-  guarded append.
+- **absent** (fresh): `fx.read_objects` the delivery via the real admission
+  reader (005.1 §5, §5.8's hardened `(object_uris, ReadSpecModel,
+  RawContractModel)` signature), stamp raw lineage (`frames.lineage.
+  stamp_raw_lineage`, `LineageStamp` built from `ctx` per [C-5] — `frames/`
+  never sees the context itself — plus `ctx.read_spec_version`, A-11/§5.9:
+  always passed, never the interim `None` n1-quarantine's own default kept
+  open), one guarded append.
 - **present** (guard-skip, rerun): no read, no write — the batch's raw rows
   already exist (I-3's guard reads DATA, never snapshot metadata).
 
@@ -21,8 +24,10 @@ would name a column that does not exist on this table's schema.
 
 `raw_count` follows [T-6]: on the fresh-write path it is the append's own
 returned `added-records` count (never a `.count()` re-execution of the
-upstream DAG); on guard-skip, `raw_df.count()` is the one deliberate action
-this path takes (there is no write-side summary to read it from).
+upstream DAG) — 005.1 §5.9: this now includes flagged (malformed) rows, the
+number `batch-started` carries (005 §6.1); on guard-skip, `raw_df.count()` is
+the one deliberate action this path takes (there is no write-side summary to
+read it from).
 
 `raw_df` is read back by name (`fx.read_batch`) unconditionally, even on the
 attempt that wrote it — 004 D-3's "one code path" rule stated once here (see
@@ -68,8 +73,8 @@ def run(ctx: BatchContext, fx: RunnerFx) -> BatchContext:
         guard_skips = (*ctx.guard_skips, "land")
         raw_count_from_append: int | None = None
     else:
-        object_df = fx.read_objects(ctx.object_uris, ctx.spec.read)
-        raw = lineage.stamp_raw_lineage(object_df, _lineage_stamp(ctx))
+        object_df = fx.read_objects(ctx.object_uris, ctx.spec.read, ctx.spec.raw_contract)
+        raw = lineage.stamp_raw_lineage(object_df, _lineage_stamp(ctx), ctx.read_spec_version)
         raw_count_from_append, _summary = fx.append(
             ctx.spec.raw_table, raw, ctx.batch_id, _STAGE_KEY
         )

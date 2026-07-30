@@ -14,6 +14,7 @@ from datetime import UTC, datetime
 import pytest
 from spine import config, context
 from spine.binding import Transforms
+from spine.core.contract import check_version, read_spec_version
 from spine.core.model import PipelineSpecModel
 
 
@@ -33,10 +34,13 @@ def _make_spec() -> PipelineSpecModel:
         quarantine_table="lake.commissions__quarantine",
         fact_table="lake.commissions__facts",
         state_table="lake.commissions__state",
+        read={"dialect": {"format": "csv"}},
+        raw_contract={"columns": [{"name": "id"}]},
     )
 
 
 def _make_seed() -> context.BatchContext:
+    spec = _make_spec()
     return context.BatchContext(
         pipeline="pipelines/commissions",
         feed_id="carrier-x/commission-statements",
@@ -46,12 +50,14 @@ def _make_seed() -> context.BatchContext:
         content_hash="sha256:" + "a" * 64,
         object_uris=("s3://bucket/statement.csv",),
         received_at=datetime(2026, 7, 25, 9, 0, 0, tzinfo=UTC),
-        spec=_make_spec(),
+        spec=spec,
         run=config.RunConfig(),
         transforms=_make_transforms(),
         attempt_id="jr_abc123",
         sfn_retry_count=0,
         sfn_redrive_count=0,
+        read_spec_version=read_spec_version(spec.read),
+        check_version=check_version(spec.raw_contract, spec.read),
     )
 
 

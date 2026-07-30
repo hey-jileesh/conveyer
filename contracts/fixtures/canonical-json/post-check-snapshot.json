@@ -1,0 +1,18 @@
+[
+  {
+    "value": {
+      "domain_id": "abc-123",
+      "amount": {
+        "$decimal": "10.50"
+      },
+      "event_time": {
+        "$timestamp": "2026-01-02T03:04:05.000000+00:00"
+      },
+      "quantity": 3,
+      "is_active": true,
+      "note": null
+    },
+    "canonical": "{\"amount\":\"10.50\",\"domain_id\":\"abc-123\",\"event_time\":\"2026-01-02T03:04:05.000000Z\",\"is_active\":true,\"note\":null,\"quantity\":3}",
+    "sha256": "5277f62971107968b153931f73252d02a92045b4792e0e0d696bec92d3c0f9fb"
+  }
+]

@@ -178,6 +178,8 @@ _BASE_SPEC: dict[str, Any] = {
     "quarantine_table": "lake.commissions__quarantine",
     "fact_table": "lake.commissions__facts",
     "state_table": "lake.commissions__state",
+    "read": {"dialect": {"format": "csv"}},
+    "raw_contract": {"columns": [{"name": "id"}]},
 }
 
 

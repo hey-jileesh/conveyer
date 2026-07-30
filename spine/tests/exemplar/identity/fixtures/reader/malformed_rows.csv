@@ -1,0 +1,5 @@
+domain_id,payload
+id-1,ok
+id-2,"unterminated
+id-3,too,many,fields
+id-4,"abc"junk,x

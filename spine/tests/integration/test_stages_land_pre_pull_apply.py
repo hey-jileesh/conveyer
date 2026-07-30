@@ -1,4 +1,4 @@
-"""`stages/{land,pre_check,pull,apply}.py` — LLD §7.5, I-6, I-7, I-12, I-19, [T-6][E-5].
+"""`stages/{land,pre_check,pull,apply}.py` — LLD §7.5, §6.5/§6.6, I-6, I-7, I-12, I-19, [T-6][E-5].
 
 Uses `local_runner_fx` (the REAL production assembly) throughout — no
 parallel test-only builder, matching every other integration suite in this
@@ -7,10 +7,16 @@ built directly (bypassing the entrypoint/`bind_transforms`) with a minimal
 inline `Transforms` double — plain functions, no `importlib` binding needed
 for these four stages.
 
-Table shapes mirror `test_spark_fx.py`'s own `_create_*_like_table` helpers,
-extended with the lineage columns `land`/`pre_check` actually stamp
-(`batch_id`, `delivery_id`, `feed_id`, `received_at`) plus the quarantine
-table's own `reason`/`check_stage` columns.
+**005.1 §4.4 DDL parity swap (bead conveyer-azr.19, n3-admission-cut):**
+`_create_raw_table`/`_create_quarantine_table` call `bootstrap.create_
+admission_tables`'s own DDL builders (the same functions `scenario_helpers.
+py` now uses) rather than a hand-rolled shape — the raw table's physical DDL
+depends only on `_CONTRACT_COLUMN_NAMES` (declared columns are always
+`STRING`/nullable regardless of a contract's own `nullable`/`required`
+flags, D-5), so one fixed base contract suffices for every test in this
+file regardless of which columns a given test's OWN `raw_contract` (via
+`_make_spec`'s `required_columns`) later declares `required`/`nullable:
+false`.
 """
 
 from __future__ import annotations
@@ -26,9 +32,14 @@ from typing import TYPE_CHECKING
 import pytest
 from pyspark.sql import SparkSession
 from spine.binding import Transforms
+from spine.bootstrap.create_admission_tables import (
+    render_quarantine_create_table_sql,
+    render_raw_create_table_sql,
+)
 from spine.config import RunConfig
 from spine.context import BatchContext
-from spine.core.model import CoEffectDecl, PipelineSpecModel
+from spine.core.contract import check_version, read_spec_version
+from spine.core.model import CoEffectDecl, ColumnSpec, PipelineSpecModel, RawContractModel
 from spine.effects.records import RunnerFx
 from spine.stages import apply, land, pre_check, pull
 
@@ -38,6 +49,14 @@ if TYPE_CHECKING:
 
 _CATALOG_PREFIX = "spine_cat."
 
+# This suite's raw table is (id, amount) -- the raw DDL's own column NAMES
+# (§4.1: declared columns are always STRING/nullable regardless of a
+# contract's `required`/`nullable` flags, D-5), independent of whichever
+# columns a given test's `raw_contract` (via `_make_spec`'s
+# `required_columns`) marks `required: true, nullable: false`.
+_CONTRACT_COLUMN_NAMES = ("id", "amount")
+_BASE_RAW_CONTRACT = RawContractModel(columns=[ColumnSpec(name=c) for c in _CONTRACT_COLUMN_NAMES])
+
 
 def _bare(qualified_table: str) -> str:
     assert qualified_table.startswith(_CATALOG_PREFIX)
@@ -45,20 +64,19 @@ def _bare(qualified_table: str) -> str:
 
 
 def _create_raw_table(spark: SparkSession, qualified_table: str) -> None:
-    spark.sql(
-        f"CREATE TABLE {qualified_table} "
-        "(id STRING, amount STRING, batch_id STRING, delivery_id STRING, "
-        "feed_id STRING, received_at TIMESTAMP) USING iceberg"
-    )
+    spark.sql(render_raw_create_table_sql(qualified_table, _BASE_RAW_CONTRACT))
 
 
 def _create_quarantine_table(spark: SparkSession, qualified_table: str) -> None:
-    spark.sql(
-        f"CREATE TABLE {qualified_table} "
-        "(id STRING, amount STRING, batch_id STRING, delivery_id STRING, "
-        "feed_id STRING, received_at TIMESTAMP, reason STRING, check_stage STRING) "
-        "USING iceberg"
-    )
+    spark.sql(render_quarantine_create_table_sql(qualified_table))
+
+
+def _create_fact_table(spark: SparkSession, qualified_table: str) -> None:
+    """pre_check's [DC-1] fact-presence probe (`table_has_batch(fact_table,
+    batch_id, None)`) needs a REAL table carrying a `batch_id` column
+    (`I-3`'s guard predicate), even in tests that never populate it -- an
+    absent table raises `AnalysisException`, not `False`."""
+    spark.sql(f"CREATE TABLE {qualified_table} (domain_id STRING, batch_id STRING) USING iceberg")
 
 
 def _create_coeff_table(spark: SparkSession, qualified_table: str, *, seed_row: bool) -> None:
@@ -75,10 +93,28 @@ def _passthrough_transforms() -> Transforms:
     )
 
 
+# `_make_spec`'s `required_columns` param (a TEST-local name, not a model
+# field: `PipelineSpecModel.required_columns` was deleted, A-12) drives
+# `raw_contract`'s `nullable: false`/`required: true` columns -- the real
+# contract grammar `stages/pre_check.py::compile_contract` compiles into its
+# `not-nullable` check (`contract/null-violation`, §6.1).
+
+
+def _raw_contract(required_columns: list[str] | None) -> RawContractModel:
+    names = set(required_columns or [])
+    return RawContractModel(
+        columns=[
+            ColumnSpec(name=c, nullable=c not in names, required=c in names)
+            for c in _CONTRACT_COLUMN_NAMES
+        ]
+    )
+
+
 def _make_spec(
     *,
     raw_table: str,
     quarantine_table: str,
+    fact_table: str = "spine_test_tables.unused_fact",
     required_columns: list[str] | None = None,
     co_effects: dict[str, CoEffectDecl] | None = None,
     serialize: bool = False,
@@ -89,9 +125,10 @@ def _make_spec(
         co_effects=co_effects or {},
         raw_table=raw_table,
         quarantine_table=quarantine_table,
-        fact_table="spine_test_tables.unused_fact",
+        fact_table=fact_table,
         state_table="spine_test_tables.unused_state",
-        required_columns=required_columns or [],
+        read={"dialect": {"format": "csv"}},
+        raw_contract=_raw_contract(required_columns),
         serialize=serialize,
     )
 
@@ -118,6 +155,8 @@ def _make_seed(
         attempt_id="attempt-1",
         sfn_retry_count=0,
         sfn_redrive_count=0,
+        read_spec_version=read_spec_version(spec.read),
+        check_version=check_version(spec.raw_contract, spec.read),
     )
 
 
@@ -208,10 +247,15 @@ def test_pre_check_zero_violations_writes_nothing_and_no_guard_row(
 ) -> None:
     raw_qt = unique_table("pre_check_clean_raw")
     qtn_qt = unique_table("pre_check_clean_qtn")
+    fact_qt = unique_table("pre_check_clean_fact")
     _create_raw_table(spark, raw_qt)
     _create_quarantine_table(spark, qtn_qt)
+    _create_fact_table(spark, fact_qt)
     spec = _make_spec(
-        raw_table=_bare(raw_qt), quarantine_table=_bare(qtn_qt), required_columns=["amount"]
+        raw_table=_bare(raw_qt),
+        quarantine_table=_bare(qtn_qt),
+        fact_table=_bare(fact_qt),
+        required_columns=["amount"],
     )
     batch_id = _batch_id(3)
     object_uris = _write_csv(tmp_path / "batch.csv", "id,amount\n1,10.5\n2,20.0\n")
@@ -238,10 +282,15 @@ def test_pre_check_with_violations_counts_and_valid_plus_viol_equals_raw(
 ) -> None:
     raw_qt = unique_table("pre_check_dirty_raw")
     qtn_qt = unique_table("pre_check_dirty_qtn")
+    fact_qt = unique_table("pre_check_dirty_fact")
     _create_raw_table(spark, raw_qt)
     _create_quarantine_table(spark, qtn_qt)
+    _create_fact_table(spark, fact_qt)
     spec = _make_spec(
-        raw_table=_bare(raw_qt), quarantine_table=_bare(qtn_qt), required_columns=["amount"]
+        raw_table=_bare(raw_qt),
+        quarantine_table=_bare(qtn_qt),
+        fact_table=_bare(fact_qt),
+        required_columns=["amount"],
     )
     batch_id = _batch_id(4)
     object_uris = _write_csv(tmp_path / "batch.csv", "id,amount\n1,10.5\n2,\n3,20.0\n")
@@ -258,9 +307,11 @@ def test_pre_check_with_violations_counts_and_valid_plus_viol_equals_raw(
     assert after.guard_skips == ()
     qtn_rows = spark.table(qtn_qt).where(f"batch_id = '{batch_id}'").collect()
     assert len(qtn_rows) == 1
-    assert qtn_rows[0]["id"] == "2"
+    # 005.1 §4.2's fixed quarantine shape: the offending row's own `id`
+    # value lives inside the JSON `row_snapshot`, not as a table column.
+    assert '"id":"2"' in qtn_rows[0]["row_snapshot"]
     assert qtn_rows[0]["check_stage"] == "pre_check"
-    assert qtn_rows[0]["reason"] is not None
+    assert qtn_rows[0]["reason_code"] == "contract/null-violation"
 
 
 def test_pre_check_guard_skip_rerun_recomputes_same_valid_df_without_rewriting(
@@ -271,10 +322,15 @@ def test_pre_check_guard_skip_rerun_recomputes_same_valid_df_without_rewriting(
 ) -> None:
     raw_qt = unique_table("pre_check_rerun_raw")
     qtn_qt = unique_table("pre_check_rerun_qtn")
+    fact_qt = unique_table("pre_check_rerun_fact")
     _create_raw_table(spark, raw_qt)
     _create_quarantine_table(spark, qtn_qt)
+    _create_fact_table(spark, fact_qt)
     spec = _make_spec(
-        raw_table=_bare(raw_qt), quarantine_table=_bare(qtn_qt), required_columns=["amount"]
+        raw_table=_bare(raw_qt),
+        quarantine_table=_bare(qtn_qt),
+        fact_table=_bare(fact_qt),
+        required_columns=["amount"],
     )
     batch_id = _batch_id(5)
     object_uris = _write_csv(tmp_path / "batch.csv", "id,amount\n1,10.5\n2,\n")

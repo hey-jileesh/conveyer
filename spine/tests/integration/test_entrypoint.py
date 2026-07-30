@@ -120,9 +120,11 @@ def _make_fx_factory(
         fx = make_runner_fx(spark, config)  # type: ignore[arg-type]
         real_read_objects = fx.read_objects
 
-        def wrapped_read_objects(uris: tuple[str, ...], read_hints: object) -> DataFrame:
+        def wrapped_read_objects(
+            uris: tuple[str, ...], read: object, raw_contract: object
+        ) -> DataFrame:
             real_paths = tuple(str(fixtures_dir / Path(u).name) for u in uris)
-            return real_read_objects(real_paths, read_hints)  # type: ignore[arg-type]
+            return real_read_objects(real_paths, read, raw_contract)  # type: ignore[arg-type]
 
         return replace(fx, read_objects=wrapped_read_objects)
 
@@ -152,7 +154,16 @@ def test_main_end_to_end_identity_clean_batch_matches_goldens_and_emits_both_eve
             "quarantine_table": _bare(qtn_qt),
             "fact_table": _bare(fact_qt),
             "state_table": _bare(state_qt),
-            "required_columns": ["domain_id"],
+            "read": {"dialect": {"format": "csv", "header": True}},
+            "raw_contract": {
+                "columns": [
+                    {"name": "domain_id", "required": True, "nullable": False},
+                    {"name": "event_time"},
+                    {"name": "source_ts"},
+                    {"name": "content_hash"},
+                    {"name": "payload"},
+                ]
+            },
             "sla_minutes": 480,
         }
     )
@@ -313,7 +324,16 @@ def test_main_installs_json_log_handler_exactly_once_across_two_invocations(
             "quarantine_table": _bare(qtn_qt),
             "fact_table": _bare(fact_qt),
             "state_table": _bare(state_qt),
-            "required_columns": ["domain_id"],
+            "read": {"dialect": {"format": "csv", "header": True}},
+            "raw_contract": {
+                "columns": [
+                    {"name": "domain_id", "required": True, "nullable": False},
+                    {"name": "event_time"},
+                    {"name": "source_ts"},
+                    {"name": "content_hash"},
+                    {"name": "payload"},
+                ]
+            },
             "sla_minutes": 480,
         }
     )

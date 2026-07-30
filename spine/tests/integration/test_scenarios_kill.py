@@ -1,5 +1,6 @@
 """R-03 (KillFx, 8 kill points), R-08 (merge-conflict rerun), R-13 (one-commit
-invariant) — LLD §12.4, I-4, I-19 [T-4], [E-16].
+invariant), A-07(b), A-10's hash-keyed-rerun leg — LLD §12.4, I-4, I-19
+[T-4], [E-16]; 005.1 §6.5/§8.2.4, A-9, A-10, A-14.
 
 Bead `conveyer-nvh.23`, M4. Reuses `scenario_helpers.py`'s table-DDL and
 spec/seed-building helpers by import (`tests/` has no `__init__.py`
@@ -77,6 +78,20 @@ end state an unkilled run reaches (R-01/R-04's own convergence pattern):
 every already-durably-committed effect is guard-skipped, every not-yet-
 committed one runs for the first time, and the durable fact/quarantine/state
 content is identical regardless of which point killed the first attempt.
+
+**N4 additions (bead conveyer-azr.20, n4-rerun-matrix): A-07(b) and A-10's
+own hash-keyed-rerun leg.** Both reuse this file's `kill_after`/
+`make_wrapped_fx` machinery rather than the R-03 parametrized matrix itself
+(neither is one of R-03's own 8 kill points — A-07(b) kills at the SAME
+point R-03's own "pre_check" row does, occurrence 2, but then reruns under a
+DELIBERATELY MUTATED contract rather than an unchanged one; A-10 kills at
+R-03's own "post_check" point, occurrence 3, then asserts A-10's own
+`row_hash`/zero-new-quarantine-rows claims specifically, which R-03's own
+parametrized case never inspects). Every new leg was scratch-validated
+against a real local Spark/Iceberg session (`uv run -p 3.11 --package
+conveyer-spine python <script>`) before being written here — the exact
+drift-string shape and cast-failure-retention behavior in A-07(b) are
+probe-confirmed, not derived from the LLD text alone.
 """
 
 from __future__ import annotations
@@ -90,6 +105,8 @@ import killfx
 import pytest
 from pyspark.sql import SparkSession
 from scenario_helpers import FIXTURES_DIR as _FIXTURES_DIR
+from scenario_helpers import IDENTITY_RAW_CONTRACT as _IDENTITY_RAW_CONTRACT
+from scenario_helpers import IDENTITY_READ as _IDENTITY_READ
 from scenario_helpers import bare as _bare
 from scenario_helpers import batch_id as _batch_id
 from scenario_helpers import create_fact_table as _create_fact_table
@@ -106,11 +123,15 @@ from snapshot_asserts import (
 from spine.binding import bind_transforms
 from spine.config import RunConfig
 from spine.context import BatchContext
-from spine.core.model import CoEffectDecl, PipelineSpecModel
+from spine.core.contract import check_version, read_spec_version
+from spine.core.model import CoEffectDecl, ColumnSpec, PipelineSpecModel, RawContractModel
 from spine.effects.records import RunnerFx, TransientError
 from spine.run import run as run_sequence
+from spine.stages import land, pre_check
 
 if TYPE_CHECKING:
+    from pathlib import Path
+
     from tests.conftest import LedgerCatalogFixture, MotoEventsBus
 
 _WrapperMap = Mapping[str, Callable[[Callable[..., Any]], Callable[..., Any]]]
@@ -150,7 +171,8 @@ def _make_spec_with_probe(
         quarantine_table=quarantine_table,
         fact_table=fact_table,
         state_table=state_table,
-        required_columns=["domain_id"],
+        read=_IDENTITY_READ,
+        raw_contract=_IDENTITY_RAW_CONTRACT,
     )
 
 
@@ -179,6 +201,8 @@ def _make_seed(
         attempt_id=attempt_id,
         sfn_retry_count=0,
         sfn_redrive_count=0,
+        read_spec_version=read_spec_version(spec.read),
+        check_version=check_version(spec.raw_contract, spec.read),
     )
 
 
@@ -293,7 +317,11 @@ def test_r03_kill_at_each_point_then_restart_converges(
     assert pre_rows[0]["domain_id"] is None
     post_rows = _quarantine_rows(spark, qtn_qt, batch_id, "post_check")
     assert len(post_rows) == 1
-    assert post_rows[0]["payload"] == "INVALID"
+    # 005.1 §4.2's fixed, candidate-independent quarantine shape: the row's
+    # own candidate columns (incl. `payload`) live inside `row_snapshot`
+    # (JSON), not as a table column -- see `test_scenarios_core.py`'s R-04
+    # identical fix.
+    assert '"payload":"INVALID"' in post_rows[0]["row_snapshot"]
     _assert_converged_violations(spark, fact_qt, state_qt)
 
 
@@ -323,7 +351,8 @@ def test_r08_merge_conflict_rerun_converges_then_healthy_rerun_is_a_logical_noop
         quarantine_table=_bare(qtn_qt),
         fact_table=_bare(fact_qt),
         state_table=_bare(state_qt),
-        required_columns=["domain_id"],
+        read=_IDENTITY_READ,
+        raw_contract=_IDENTITY_RAW_CONTRACT,
     )
     batch_id = _batch_id(380)
 
@@ -410,7 +439,8 @@ def test_r13_one_commit_invariant_per_effectful_stage_then_rerun_advances_zero(
         quarantine_table=_bare(qtn_qt),
         fact_table=_bare(fact_qt),
         state_table=_bare(state_qt),
-        required_columns=["domain_id"],
+        read=_IDENTITY_READ,
+        raw_contract=_IDENTITY_RAW_CONTRACT,
     )
     batch_id = _batch_id(390)
 
@@ -481,3 +511,182 @@ def test_r13_one_commit_invariant_per_effectful_stage_then_rerun_advances_zero(
     assert fact_rows == _CLEAN_FACT_GOLDEN  # unchanged by the rerun
     raw_rows_count = spark.table(raw_qt).where(f"batch_id = '{batch_id}'").count()
     assert raw_rows_count == 3  # unchanged by the rerun
+
+
+# --- A-07(b): contract mutated between attempts, KillFx after pre_check's
+# own append -- drift recorded, nothing raised, cast failures retained -----
+
+
+def test_a07b_pre_check_contract_mutated_between_attempts_drift_recorded_via_killfx(
+    spark: SparkSession,
+    local_runner_fx: RunnerFx,
+    ledger_catalog: LedgerCatalogFixture,
+    unique_table: Callable[[str], str],
+    make_wrapped_fx: _MakeWrappedFx,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+) -> None:
+    raw_qt = unique_table("a07b_raw")
+    qtn_qt = unique_table("a07b_qtn")
+    fact_qt = unique_table("a07b_fact")
+    _create_raw_table(spark, raw_qt)
+    _create_quarantine_table(spark, qtn_qt)
+    _create_fact_table(spark, fact_qt)
+
+    original_contract = RawContractModel(
+        columns=[
+            ColumnSpec(name="domain_id", required=True, nullable=False),
+            ColumnSpec(name="event_time"),
+            ColumnSpec(name="source_ts"),
+            ColumnSpec(name="content_hash"),
+            ColumnSpec(name="payload"),
+        ]
+    )
+    # Tightened between attempts: `content_hash` string -> int.
+    tightened_contract = RawContractModel(
+        columns=[
+            ColumnSpec(name="domain_id", required=True, nullable=False),
+            ColumnSpec(name="event_time"),
+            ColumnSpec(name="source_ts"),
+            ColumnSpec(name="content_hash", type="int"),
+            ColumnSpec(name="payload"),
+        ]
+    )
+    spec1 = PipelineSpecModel(
+        pipeline="pipelines/identity",
+        transforms_module="pipelines.identity.transforms",
+        raw_table=_bare(raw_qt),
+        quarantine_table=_bare(qtn_qt),
+        fact_table=_bare(fact_qt),
+        state_table="spine_test_tables.unused_state_a07b",
+        read=_IDENTITY_READ,
+        raw_contract=original_contract,
+    )
+    path = tmp_path / "object_1.csv"
+    path.write_text(
+        "domain_id,event_time,source_ts,content_hash,payload\n"
+        "id-101,2026-05-01T00:00:00Z,2026-05-01T00:00:00Z,12345,ok1\n"
+        ",2026-05-01T00:00:01Z,2026-05-01T00:00:01Z,99999,ok2\n"
+        "id-103,2026-05-01T00:00:02Z,2026-05-01T00:00:02Z,abc,ok3\n"
+    )
+    batch_id = _batch_id(320)
+
+    # Kill AFTER pre_check's own append (occurrence 2: land=1, pre_check=2
+    # -- this file's own kill-point table): under `original_contract`, the
+    # single null-`domain_id` row is the ONE violation, so this is the SAME
+    # point R-03's own "pre_check" row kills at. The attempt dies right
+    # there -- post_check/commit/fold/publish never run.
+    killed_fx = make_wrapped_fx(local_runner_fx, {"append": killfx.kill_after(2, before=False)})
+    seed1 = _make_seed(
+        spec=spec1, batch_id=batch_id, attempt_id="attempt-1", object_uris=(str(path),)
+    )
+    with pytest.raises(killfx.SimulatedKill):
+        run_sequence(seed1, killed_fx)
+
+    # Attempt 2: fresh seed, SAME batch_id, the TIGHTENED contract -- door 1
+    # (quarantine guard present, §6.5's A-9 subtraction path). land+pre_check
+    # only, via the real `run()` driver (not direct stage calls) so
+    # `fx.record_run` genuinely fires -- the WIRING this leg pins.
+    spec2 = PipelineSpecModel(**{**spec1.model_dump(), "raw_contract": tightened_contract})
+    seed2 = _make_seed(
+        spec=spec2, batch_id=batch_id, attempt_id="attempt-2", object_uris=(str(path),)
+    )
+    capsys.readouterr()  # drain attempt 1's own EMF/log output
+    result2 = run_sequence(
+        seed2, local_runner_fx, stages=(("land", land.run), ("pre_check", pre_check.run))
+    )
+
+    tightened_check_version = check_version(tightened_contract, _IDENTITY_READ)
+    expected_drift = (
+        "pre_check drift: durable=1 recomputed=2 only_durable=0 only_recomputed=1 "
+        f"admitted_cast_failures=1 check_version={tightened_check_version[:16]}"
+    )
+    assert result2.pre_check_drift == expected_drift
+    assert result2.guard_skips == ("land", "pre_check")
+
+    # §6.5's own letter: an admitted row whose cell now fails the CURRENT
+    # contract's cast stays admitted with a NULL cell -- recorded, never
+    # dropped (id-103's `content_hash`, "abc", cannot cast to int).
+    valid_rows = sorted((r["domain_id"], r["content_hash"]) for r in result2.valid_df.collect())
+    assert valid_rows == [("id-101", 12345), ("id-103", None)]
+
+    # `PreCheckDrift` EMF emitted via `record_run`, off the SAME ledger row
+    # `_stage_fields` folded the drift text into (not re-derived here).
+    pre_check_ledger_rows = [
+        r
+        for r in ledger_catalog.rows()
+        if r["batch_id"] == batch_id
+        and r["attempt_id"] == "attempt-2"
+        and r["stage"] == "pre_check"
+    ]
+    assert len(pre_check_ledger_rows) == 1
+    assert pre_check_ledger_rows[0]["outcome"] == "skipped-guard"
+    assert pre_check_ledger_rows[0]["error_message"] == expected_drift
+    captured = capsys.readouterr()
+    assert '"PreCheckDrift"' in captured.out  # the real EMF line, not just the ledger row
+
+
+# --- A-10: post_check's own hash-keyed rerun subtraction, kill-based -------
+
+
+def test_a10_post_check_hash_keyed_rerun_subtraction_exercised_via_killfx(
+    spark: SparkSession,
+    local_runner_fx: RunnerFx,
+    unique_table: Callable[[str], str],
+    make_wrapped_fx: _MakeWrappedFx,
+) -> None:
+    raw_qt = unique_table("a10_hash_raw")
+    qtn_qt = unique_table("a10_hash_qtn")
+    fact_qt = unique_table("a10_hash_fact")
+    state_qt = unique_table("a10_hash_state")
+    _create_raw_table(spark, raw_qt)
+    _create_quarantine_table(spark, qtn_qt)
+    _create_fact_table(spark, fact_qt)
+    _create_state_table(spark, state_qt)
+    spec = PipelineSpecModel(
+        pipeline="pipelines/identity",
+        transforms_module="pipelines.identity_violations.transforms",
+        raw_table=_bare(raw_qt),
+        quarantine_table=_bare(qtn_qt),
+        fact_table=_bare(fact_qt),
+        state_table=_bare(state_qt),
+        read=_IDENTITY_READ,
+        raw_contract=_IDENTITY_RAW_CONTRACT,
+    )
+    batch_id = _batch_id(310)
+
+    # Kill AFTER post_check's own append (occurrence 3: land=1, pre_check=2,
+    # post_check=3 -- this file's own kill-point table): the one post_check
+    # violation (payload == "INVALID") commits, then the attempt dies before
+    # commit ever runs.
+    killed_fx = make_wrapped_fx(local_runner_fx, {"append": killfx.kill_after(3, before=False)})
+    seed1 = _make_seed(
+        spec=spec, batch_id=batch_id, attempt_id="attempt-1", object_uris=_VIOLATIONS_OBJECT_URIS
+    )
+    with pytest.raises(killfx.SimulatedKill):
+        run_sequence(seed1, killed_fx)
+
+    durable_post = (
+        spark.table(qtn_qt)
+        .where(f"batch_id = '{batch_id}' AND check_stage = 'post_check'")
+        .collect()
+    )
+    assert len(durable_post) == 1
+    row_hash = durable_post[0]["row_hash"]
+    assert len(row_hash) == 64
+    assert all(c in "0123456789abcdef" for c in row_hash)  # §7.2: lowercase hex sha256
+
+    # Fresh restart: q_present=True, f_present=False (commit never ran) --
+    # PATH 4, §8.2.4's hash-keyed subtraction (the durable row no longer
+    # carries candidate columns at all, only `row_hash` -- the all-column/
+    # locator-keyed anti-joins pre_check's own doors use are impossible
+    # here, [DC-5]'s third mechanism).
+    qtn_before = snapshot_ids(spark, qtn_qt)
+    seed2 = _make_seed(
+        spec=spec, batch_id=batch_id, attempt_id="attempt-2", object_uris=_VIOLATIONS_OBJECT_URIS
+    )
+    result2 = run_sequence(seed2, local_runner_fx)
+
+    assert result2.post_quarantined_count == 1  # the DURABLE count -- path 4's own signature
+    assert_no_new_snapshot(spark, qtn_qt, qtn_before)  # hash subtraction: zero NEW rows
+    _assert_converged_violations(spark, fact_qt, state_qt)

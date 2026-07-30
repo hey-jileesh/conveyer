@@ -313,3 +313,17 @@ Nothing else changes: restart is from the top, guards make reruns no-ops, and th
 - **008** — maintenance obligations extended to admission tables (§6.2).
 - **009** — freezes the authoring surfaces previewed here (§5.1, §7.1).
 - **012** — the remediation workflow quarantine is designed for (§8.3).
+
+---
+
+## 15. Errata (from 005.1, v1.x)
+
+**Status note.** Decision-record updates, not decision reversals (per this doc's own Conventions, §"Conventions" above — "friction from 005.1 ... lands as v1.x revisions with decision-record updates"). Recorded verbatim-faithful to 005.1 LLD §15.3 ("To 005 (v1.x)"), discharging that register entry.
+
+1. **§6.1 — `malformed_text` reads *undialected*, not merely "undecoded."** "The undecoded line verbatim" is read as *undialected*: the value is necessarily post-charset-decode (005.1 §5.4's ladder runs decompression, then charset, before dialect parsing) — "undecoded" describes what survives the *dialect* parse step, not the *charset* step.
+2. **§5.2 — tier-1 "charset yields no decodable stream" is subsumed, not a separate detector.** Under the utf-8 ladder (005.1 §5.6), total mojibake never decodes to a plausible header, so it is caught by the existing header required-column check (§7.1) — there is no separate charset-failure detector to build.
+3. **§7.1 — castability semantics named precisely.** "Castability to declared `type`" is SQL `try_cast`'s semantics exactly, including scale rounding on `decimal(p,s)` and the broad bool token set — documented and CI-pinned against the engine (005.1 §6.2, A-15).
+4. **D-9 — the record locator's ordinal is 1-based, over records not physical lines.** "Row 1042 of file X" reads as the 1-based **record ordinal** (`row_index`), not a physical line number; the mapping from record ordinal to physical line is separately documented and asserted (005.1 A-3/A-6).
+5. **§7.2/§10 — [DC-1]: durable-authority needs a second door.** "On a guard-skipped rerun the durable rows are authoritative" (§7.2) is incomplete for zero-violation batches: they write **no** quarantine row, so their rerun is guard-*absent*, not guard-skipped — the guard-skip branch never fires for them. The authoritative signal for that case is **committed-fact presence**: without a fact-presence probe, a post-completion rerun under a moved contract pin would append quarantine rows contradicting facts already committed, silently. The fresh path gains that probe at **both** admission-adjacent quarantine writers — pre_check (§7.2) and post_check (§8.2, its own D-7 shape) — so complementarity holds through both doors at both stages (005.1 §6.5/§8.2, [DC-1]/[R2-1]).
+
+*Source: `design/005.1_admission_lld.md` §15.3 ("To 005 (v1.x)"), `conveyer-azr` epic.*
