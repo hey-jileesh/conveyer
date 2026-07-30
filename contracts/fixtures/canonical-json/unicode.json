@@ -1,0 +1,44 @@
+[
+  {
+    "value": {
+      "s": "a�b"
+    },
+    "canonical": "{\"s\":\"a�b\"}",
+    "sha256": "831e2ffe20d5ec81d65bb674545ecad8eb14892a421787b7d9588084a3e038c7"
+  },
+  {
+    "value": {
+      "s": "emoji:😀!"
+    },
+    "canonical": "{\"s\":\"emoji:😀!\"}",
+    "sha256": "18b91172bfeafca1895abccb25e07b1a37e02f55df7c3839555ba29cb89eaf40"
+  },
+  {
+    "value": {
+      "s": "line1\nline2\ttabbed\"quoted\\backslash"
+    },
+    "canonical": "{\"s\":\"line1\\nline2\\ttabbed\\\"quoted\\\\backslash\"}",
+    "sha256": "c02e98d2edb0c10079461ff3427022f23ee5fd8ab15f6879f6c035fabbde6ac9"
+  },
+  {
+    "value": {
+      "s": "ctrl:\u0001\u001f"
+    },
+    "canonical": "{\"s\":\"ctrl:\\u0001\\u001f\"}",
+    "sha256": "7fef507a290f3408b379f7de2282def3a85baac991dc8ce73b1a6d0815af5462"
+  },
+  {
+    "value": {
+      "s": ""
+    },
+    "canonical": "{\"s\":\"\"}",
+    "sha256": "6f600f2520d1f84f59052fea1223d39ea8f79da21817fd1ca486770e17ddb1b8"
+  },
+  {
+    "value": {
+      "s": "􏿿"
+    },
+    "canonical": "{\"s\":\"􏿿\"}",
+    "sha256": "45559be02bb551b68d42127975e0e525e12b1438fa4e3e1361eeb5c6c30fbef9"
+  }
+]

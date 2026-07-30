@@ -30,6 +30,8 @@ def _make_spec(domain_id_col: str = "domain_id") -> PipelineSpecModel:
         fact_table="lake.commissions__facts",
         state_table="lake.commissions__state",
         domain_id_col=domain_id_col,
+        read={"dialect": {"format": "csv"}},
+        raw_contract={"columns": [{"name": "id"}]},
     )
 
 

@@ -134,6 +134,135 @@ hardened by `conveyer-nvh.40` [F1]):
   failure` and raises a plain `ValueError` (never the caller-visible JVM
   message text -- a fixed, fixed-shape string) so this can never be
   mistaken for a retryable `TransientError`.
+
+**n2-reader (bead conveyer-azr.16, 005.1 §5; wired into `SparkFx`/
+`build_spark_fx` by bead conveyer-azr.19, n3-admission-cut): `_build_read_
+objects_admission`** -- the real reader replacing I-P1 (§5.8's hardened
+`(object_uris, ReadSpecModel, RawContractModel)` signature). Design notes
+and empirical findings (scratch-script probes, `uv run -p 3.11 --package
+conveyer-spine python <script>` against local Spark 3.5.9 -- the shared
+project kernel cannot import `pyspark`):
+
+- **Single-split acquisition** (§5.1 step 1): `sc.newAPIHadoopFile(uri,
+  TextInputFormat, LongWritable, Text, conf={"mapreduce.input.
+  fileinputformat.split.minsize": str(2**63 - 1)})` -- verified
+  `.getNumPartitions() == 1` for both a plain and a gzip-compressed file (gzip
+  is non-splittable regardless, so the conf is load-bearing for plain text
+  only, matching A-3's "one split -> file order unconditionally"). `.values()`
+  discards the `LongWritable` offset key -- only line text is kept.
+- **Hadoop's `LineRecordReader` already strips a leading UTF BOM at true file
+  offset 0** (`LineRecordReader.skipUtfByteOrderMark`, visible in this
+  bead's own probe stack traces) -- for BOTH `newAPIHadoopFile` and
+  `spark.read.text(...)` (non-wholetext). Verified empirically: a BOM at
+  byte 0 never reaches Python; a stray U+FEFF elsewhere in the file (e.g.
+  line 2) is passed through untouched. This means the explicit BOM-strip
+  code below is, for the non-multiline path, matching a condition Hadoop has
+  usually already satisfied -- kept anyway (idempotent: stripping an absent
+  BOM is a no-op) because (a) it is the letter of §5.1 step 3 and A-2, (b) it
+  must not be assumed stable across Hadoop versions, and (c) `wholetext=True`
+  (the multiline path, next bullet) does **not** get this free stripping --
+  verified separately, the BOM survives intact into the wholetext string, so
+  the strip is genuinely load-bearing there.
+- **UTF-8-with-replacement decode** (A-2, Hadoop `Text` semantics): verified
+  -- invalid UTF-8 bytes (`b"\xff\xfe"`) decode to U+FFFD per malformed byte,
+  never raise, for both the Hadoop RDD path and `spark.read.text`.
+- **The header probe** (§5.2) is one mechanism shared by both the
+  `multiline: false` and `multiline: true` bodies -- headers are always
+  single physical lines regardless of how the body is later parsed, so
+  `_probe_header` always uses the cheap, line-oriented `spark.read.text(uri)
+  .limit(skip_leading_lines + 1).collect()`, never `wholetext=True`. Any
+  exception raised by that call (verified: a corrupt gzip head surfaces as
+  `Py4JJavaError` wrapping `java.io.IOException: not a gzip file`) is
+  translated to `undecodable-object` -- never re-raised untouched, so a JVM
+  stack trace (which may embed the URI) never becomes this defect's message
+  ([S-8]). Fewer lines returned than requested, under `dialect.header`, is
+  the "header line absent" case of the same code (§5.2's own words); under
+  `header: false` no minimum line count is enforced (an empty headerless
+  object is valid, zero data rows -- verified). A header line that itself
+  fails `core.reading.parse_line` (`tokens is None`) is treated as the same
+  `undecodable-object` code -- the LLD's tier-1 table does not name this
+  sub-case separately, so this is a documented interpretation (the §5.7
+  table's "header line absent" bucket read broadly as "header line
+  unusable"), not a literal quote.
+- **`duplicate-header-column` reports exactly one group** (the lowest
+  header position among any duplicate-name groups found) even when more
+  than one distinct token is duplicated in the same header -- matches the
+  message grammar's singular `positions=[<i>,<j>]` shape (§5.2); a
+  duplicate-checked rerun after fixing the first would surface the next.
+  Verified the [DC-8] rule holds: an undeclared duplicated token's own text
+  never appears in the raised message, only its positions.
+- **The per-line body** (§5.1 steps 2-8): one `sc.newAPIHadoopFile(...)
+  .values().mapPartitions(shaper)` per object (single partition, so
+  `enumerate` inside the closure IS the physical line ordinal, no shuffle).
+  `shaper` re-applies the BOM strip to physical line 0 (belt-and-suspenders
+  per the bullet above), skips `skip_leading_lines` (+ 1 more when
+  `dialect.header`, the already-probed header line), and calls
+  `core.reading.parse_line` per remaining line -- malformed
+  (`parsed.tokens is None`) or ragged (`len(tokens) != binding.
+  expected_width`) lines shape to `malformed_text = line` (the decoded line
+  verbatim, §5.4) with every declared column NULL and `extras = {}`; a
+  well-formed line shapes cell-by-cell from the header-probe's own
+  `HeaderBinding.column_at` (declared target or `extras`, keyed by the
+  ORIGINAL header token at that position -- `header_tokens`, carried from
+  the probe, never re-derived). An empty line (`parsed.tokens == ()`,
+  verified the one shape a wholly-blank line produces) yields no record and
+  no `row_index` ordinal (§5.1.6) -- verified against a fixture with an
+  embedded blank line: the ordinal after it does not skip, i.e. row_index
+  stays a dense 1..N sequence over DATA records only, exactly A-3's stated
+  physical-line formula (`skip_leading_lines + header + row_index`).
+- **The `multiline: true` body** (§5.5) reads the whole object once
+  (`spark.read.text(uri, wholetext=True).collect()`, one row read to the
+  DRIVER -- the §5.5 whole-object-memory cost lands there, not "one task",
+  critique F3, `spine/README.md`'s own operational note), BOM-strips, drops
+  `skip_leading_lines` physical lines (`str.splitlines(keepends=True)` --
+  the LLD's own "content_lines_keepends" IS that stdlib call, by name), then
+  feeds the remainder to ONE `csv.reader` for the whole object via
+  `core.reading.multiline_records` (moved out of this module, critique F3,
+  bead conveyer-azr.30 -- a plain, Spark-free closure-based generator,
+  deliberately not a custom class: this engine's idiom rule requires
+  spine/** classes to be a frozen dataclass/`BaseModel`/`Enum`, and a
+  mutable line-position tracker has no honest frozen-dataclass shape).
+  **This `csv.reader` is built with `strict=False`, unlike
+  `core.reading.parse_line`'s `strict=True`** -- a deliberate, verified
+  difference: under `multiline: true`, §5.5 states an unterminated quote
+  must "consume the file's remainder into one field" rather than raise,
+  and `strict=False` is exactly the stdlib `csv` knob that turns "unexpected
+  end of data" at true EOF from a raised `csv.Error` into a
+  silently-finalized last field/row (verified with a matched pair of
+  probes, `strict=True` vs `strict=False`, over the identical unterminated-
+  quote fixture: the former raises, the latter returns the swallowed
+  remainder as one token). `core.reading.multiline_records` tracks, per
+  yielded record, exactly which physical lines (with their original line
+  endings) the reader consumed to produce it -- via a `nonlocal` counter in
+  a nested generator, not index arithmetic re-derived from token content --
+  so `malformed_text` on a ragged multiline record is the verbatim source
+  span, the same "the line as decoded, unparsed" contract as the per-line
+  path, generalized to however many physical lines contributed. The first
+  yielded record is the header (already bound at probe time) under
+  `dialect.header` and is skipped without re-shaping; a wholly-empty record
+  yields no row, mirroring the per-line path's own rule (not restated
+  verbatim in §5.5, applied here for row_index-semantics consistency
+  between the two body modes -- a documented interpretation, not a literal
+  quote). `core.reading.shape_row` (also moved, critique F3) is the SAME
+  per-record shaper the per-line body uses (bullet above) -- one authored
+  ragged/malformed verdict, both body modes.
+- **Compression/extension validation** (§5.6) runs once, over every
+  `sorted_uris` entry, strictly BEFORE any header probe (`_check_
+  compression_extensions`) -- `gzip` requires a `.gz`/`.gzip` suffix; `none`
+  forbids every Hadoop-actionable compression suffix
+  (`.gz .gzip .zst .bz2 .lz4 .snappy .deflate`); `zstd` itself never reaches
+  this function (rejected earlier, at `ReadSpecModel` parse, A-2).
+- **Objects union onto one fixed schema** (`_admission_raw_row_schema`,
+  built once per call from `raw_contract` -- every declared column typed
+  `string`, D-5) via `unionByName` -- every per-object frame already shares
+  the identical `StructType` instance, so this is a formality over a plain
+  `union`, kept for the self-documenting "union by name" contract §5.1
+  states.
+- **No URIs in any raised message** ([S-8]/A-10): every tier-1 `ValueError`
+  cites `object_seq` (assigned from `sorted(object_uris)`, 1-based, before
+  any check runs) and column names only -- verified by an explicit
+  no-substring-of-the-real-path assertion in this bead's own tests, not
+  just by inspection.
 """
 
 from __future__ import annotations
@@ -143,17 +272,21 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 from pyspark.sql import functions as F
+from pyspark.sql.types import IntegerType, LongType, MapType, StringType, StructField, StructType
 
 from spine.config import RunConfig, RunnerConfig
+from spine.core import reading
 from spine.core.merge import MergeSpec, quote_identifier
 from spine.core.naming import qualified
 from spine.effects.records import MergeResult, TransientError
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Mapping
+    from collections.abc import Callable, Iterable, Iterator
 
-    from pydantic import JsonValue
+    from pyspark import RDD
     from pyspark.sql import DataFrame, SparkSession
+
+    from spine.core.model import RawContractModel, ReadSpecModel
 
 logger = logging.getLogger(__name__)
 
@@ -355,40 +488,310 @@ def render_merge(spec: MergeSpec) -> str:
     )
 
 
-def _build_read_objects(
+# --- n2-reader (005.1 §5): the real admission reader -----------------------
+#
+# See the module docstring's own "n2-reader" section for the empirical
+# findings backing each design choice. `_build_read_objects_admission` is
+# the entry point `build_spark_fx`/`SparkFx.read_objects` (§5.8) wires in --
+# bead conveyer-azr.19 (n3-admission-cut) retired the provisional I-P1
+# `_build_read_objects` (CSV/UTF-8/header/FAILFAST) this section used to
+# sit alongside.
+
+_ADMISSION_GZIP_EXTENSIONS: tuple[str, ...] = (".gz", ".gzip")
+_ADMISSION_HADOOP_COMPRESSION_EXTENSIONS: tuple[str, ...] = (
+    ".gz",
+    ".gzip",
+    ".zst",
+    ".bz2",
+    ".lz4",
+    ".snappy",
+    ".deflate",
+)
+_ADMISSION_HADOOP_TEXT_INPUT_FORMAT = "org.apache.hadoop.mapreduce.lib.input.TextInputFormat"
+_ADMISSION_HADOOP_LONG_WRITABLE = "org.apache.hadoop.io.LongWritable"
+_ADMISSION_HADOOP_TEXT_WRITABLE = "org.apache.hadoop.io.Text"
+# A-3: forces a single Hadoop split per object -- see module docstring.
+_ADMISSION_SINGLE_SPLIT_CONF: dict[str, str] = {
+    "mapreduce.input.fileinputformat.split.minsize": str(2**63 - 1)
+}
+_ADMISSION_BOM = "﻿"
+
+
+def _check_compression_extensions(sorted_uris: tuple[str, ...], compression: str) -> None:
+    """§5.6, bind time, pre-probe: `compression: gzip` requires every object's
+    URI to end `.gz`/`.gzip`; `compression: none` forbids every extension
+    Hadoop would act on. `sorted_uris` must already be the SAME sorted tuple
+    `object_seq` is assigned from (A-3), so a raised message's `object_seq`
+    matches every other defect this reader raises. `compression: zstd` never
+    reaches this function -- rejected earlier, at `ReadSpecModel` parse
+    (A-2's `reserved-ladder-value`)."""
+    for object_seq, uri in enumerate(sorted_uris, start=1):
+        if compression == "gzip":
+            mismatched = not uri.endswith(_ADMISSION_GZIP_EXTENSIONS)
+        else:
+            mismatched = uri.endswith(_ADMISSION_HADOOP_COMPRESSION_EXTENSIONS)
+        if mismatched:
+            raise ValueError(
+                f"admission-defect/compression-extension-mismatch: object_seq={object_seq}"
+            )
+
+
+@dataclass(frozen=True)
+class _HeaderProbe:
+    """§5.2's per-object result, computed once and reused by the body read
+    below -- the header is never re-parsed after the probe. `header_tokens`
+    is `None` under `dialect.header is False` (no header line exists;
+    `binding.column_at` is the positional mapping `core.reading.bind_header`
+    already derives straight from `raw_contract.columns`)."""
+
+    binding: reading.HeaderBinding
+    header_tokens: tuple[str, ...] | None
+
+
+def _probe_header(
     spark: SparkSession,
-) -> Callable[[tuple[str, ...], Mapping[str, Any]], DataFrame]:
-    def read_objects(uris: tuple[str, ...], read_hints: Mapping[str, JsonValue]) -> DataFrame:
-        # I-P1, provisional: CSV, UTF-8, header row, all columns string (the
-        # default when `inferSchema` is left unset), mode=FAILFAST -- a
-        # malformed row (wrong column count vs. the header) is a
-        # deterministic job failure (verified empirically: Spark raises
-        # `Py4JJavaError`/`MALFORMED_CSV_RECORD` under FAILFAST for a ragged
-        # row). `read_hints` (`spec.read`) is accepted but not yet consumed --
-        # 005 owns real reader-hint semantics (I-P1); Phase 1's reader is
-        # fixed regardless of hint content.
-        #
-        # nvh.38: `escape='"'` restores RFC-4180 doubled-quote decoding.
-        # Spark's CSV reader defaults `escape` to backslash, not the quote
-        # character -- a well-formed doubled-quote value (what `csv.writer`
-        # emits for a field containing a quote and/or comma, e.g.
-        # `"has""embedded,quote"`) was misparsed as a ragged row and killed
-        # the whole batch under FAILFAST. This is 005's provisional reader
-        # accepting valid CSV, not new reader-hint semantics -- 005 still
-        # owns real reader semantics (I-P1). `multiLine` is deliberately
-        # left unset: not needed for doubled-quote decoding (verified), and
-        # enabling it would trade away FAILFAST's ability to catch an
-        # unclosed quote (a genuinely malformed row) for support of the
-        # separate, unreported embedded-newline-in-a-quoted-field case.
-        del read_hints
-        return (
-            spark.read.format("csv")
-            .option("header", "true")
-            .option("encoding", "UTF-8")
-            .option("mode", "FAILFAST")
-            .option("escape", '"')
-            .load(list(uris))
+    object_seq: int,
+    uri: str,
+    read: ReadSpecModel,
+    raw_contract: RawContractModel,
+    dialect: reading.DialectValue,
+) -> _HeaderProbe:
+    """§5.2/A-10: a `limit`-bounded, driver-side read of the first
+    `skip_leading_lines + 1` lines -- cheap even for gzip (module docstring).
+    Every tier-1 defect this function can discover is raised here, before
+    any object's body is ever read (§5.2's "before any append")."""
+    limit = read.skip_leading_lines + 1
+    try:
+        taken = spark.read.text(uri).limit(limit).collect()
+    except Exception:  # noqa: BLE001 -- translated to a named tier-1 defect, never re-raised
+        # conveyer-azr.32/S-8/A-10: `from None` suppresses the chained
+        # Py4JJavaError -- its text embeds the full JVM stack, including
+        # this object's s3:// URI (partner-authored, payload-classified).
+        # `object_seq` plus the seed event already identify the object; the
+        # cause adds no permitted information, only a leak.
+        raise ValueError(f"admission-defect/undecodable-object: object_seq={object_seq}") from None
+    raw_lines = [row["value"] for row in taken]
+    if raw_lines and raw_lines[0].startswith(_ADMISSION_BOM):
+        raw_lines[0] = raw_lines[0][1:]
+    header_tokens: tuple[str, ...] | None = None
+    if dialect.header:
+        if len(raw_lines) < limit:
+            # "header line absent" (§5.2): fewer lines exist than the
+            # skip + header would require.
+            raise ValueError(
+                f"admission-defect/undecodable-object: object_seq={object_seq}"
+            ) from None
+        parsed = reading.parse_line(raw_lines[read.skip_leading_lines], dialect)
+        if parsed.tokens is None:
+            # A malformed header line has no A-10-named code of its own
+            # (module docstring: a documented interpretation, not a literal
+            # quote) -- folded into "header line unusable".
+            raise ValueError(
+                f"admission-defect/undecodable-object: object_seq={object_seq}"
+            ) from None
+        header_tokens = parsed.tokens
+    binding = reading.bind_header(header_tokens or (), raw_contract, dialect)
+    if dialect.header and binding.duplicate_name_groups:
+        assert header_tokens is not None, "duplicate_name_groups is always empty under header:false"
+        declared_names = {column.name for column in raw_contract.columns}
+        group = min(binding.duplicate_name_groups, key=lambda positions: positions[0])
+        token = header_tokens[group[0]]
+        # [DC-8]: the token itself is named only when it equals a DECLARED
+        # column name -- an arbitrary undeclared header token is partner-
+        # authored payload text, never surfaced in a defect message.
+        name_suffix = f" name={token!r}" if token in declared_names else ""
+        raise ValueError(
+            f"admission-defect/duplicate-header-column: object_seq={object_seq} "
+            f"positions={list(group)}{name_suffix}"
         )
+    if dialect.header and binding.missing_required:
+        raise ValueError(
+            f"admission-defect/required-column-missing: object_seq={object_seq} "
+            f"columns={list(binding.missing_required)}"
+        )
+    return _HeaderProbe(binding=binding, header_tokens=header_tokens)
+
+
+def _admission_raw_row_schema(raw_contract: RawContractModel) -> StructType:
+    """§5.1.8's per-object emitted shape: locators, `malformed_text`, every
+    declared column (always `string`, D-5), `extras` last -- the fixed
+    schema every object's frame is built against and unioned onto.
+    `batch_id`/`delivery_id`/`feed_id`/`received_at`/`read_spec_version`
+    (land's own lineage stamp) are NOT here -- §5.1's own words, "minus
+    lineage/stamp columns, added by `frames.stamp_raw_lineage`"."""
+    fields = [
+        StructField("source_uri", StringType(), nullable=False),
+        StructField("object_seq", IntegerType(), nullable=False),
+        StructField("row_index", LongType(), nullable=False),
+        StructField("malformed_text", StringType(), nullable=True),
+    ]
+    fields.extend(
+        StructField(column.name, StringType(), nullable=True) for column in raw_contract.columns
+    )
+    fields.append(
+        StructField(
+            "extras", MapType(StringType(), StringType(), valueContainsNull=False), nullable=False
+        )
+    )
+    return StructType(fields)
+
+
+def _make_line_shaper(
+    uri: str,
+    object_seq: int,
+    dialect: reading.DialectValue,
+    skip_leading_lines: int,
+    binding: reading.HeaderBinding,
+    header_tokens: tuple[str, ...] | None,
+    column_names: tuple[str, ...],
+) -> Callable[[Iterable[str]], Iterator[tuple[Any, ...]]]:
+    """§5.1 steps 2-8, `multiline: false`: the `mapPartitions` closure over
+    ONE object's single-partition line RDD. `enumerate` over the closure's
+    own iterator IS the physical line ordinal (0-based, §5.1 step 2) --
+    single-split acquisition (module docstring) makes this the file's own
+    line order, unconditionally (A-3). Every parsing/shaping decision is
+    `core.reading.parse_line` + `core.reading.shape_row` (built from the
+    probe's own `HeaderBinding`, moved out of this module by critique F3,
+    bead conveyer-azr.30) -- this closure only counts and filters lines,
+    contributing acquisition/iteration, nothing semantic."""
+    header_offset = skip_leading_lines + (1 if dialect.header else 0)
+
+    def shape(lines: Iterable[str]) -> Iterator[tuple[Any, ...]]:
+        row_index = 0
+        for physical_line_no, line in enumerate(lines):
+            if physical_line_no == 0 and line.startswith(_ADMISSION_BOM):
+                line = line[1:]  # A-2 step 3 -- belt-and-suspenders, module docstring
+            if physical_line_no < header_offset:
+                continue  # skip_leading_lines, then the already-probed header line
+            parsed = reading.parse_line(line, dialect)
+            if parsed.tokens == ():
+                continue  # §5.1.6: an empty line yields no record, no ordinal
+            row_index += 1
+            yield reading.shape_row(
+                uri,
+                object_seq,
+                row_index,
+                line,
+                parsed.tokens,
+                binding,
+                header_tokens,
+                column_names,
+            )
+
+    return shape
+
+
+def _shape_multiline_object(
+    spark: SparkSession,
+    uri: str,
+    object_seq: int,
+    read: ReadSpecModel,
+    dialect: reading.DialectValue,
+    probe: _HeaderProbe,
+    column_names: tuple[str, ...],
+) -> list[tuple[Any, ...]]:
+    """§5.5's whole-object path: `wholetext=True` (one row) read to the
+    DRIVER via `.collect()[0]["value"]` -- §5.5's named whole-object-memory
+    cost therefore lands on the DRIVER, not "one task" a naive reading might
+    expect (critique F3, bead conveyer-azr.30; see `spine/README.md`'s own
+    operational note) -- explicit BOM strip (NOT free here -- module
+    docstring: `wholetext` does not go through the per-line reader's own BOM
+    handling), `str.splitlines(keepends=True)` (the LLD's own
+    "content_lines_keepends", by name) after dropping `skip_leading_lines`
+    physical lines, then `core.reading.multiline_records` over the remainder
+    (moved out of this module, critique F3). The first record is the header
+    under `dialect.header` (already bound at probe time -- skipped here
+    without re-shaping); a wholly-empty record yields no row (row_index-
+    semantics parity with the per-line path, module docstring)."""
+    content = spark.read.text(uri, wholetext=True).collect()[0]["value"]
+    if content.startswith(_ADMISSION_BOM):
+        content = content[1:]
+    physical_lines = content.splitlines(keepends=True)
+    body_lines = physical_lines[read.skip_leading_lines :]
+    rows: list[tuple[Any, ...]] = []
+    row_index = 0
+    for record_ordinal, (tokens, raw_text) in enumerate(
+        reading.multiline_records(body_lines, dialect), start=1
+    ):
+        if dialect.header and record_ordinal == 1:
+            continue
+        if len(tokens) == 0:
+            continue
+        row_index += 1
+        rows.append(
+            reading.shape_row(
+                uri,
+                object_seq,
+                row_index,
+                raw_text,
+                tokens,
+                probe.binding,
+                probe.header_tokens,
+                column_names,
+            )
+        )
+    return rows
+
+
+def _build_read_objects_admission(
+    spark: SparkSession,
+) -> Callable[[tuple[str, ...], ReadSpecModel, RawContractModel], DataFrame]:
+    """005.1 §5's real reader (A-1, A-3, A-4; §5.8's signature) -- see the
+    module docstring's "n2-reader" section for the full design account and
+    its empirical backing. Wired into `build_spark_fx`/`SparkFx.read_objects`
+    (bead conveyer-azr.19, n3-admission-cut)."""
+
+    def read_objects(
+        object_uris: tuple[str, ...], read: ReadSpecModel, raw_contract: RawContractModel
+    ) -> DataFrame:
+        # A-3: codepoint order; object_seq is 1-based over this exact tuple.
+        sorted_uris = tuple(sorted(object_uris))
+        _check_compression_extensions(sorted_uris, read.compression)
+        dialect = reading.dialect_value(read.dialect)
+        schema = _admission_raw_row_schema(raw_contract)
+        column_names = tuple(column.name for column in raw_contract.columns)
+        # §5.2: EVERY object is probed, and any tier-1 defect raised, before
+        # any object's body is read -- a plain list comprehension already
+        # gives this: Python evaluates left to right and a `raise` inside it
+        # propagates immediately, so the first offending object (by
+        # object_seq) stops the whole call before any body read begins.
+        probes = [
+            _probe_header(spark, object_seq, uri, read, raw_contract, dialect)
+            for object_seq, uri in enumerate(sorted_uris, start=1)
+        ]
+        object_dfs: list[DataFrame] = []
+        for object_seq, (uri, probe) in enumerate(zip(sorted_uris, probes, strict=True), start=1):
+            if dialect.multiline:
+                rows = _shape_multiline_object(
+                    spark, uri, object_seq, read, dialect, probe, column_names
+                )
+                object_dfs.append(spark.createDataFrame(rows, schema=schema))
+            else:
+                sc = spark.sparkContext
+                lines_rdd: RDD[str] = sc.newAPIHadoopFile(
+                    uri,
+                    _ADMISSION_HADOOP_TEXT_INPUT_FORMAT,
+                    _ADMISSION_HADOOP_LONG_WRITABLE,
+                    _ADMISSION_HADOOP_TEXT_WRITABLE,
+                    conf=_ADMISSION_SINGLE_SPLIT_CONF,
+                ).values()
+                shaper = _make_line_shaper(
+                    uri,
+                    object_seq,
+                    dialect,
+                    read.skip_leading_lines,
+                    probe.binding,
+                    probe.header_tokens,
+                    column_names,
+                )
+                shaped_rdd = lines_rdd.mapPartitions(shaper)
+                object_dfs.append(spark.createDataFrame(shaped_rdd, schema=schema))
+        if not object_dfs:
+            return spark.createDataFrame([], schema=schema)
+        result = object_dfs[0]
+        for df in object_dfs[1:]:
+            result = result.unionByName(df)
+        return result
 
     return read_objects
 
@@ -568,7 +971,7 @@ class SparkFx:
     `append`). `effects/build.py::make_runner_fx` splices these fields
     directly into the production `RunnerFx`."""
 
-    read_objects: Callable[[tuple[str, ...], Mapping[str, JsonValue]], DataFrame]
+    read_objects: Callable[[tuple[str, ...], ReadSpecModel, RawContractModel], DataFrame]
     read_table: Callable[[str], tuple[DataFrame, int]]
     read_batch: Callable[[str, str], DataFrame]
     table_has_batch: Callable[[str, str, str | None], bool]
@@ -585,7 +988,7 @@ def build_spark_fx(spark: SparkSession, config: RunnerConfig) -> SparkFx:
     fx`, via that same production call) both make; no test-only fork."""
     run_config = RunConfig.model_validate_json(config.run_config_json)
     return SparkFx(
-        read_objects=_build_read_objects(spark),
+        read_objects=_build_read_objects_admission(spark),
         read_table=_build_read_table(spark),
         read_batch=_build_read_batch(spark),
         table_has_batch=_build_table_has_batch(spark),

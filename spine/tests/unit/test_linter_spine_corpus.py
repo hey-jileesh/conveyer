@@ -83,6 +83,27 @@ MUST_FAIL_CASES: list[tuple[str, str, tuple[str, ...]]] = [
         "spine/effects/x.py",
         ("purity-banned-import:awsglue",),
     ),
+    # 005.1 N1 (bead conveyer-azr.14, §12.6 item 2): `expr` joins the
+    # string-SQL sinks in the `frames-transforms` profile too (previously
+    # only `effects-stages` reviewed it) -- `frames/checks.py::_typed_expr`
+    # is the ONE hardcoded exemption for this exact shape (§6.2); this
+    # fixture's function is deliberately named something else, so the
+    # exemption does not reach it and the sink rule fires.
+    (
+        "fail_frames_fstring_expr.py",
+        "spine/frames/x.py",
+        ("idiom-string-sql:expr",),
+    ),
+    # critique F1 (bead conveyer-azr.30): `count` closes the one hole
+    # `_SPARK_BANNED_ATTR_NAMES` used to leave open (`frames/quarantine.py`'s
+    # since-relocated `_assert_business_reason_grammar` was the deliberate,
+    # documented exploit of that hole) -- pinned here the same way §12.6
+    # item 1 pins the `_TRY_RAISE_ALLOWLIST`'s first `purity-try` exercise.
+    (
+        "fail_frames_count.py",
+        "spine/frames/x.py",
+        ("purity-banned-attr:count",),
+    ),
 ]
 
 MUST_PASS_CASES: list[tuple[str, str]] = [
@@ -92,6 +113,12 @@ MUST_PASS_CASES: list[tuple[str, str]] = [
     # simulated location, confirming the profile match is path-driven, not
     # filename-driven.
     ("pass_frames_functions_only.py", "pipelines/identity/transforms.py"),
+    # 005.1 n0-reading (bead conveyer-azr.12, §12.6 item 1): the corpus's
+    # first MUST-PASS exercise of `purity-try` (not just `purity-raise`) via
+    # `_TRY_RAISE_ALLOWLIST` -- rel_path must be the EXACT
+    # `spine/core/reading.py` the allowlist entry names, since the engine
+    # keys allowlist membership off `(rel_path, function_name)`.
+    ("pass_core_parse_line_try.py", "spine/core/reading.py"),
 ]
 
 
@@ -119,17 +146,29 @@ def test_must_pass_fixture_is_clean(fixture_name: str, rel_path: str) -> None:
     assert violations == (), f"{fixture_name}: expected no violations, got {violations}"
 
 
-def test_effects_stages_string_sql_exemption_targets_a_real_function() -> None:
-    """§12.3: the rendered MERGE in `effects/spark.py` is the single
-    hardcoded string-SQL exemption -- verify the `(file, function)` pair
-    named in `_STRING_SQL_EXEMPTION` still matches a real function in the
-    real file (not a stale name after a rename), and that the real file
-    reports zero `idiom-string-sql` violations either way. `render_merge`'s
-    own docstring records why the exemption is currently a documented no-op
-    (`spark.sql(sql_text)` is called with a plain variable, never an inline
-    f-string) -- this test pins that finding as a regression guard rather
-    than re-deriving it."""
-    (rel_path, function_name) = next(iter(_CONFIG.string_sql_exemption))
+@pytest.mark.parametrize("rel_path,function_name", sorted(_CONFIG.string_sql_exemption))
+def test_string_sql_exemption_targets_a_real_function(rel_path: str, function_name: str) -> None:
+    """§12.3/§12.6 item 2: every `(file, function)` pair in
+    `_STRING_SQL_EXEMPTION` still names a real function in a real file (not
+    a stale name after a rename), and the real file reports zero
+    `idiom-string-sql` violations either way.
+
+    Parametrized over EVERY entry, not just `next(iter(...))` over the
+    frozenset -- with a single entry (`effects/spark.py::render_merge`) that
+    accidentally proved nothing about ORDER; now that a second entry exists
+    (`frames/checks.py::_typed_expr`, bead conveyer-azr.14, §12.6 item 2),
+    `next(iter(...))` over a 2+-element frozenset would pick one
+    hash-order-dependent entry and silently skip verifying the other(s) --
+    a latent flakiness/coverage gap this parametrization closes for both the
+    existing and any future entry.
+
+    `render_merge`'s own docstring records why ITS exemption is currently a
+    documented no-op (`spark.sql(sql_text)` is called with a plain variable,
+    never an inline f-string); `_typed_expr`'s IS load-bearing (it genuinely
+    builds `F.expr(f"try_cast(...)")` text, §6.2) -- both are asserted
+    identically here (a real function, zero real violations), and the
+    LOAD-BEARING-vs-documented-no-op distinction is each function's own
+    docstring's job, not this test's."""
     # `rel_path` is relative to the engine's own `root` (`config.package_root`
     # below the repo root, i.e. the `spine` uv-workspace module dir) -- see
     # `LinterConfig.package_root`'s docstring; `parents[2]` of THIS file

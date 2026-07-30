@@ -7,7 +7,7 @@ UV := uv run -p 3.11 --package conveyer-spine
 
 .PHONY: setup lint schemas test-unit test-frames test-integration test-contracts test \
         coverage registry test-golden package package-router push-wheel \
-        bootstrap-ledger plan apply smoke
+        bootstrap-ledger bootstrap-admission plan apply smoke
 
 setup:
 	uv sync --all-packages
@@ -101,6 +101,11 @@ push-wheel:
 bootstrap-ledger:  ## idempotent run_ledger Iceberg table creation (LLD §6.5, I-17)
 	@test -n "$(ENV)" || { echo "ENV is required"; exit 1; }
 	$(UV) python -m spine.bootstrap.create_run_ledger --env $(ENV)
+
+bootstrap-admission:  ## idempotent per-pipeline raw/quarantine Iceberg table creation (005.1 LLD §4.4)
+	@test -n "$(ENV)" || { echo "ENV is required"; exit 1; }
+	@test -n "$(SPEC)" || { echo "SPEC is required (pipeline spec URI, s3:// or file://)"; exit 1; }
+	$(UV) python -m spine.bootstrap.create_admission_tables --spec-uri $(SPEC) --env $(ENV)
 
 # D-1: spine has no terraform env root of its own -- `modules/spine-platform`
 # and `modules/spine-pipeline` are consumed from the existing ingestion env

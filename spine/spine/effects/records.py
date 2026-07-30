@@ -32,13 +32,14 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import TYPE_CHECKING
 
-from pydantic import BaseModel, JsonValue
+from pydantic import BaseModel
 
 if TYPE_CHECKING:
     from pyspark.sql import DataFrame
 
     from spine.config import RunnerConfig
     from spine.core.merge import MergeSpec
+    from spine.core.model import RawContractModel, ReadSpecModel
     from spine.core.run_facts import RunFact
 
 
@@ -72,8 +73,10 @@ class MergeResult:  # §7.6
 
 @dataclass(frozen=True)
 class RunnerFx:  # spine/effects/records.py — §7.6's full signature
-    read_objects: Callable[[tuple[str, ...], Mapping[str, JsonValue]], DataFrame]
-    # (object_uris, read_hints) -> raw DataFrame; land's delivery read (004 v1.x accretion)
+    read_objects: Callable[[tuple[str, ...], ReadSpecModel, RawContractModel], DataFrame]
+    # (object_uris, read, raw_contract) -> raw DataFrame; land's delivery read (005.1 §5.8,
+    # hardened from 004.1's provisional `Mapping[str, JsonValue]` hints shape -- errata-notes
+    # §1.1's class, discharged by bead conveyer-azr.19, n3-admission-cut)
     read_table: Callable[[str], tuple[DataFrame, int]]  # pinned read: (table) -> (df, snapshot_id)
     # I-6 -- current snapshot resolved first, then read AT that snapshot;
     # zero-snapshot table: sid = -1 sentinel

@@ -18,14 +18,20 @@ recorded assumption this bead flags: if `TransientError` ever grows
 subclasses, this name-only check stops recognizing them and needs revisiting
 alongside `effects/records.py` (bead conveyer-nvh.18+).
 
-`_stage_fields`' `post_check` branch is the one place a non-failed
-transition's `error_message` gets populated: I-12 [H-2]'s guard-skip
-read-back subset mismatch is surfaced as data, never raised, so
+`_stage_fields`' `post_check` branch was, until this bead, the one place a
+non-failed transition's `error_message` gets populated: I-12 [H-2]'s
+guard-skip read-back subset mismatch is surfaced as data, never raised, so
 `ctx_after.post_check_drift` (set only by `stages/post_check.py`'s drift
 branch, `None` otherwise) folds straight into the row's `error_message` when
 present — `failed()` is a separate function that never calls
 `_stage_fields`, so a genuinely failed attempt's `error_message` is
 untouched by this.
+
+**005.1 A-9 (bead conveyer-azr.18, n3-context-wiring; `stages/pre_check.py`
+starts setting the field in bead conveyer-azr.19, n3-admission-cut)**: the
+`pre_check` branch folds `ctx_after.pre_check_drift` into `error_message` on
+the identical, non-failed-transition-only terms — the exact mirror
+`context.py`'s own docstring promises.
 """
 
 from __future__ import annotations
@@ -112,10 +118,16 @@ def _stage_fields(stage: str, ctx_after: BatchContext) -> dict[str, Any]:
     if stage == "land":
         return {"raw_count": ctx_after.raw_count, "snapshot_id": ctx_after.land_snapshot_id}
     if stage == "pre_check":
-        return {
+        pre_check_fields: dict[str, Any] = {
             "pre_quarantined": ctx_after.pre_quarantined_count,
             "snapshot_id": ctx_after.pre_quarantine_snapshot_id,
         }
+        if ctx_after.pre_check_drift is not None:
+            # 005.1 A-9: an exact mirror of the post_check branch below --
+            # a guard-skip rerun's durable-vs-recomputed drift is surfaced
+            # as data on this (non-failed) transition's row, never raised.
+            pre_check_fields["error_message"] = ctx_after.pre_check_drift
+        return pre_check_fields
     if stage == "pull":
         return {"co_effect_snapshot_ids": ctx_after.co_effect_snapshot_ids}
     if stage == "apply":

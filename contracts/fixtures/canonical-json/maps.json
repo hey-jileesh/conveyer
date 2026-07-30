@@ -1,0 +1,54 @@
+[
+  {
+    "value": {},
+    "canonical": "{}",
+    "sha256": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a"
+  },
+  {
+    "value": {
+      "empty_map": {},
+      "empty_list": []
+    },
+    "canonical": "{\"empty_list\":[],\"empty_map\":{}}",
+    "sha256": "a0dd3bcf7c4ed68e55737657417454367cf216595c967958bca95e09ba372b05"
+  },
+  {
+    "value": {
+      "nested": {
+        "a": {
+          "b": {
+            "c": []
+          }
+        }
+      }
+    },
+    "canonical": "{\"nested\":{\"a\":{\"b\":{\"c\":[]}}}}",
+    "sha256": "5e5e0d4c3af85d5b26faeffefd3e826229931990a296dce3764cd8a1f6188619"
+  },
+  {
+    "value": {
+      "list_of_maps": [
+        {
+          "b": 1,
+          "a": 2
+        },
+        {
+          "d": 3,
+          "c": 4
+        }
+      ]
+    },
+    "canonical": "{\"list_of_maps\":[{\"a\":2,\"b\":1},{\"c\":4,\"d\":3}]}",
+    "sha256": "bceabfa774f0ba32e042b63618836577cd748432b0a53b6bf52a4fce9426f6fd"
+  },
+  {
+    "value": {
+      "a": null,
+      "b": {
+        "c": null
+      }
+    },
+    "canonical": "{\"a\":null,\"b\":{\"c\":null}}",
+    "sha256": "0068ba9653f5819a9a3187269491e8fa88d864813fffe7e1fa539f34821de836"
+  }
+]

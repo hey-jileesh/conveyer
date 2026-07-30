@@ -15,6 +15,7 @@ from datetime import UTC, datetime, timedelta
 import pytest
 from spine import config, context, run
 from spine.binding import Transforms
+from spine.core.contract import check_version, read_spec_version
 from spine.core.model import PipelineSpecModel
 
 
@@ -34,10 +35,13 @@ def _make_spec() -> PipelineSpecModel:
         quarantine_table="lake.commissions__quarantine",
         fact_table="lake.commissions__facts",
         state_table="lake.commissions__state",
+        read={"dialect": {"format": "csv"}},
+        raw_contract={"columns": [{"name": "id"}]},
     )
 
 
 def _make_seed() -> context.BatchContext:
+    spec = _make_spec()
     return context.BatchContext(
         pipeline="pipelines/commissions",
         feed_id="carrier-x/commission-statements",
@@ -47,12 +51,14 @@ def _make_seed() -> context.BatchContext:
         content_hash="sha256:" + "a" * 64,
         object_uris=("s3://bucket/statement.csv",),
         received_at=datetime(2026, 7, 25, 9, 0, 0, tzinfo=UTC),
-        spec=_make_spec(),
+        spec=spec,
         run=config.RunConfig(),
         transforms=_make_transforms(),
         attempt_id="jr_abc123",
         sfn_retry_count=0,
         sfn_redrive_count=0,
+        read_spec_version=read_spec_version(spec.read),
+        check_version=check_version(spec.raw_contract, spec.read),
     )
 
 
@@ -91,6 +97,14 @@ def _stage_raises(ctx: context.BatchContext, fx: _FakeFx) -> context.BatchContex
 def _stage_overwrites_raw_count(ctx: context.BatchContext, fx: _FakeFx) -> context.BatchContext:
     # illegal: raw_count was already set by _stage_land -- this stage resets it
     return dataclasses.replace(ctx, raw_count=999)
+
+
+def _stage_overwrites_read_spec_version(
+    ctx: context.BatchContext, fx: _FakeFx
+) -> context.BatchContext:
+    # illegal: read_spec_version is a no-default seed field (005.1 A-11) --
+    # already-set from construction onward, same as `pipeline`/`feed_id`.
+    return dataclasses.replace(ctx, read_spec_version="a-different-hash")
 
 
 def _stage_guard_skip(name: str):
@@ -150,6 +164,21 @@ def test_run_trips_set_once_assertion_when_a_stage_overwrites_a_set_field() -> N
     stages = (("land", _stage_land), ("pre_check", _stage_overwrites_raw_count))
 
     with pytest.raises(AssertionError, match="raw_count"):
+        run.run(seed, fx, stages=stages)
+
+
+def test_run_trips_set_once_assertion_for_read_spec_version_no_exemption_needed() -> None:
+    """005.1 A-11/§3.5 (bead conveyer-azr.18): `read_spec_version`/
+    `check_version` carry no dataclass default (like `pipeline`/`feed_id`
+    above them) -- `run.py::_assert_set_once`'s reflective walk already
+    treats a no-default field as "already set from the very first stage
+    onward" with zero exemption-list changes, so this is a plain
+    reuse of the existing mechanism, not new machinery."""
+    seed = _make_seed()
+    fx = _FakeFx()
+    stages = (("land", _stage_overwrites_read_spec_version),)
+
+    with pytest.raises(AssertionError, match="read_spec_version"):
         run.run(seed, fx, stages=stages)
 
 

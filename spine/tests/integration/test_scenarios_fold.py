@@ -61,10 +61,13 @@ what the first batch's successful fold already left behind.
 **R-14 (structural fact check at commit, I-24):**
 
 1. A NULL-`domain_id` fixture row that survives PAST `pre_check` (the spec's
-   `required_columns` is deliberately `[]`, the provisional I-P2 default —
-   NOT `["domain_id"]`, unlike most other scenario tests in this suite —
-   so `pre_check`'s "null in a required column" predicate never fires and
-   the row reaches `commit` unquarantined) hits `commit`'s OWN structural
+   `raw_contract` deliberately leaves `domain_id` at its all-nullable
+   default -- `nullable: true, required: false`, NOT the usual
+   `required: true, nullable: false` most other scenario tests in this
+   suite declare (005.1 §3.4/A-12, bead conveyer-azr.13's migration off the
+   old `required_columns: []` provisional default) — so `pre_check`'s
+   TEMPORARY-SHIM-derived "null in a required column" predicate never fires
+   and the row reaches `commit` unquarantined) hits `commit`'s OWN structural
    check (`core.checks.structural_fact_check`, I-24's "fail-fast defect, not
    a quarantine row" designed specifically for a NULL `domain_id` that
    `pre_check`'s provisional contract didn't happen to catch) — a named
@@ -306,12 +309,13 @@ def test_r14_null_domain_id_survives_to_commit_fails_fast_no_append(
     sh.create_quarantine_table(spark, qtn_qt)
     sh.create_fact_table(spark, fact_qt)
     sh.create_state_table(spark, state_qt)
-    # required_columns deliberately [] (the I-P2 provisional default) -- NOT
-    # ["domain_id"] -- so pre_check's "null in a required column" predicate
-    # never fires and this row survives, unquarantined, all the way to
-    # commit's OWN structural check (I-24's whole reason to exist: catching
-    # exactly the NULL domain_id case pre_check's provisional contract
-    # doesn't happen to cover).
+    # raw_contract's domain_id column deliberately left at its all-nullable
+    # default (nullable: true, required: false) -- NOT the usual
+    # required: true, nullable: false most other scenario tests declare --
+    # so pre_check's TEMPORARY-SHIM predicate never fires and this row
+    # survives, unquarantined, all the way to commit's OWN structural check
+    # (I-24's whole reason to exist: catching exactly the NULL domain_id
+    # case pre_check's provisional contract doesn't happen to cover).
     spec = PipelineSpecModel(
         pipeline="pipelines/identity",
         transforms_module="pipelines.identity.transforms",
@@ -319,7 +323,16 @@ def test_r14_null_domain_id_survives_to_commit_fails_fast_no_append(
         quarantine_table=sh.bare(qtn_qt),
         fact_table=sh.bare(fact_qt),
         state_table=sh.bare(state_qt),
-        required_columns=[],
+        read={"dialect": {"format": "csv", "header": True}},
+        raw_contract={
+            "columns": [
+                {"name": "domain_id"},
+                {"name": "event_time"},
+                {"name": "source_ts"},
+                {"name": "content_hash"},
+                {"name": "payload"},
+            ]
+        },
     )
     csv_path = _write_csv(
         tmp_path / "null_domain.csv",

@@ -1,0 +1,27 @@
+[
+  {
+    "value": {
+      "domain_id": "abc-123",
+      "amount": null,
+      "status": "PENDING",
+      "extras": {
+        "Order ID": "99",
+        "notes": "n/a"
+      },
+      "malformed_text": null
+    },
+    "canonical": "{\"amount\":null,\"domain_id\":\"abc-123\",\"extras\":{\"Order ID\":\"99\",\"notes\":\"n/a\"},\"malformed_text\":null,\"status\":\"PENDING\"}",
+    "sha256": "139bb895648d553da24a2bc76a56a51666d1e46e5b46768845d71f4354d50d1b"
+  },
+  {
+    "value": {
+      "domain_id": null,
+      "amount": null,
+      "status": null,
+      "extras": {},
+      "malformed_text": "abc-123,,PEND\"ING,extra,tokens"
+    },
+    "canonical": "{\"amount\":null,\"domain_id\":null,\"extras\":{},\"malformed_text\":\"abc-123,,PEND\\\"ING,extra,tokens\",\"status\":null}",
+    "sha256": "26a0f4a83ca5d4d73dda95fa1eafda07c12a58b7a123e4490ce01f438ce80180"
+  }
+]

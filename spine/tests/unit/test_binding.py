@@ -32,7 +32,14 @@ from pathlib import Path
 import pipelines
 import pytest
 from spine.binding import Transforms, bind_transforms
-from spine.core.model import CoEffectDecl, PipelineSpecModel
+from spine.core.model import (
+    CoEffectDecl,
+    ColumnSpec,
+    DialectModel,
+    PipelineSpecModel,
+    RawContractModel,
+    ReadSpecModel,
+)
 
 
 def test_transforms_is_a_frozen_record_of_functions() -> None:
@@ -59,6 +66,8 @@ def _make_spec(**overrides: object) -> PipelineSpecModel:
         quarantine_table="lake.commissions__quarantine",
         fact_table="lake.commissions__facts",
         state_table="lake.commissions__state",
+        read={"dialect": {"format": "csv"}},
+        raw_contract={"columns": [{"name": "id"}]},
     )
     base.update(overrides)
     return PipelineSpecModel(**base)  # type: ignore[arg-type]
@@ -175,8 +184,8 @@ def test_bind_transforms_rejects_out_of_namespace_module_defensively() -> None:
         fold="default-lww",
         serialize=False,
         domain_id_col="domain_id",
-        required_columns=[],
-        read={},
+        read=ReadSpecModel(dialect=DialectModel(format="csv")),
+        raw_contract=RawContractModel(columns=[ColumnSpec(name="id")]),
         sla_minutes=480,
     )
 

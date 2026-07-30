@@ -65,26 +65,59 @@ assertion to the two files that between them cover every §11.1 metric
 (this module + `router.py`), not to this module alone.
 
 **Post-check drift WARNING + EMF (moved here from `stages/post_check.py`,
-critique F4, bead conveyer-nvh.43):** I-12 [H-2]'s guard-skip read-back
-subset mismatch is surfaced as data on the `RunFact` itself
-(`stage="post_check"`, `outcome="skipped-guard"`, `error_message` carrying
-the short, counts-only drift text, [S-7]) — `core/run_facts.py::
-_stage_fields` is what threads `ctx.post_check_drift` into that field; this
-module is where the actual WARNING log + EMF `PostCheckDrift` emission now
-happens, derived purely from the `RunFact`, in the SAME unconditional,
-before-the-append-attempt channel as `_log_transition`/`_emit_metrics`
-(stages carry zero instrumentation, §7.3 — `post_check.py` itself only ever
-sets the ctx field). Guarded on `outcome == "skipped-guard"`, not merely
-`error_message is not None`: a genuinely FAILED `post_check` transition
-(recorded via `failed()`, never `transition()`) never populates
-`post_check_drift` in the first place, but gating on the outcome too keeps
-this emission's precondition self-documenting and independent of that other
-function's own behavior.
+critique F4, bead conveyer-nvh.43; gate corrected, critique F2, bead
+conveyer-azr.30):** I-12 [H-2]'s guard-skip read-back subset mismatch is
+surfaced as data on the `RunFact` itself (`stage="post_check"`,
+`error_message` carrying the short, counts-only drift text, [S-7]) —
+`core/run_facts.py::_stage_fields` is what threads `ctx.post_check_drift`
+into that field; this module is where the actual WARNING log + EMF
+`PostCheckDrift` emission now happens, derived purely from the `RunFact`, in
+the SAME unconditional, before-the-append-attempt channel as
+`_log_transition`/`_emit_metrics` (stages carry zero instrumentation, §7.3 —
+`post_check.py` itself only ever sets the ctx field). Gated on `outcome !=
+"failed" and error_message is not None` — an EXACT mirror of the pre_check
+gate below, NOT the single `outcome == "skipped-guard"` value the original
+(nvh.43) gate used: 005.1 [R2-1] door 2 (`stages/post_check.py`'s own
+[DC-1] fact-presence demotion) records drift on an `outcome="ok"`
+transition too (the quarantine table's OWN guard was never present there,
+so `guard_skips` never accretes `"post_check"`), while door 4 (the
+guard-present hash-keyed subtraction, §8.2.4) reaches `outcome=
+"skipped-guard"` — both are real drift events this stage may report, and
+the original `outcome == "skipped-guard"`-only gate silently swallowed
+door 2's WARNING + EMF (the drift still folded into the ledger row's
+`error_message` via `core/run_facts.py`, but never alarmed — critique F2's
+own finding). A genuinely FAILED `post_check` transition (`failed()`, never
+`transition()`) never populates `post_check_drift` in the first place
+(`failed()` never calls `_stage_fields`) — the explicit `outcome !=
+"failed"` exclusion is defense in depth here, matching pre_check's own
+identical reasoning below, not load-bearing on its own.
 
 `recorded_at` (§6.5's "append time" column) is stamped here, with this
 module's own wall clock (`datetime.now(UTC)`) — deliberately NOT `fx.now()`:
 it is the ledger *write's* own timestamp (`core/run_facts.py`'s docstring),
 a value the pure `transition`/`failed` functions cannot know.
+
+**Pre-check drift WARNING + EMF (bead conveyer-azr.18, n3-context-wiring,
+005.1 §3.5/A-9):** an EXACT mirror of `_emit_post_check_drift` above, for
+`stage="pre_check"` — `core/run_facts.py::_stage_fields` is what threads
+`ctx.pre_check_drift` into `RunFact.error_message` for that stage; this
+module emits the WARNING log + EMF `PreCheckDrift` off the `RunFact` alone,
+in the same unconditional, before-the-append-attempt channel, gated on
+`stage == "pre_check" and outcome != "failed" and error_message is not
+None` — NOT on a single outcome value the way post_check's `outcome ==
+"skipped-guard"` gate is, because 005.1 §6.5's door 2 (the [DC-1]
+fact-presence demotion) records drift on an `outcome="ok"` transition too
+(a zero-violation rerun with facts already committed takes NO guard-skip
+branch at all yet still recomputes the drift probe), while door 3 (the
+guard-present subtraction path) reaches `outcome="skipped-guard"`, same as
+post_check's one door. The explicit `outcome != "failed"` exclusion matters
+because a genuinely FAILED pre_check transition (`run_facts.failed()`, never
+`transition()`) ALSO carries a non-`None` `error_message` — the foreign
+exception's own location string, never `ctx.pre_check_drift` (`failed()`
+never calls `_stage_fields`) — so gating on `error_message is not None`
+alone would have wrongly routed that text through this channel too.
+`stages/pre_check.py` (bead conveyer-azr.19, n3-admission-cut) is what
+actually sets `ctx.pre_check_drift` on its two rerun doors, per §6.5.
 """
 
 from __future__ import annotations
@@ -316,15 +349,18 @@ def _lifecycle_metrics(run_fact: RunFact) -> tuple[tuple[str, float], ...]:
 
 def _emit_post_check_drift(run_fact: RunFact) -> None:
     """I-12 [H-2] (moved here from `stages/post_check.py`, critique F4): a
-    guard-skip rerun's read-back-vs-recomputed count mismatch, WARNING + EMF
-    `PostCheckDrift`, derived purely from `run_fact.error_message` (already
-    the short, counts-only drift text `post_check.py` set on `ctx.
-    post_check_drift`, [S-7]) -- never invoked directly on a raw exception,
-    so there is no row-value leakage risk to guard against here the way
-    `_log_ledger_loss` does."""
+    rerun's read-back-vs-recomputed count mismatch on either door 2
+    (`outcome="ok"`) or door 4 (`outcome="skipped-guard"`, critique F2) --
+    WARNING + EMF `PostCheckDrift`, derived purely from `run_fact.
+    error_message` (already the short, counts-only drift text `post_check.py`
+    set on `ctx.post_check_drift`, [S-7]) -- never invoked directly on a raw
+    exception, so there is no row-value leakage risk to guard against here
+    the way `_log_ledger_loss` does. Message text deliberately does not name
+    a specific door (unlike the docstring above) -- door 2 is not a
+    guard-skip rerun at all, so "guard-skip rerun" would misdescribe it."""
     logger = logging.getLogger(_LOGGER_NAME)
     logger.warning(
-        "post_check drift on guard-skip rerun (I-12 [H-2]): %s",
+        "post_check drift (I-12 [H-2]): %s",
         run_fact.error_message,
         extra={
             "batch_id": run_fact.batch_id,
@@ -336,6 +372,28 @@ def _emit_post_check_drift(run_fact: RunFact) -> None:
     )
     observability.emit_metric(
         "PostCheckDrift", 1, run_fact.pipeline, run_fact.feed_id, stage=run_fact.stage
+    )
+
+
+def _emit_pre_check_drift(run_fact: RunFact) -> None:
+    """005.1 A-9/§3.5: an exact mirror of `_emit_post_check_drift` above, for
+    `stage="pre_check"` — WARNING + EMF `PreCheckDrift`, derived purely from
+    `run_fact.error_message` (already the short, counts-only drift text
+    `stages/pre_check.py` sets on `ctx.pre_check_drift`, [S-7])."""
+    logger = logging.getLogger(_LOGGER_NAME)
+    logger.warning(
+        "pre_check drift (005.1 A-9): %s",
+        run_fact.error_message,
+        extra={
+            "batch_id": run_fact.batch_id,
+            "pipeline": run_fact.pipeline,
+            "feed_id": run_fact.feed_id,
+            "attempt_id": run_fact.attempt_id,
+            "stage": run_fact.stage,
+        },
+    )
+    observability.emit_metric(
+        "PreCheckDrift", 1, run_fact.pipeline, run_fact.feed_id, stage=run_fact.stage
     )
 
 
@@ -399,9 +457,34 @@ def build_record_run(
         try:
             _log_transition(run_fact)
             _emit_metrics(run_fact)
-            if run_fact.stage == "post_check" and run_fact.outcome == "skipped-guard":
-                if run_fact.error_message is not None:
-                    _emit_post_check_drift(run_fact)
+            # critique F2 (bead conveyer-azr.30): gated on outcome != "failed",
+            # an EXACT mirror of pre_check's own gate below (was outcome ==
+            # "skipped-guard" only, which silently dropped door 2's WARNING +
+            # EMF -- see this module's own docstring for the full account).
+            if (
+                run_fact.stage == "post_check"
+                and run_fact.outcome != "failed"
+                and run_fact.error_message is not None
+            ):
+                _emit_post_check_drift(run_fact)
+            # 005.1 A-9: gated on outcome != "failed", the SAME shape as
+            # post_check's own gate above -- pre_check's own [DC-1] door 2
+            # (fact-presence demotion, §6.5) recomputes the drift probe on
+            # an outcome="ok" transition (the quarantine table's OWN guard
+            # was never present, so `guard_skips` never accretes
+            # "pre_check" there), while door 3 (guard-present subtraction)
+            # reaches this branch with outcome="skipped-guard" -- both are
+            # real drift events this stage may report. A genuinely FAILED
+            # pre_check transition also carries a non-None `error_message`
+            # (`_error_message(exc)`, via `failed()`, never `ctx.
+            # pre_check_drift`) -- excluding "failed" explicitly keeps that
+            # foreign text out of this channel.
+            if (
+                run_fact.stage == "pre_check"
+                and run_fact.outcome != "failed"
+                and run_fact.error_message is not None
+            ):
+                _emit_pre_check_drift(run_fact)
         except Exception:  # noqa: BLE001 -- §11.3: record_run NEVER raises
             pass
 

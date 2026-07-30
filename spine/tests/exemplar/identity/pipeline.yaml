@@ -15,9 +15,25 @@ fact_table: conveyer_dev_lake.identity__facts
 state_table: conveyer_dev_lake.identity__state
 fold: default-lww
 domain_id_col: domain_id
-required_columns:
-  - domain_id
 co_effects: {}
 serialize: false
-read: {}
+read:
+  compression: none
+  dialect:
+    format: csv
+    header: true
+raw_contract:
+  columns:
+    - name: domain_id
+      type: string
+      required: true
+      nullable: false
+    - name: event_time
+      type: string
+    - name: source_ts
+      type: string
+    - name: content_hash
+      type: string
+    - name: payload
+      type: string
 sla_minutes: 480

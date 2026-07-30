@@ -214,6 +214,7 @@ _ALL_EMITTED_CONVEYER_SPINE_METRIC_NAMES = frozenset(
         "BatchesCompleted",
         "RunLedgerLoss",
         "PostCheckDrift",
+        "PreCheckDrift",
         "SingleFlightCollisions",
     }
 )
@@ -423,10 +424,51 @@ def test_record_run_warning_log_omits_error_message_but_keeps_error_type(
 
 
 # --- post_check drift WARNING + EMF (moved here from stages/post_check.py, ---
-# --- critique F4, bead conveyer-nvh.43) --------------------------------------
+# --- critique F4, bead conveyer-nvh.43; gate corrected, critique F2, bead ---
+# --- conveyer-azr.30, to fire on BOTH doors -- outcome="ok" (door 2, [DC-1] --
+# --- fact-presence demotion) as well as outcome="skipped-guard" (door 4), ---
+# --- an EXACT mirror of pre_check's own two cases below) --------------------
 
 
-def test_record_run_post_check_drift_warns_and_emits_metric(
+def test_record_run_post_check_drift_warns_and_emits_metric_on_ok_outcome(
+    monkeypatch: pytest.MonkeyPatch, tmp_path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The gap critique F2 fixes: door 2 (`stages/post_check.py`'s own
+    [DC-1] fact-presence demotion) records drift on an `outcome="ok"`
+    transition (the quarantine table's OWN guard was never present there,
+    so `guard_skips` never accretes "post_check") -- the original
+    (nvh.43) gate, `outcome == "skipped-guard"` only, silently swallowed
+    this WARNING + EMF entirely (the drift still folded into the ledger
+    row's `error_message`, but never alarmed)."""
+    monkeypatch.setattr(ledger, "time", types.SimpleNamespace(sleep=lambda _s: None))
+    metric_calls: list[tuple[str, float, str | None]] = []
+    monkeypatch.setattr(
+        ledger.observability,
+        "emit_metric",
+        lambda name, value, _pipeline, _feed_id, stage=None, **_kw: metric_calls.append(
+            (name, value, stage)
+        ),
+    )
+
+    def broken_catalog() -> None:
+        raise RuntimeError("boom")
+
+    record_run = ledger.build_record_run(broken_catalog, _sql_config(tmp_path))
+    drift_text = "post-check drift: durable=0 recomputed=1 subset=False"
+    with caplog.at_level(logging.INFO, logger=ledger._LOGGER_NAME):
+        record_run(_run_fact(stage="post_check", outcome="ok", error_message=drift_text))
+
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    drift_warnings = [r for r in warnings if "drift" in r.getMessage().lower()]
+    assert len(drift_warnings) == 1
+    assert drift_text in drift_warnings[0].getMessage()
+    assert drift_warnings[0].stage == "post_check"
+    assert drift_warnings[0].batch_id == "b1"
+    drift_metrics = [c for c in metric_calls if c[0] == "PostCheckDrift"]
+    assert drift_metrics == [("PostCheckDrift", 1, "post_check")]
+
+
+def test_record_run_post_check_drift_warns_and_emits_metric_on_skipped_guard_outcome(
     monkeypatch: pytest.MonkeyPatch, tmp_path, caplog: pytest.LogCaptureFixture
 ) -> None:
     monkeypatch.setattr(ledger, "time", types.SimpleNamespace(sleep=lambda _s: None))
@@ -443,7 +485,7 @@ def test_record_run_post_check_drift_warns_and_emits_metric(
         raise RuntimeError("boom")
 
     record_run = ledger.build_record_run(broken_catalog, _sql_config(tmp_path))
-    drift_text = "post-check drift: durable=1 recomputed=2 subset=False"
+    drift_text = "post-check drift: durable=1 recomputed=0 subset=False"
     with caplog.at_level(logging.INFO, logger=ledger._LOGGER_NAME):
         record_run(_run_fact(stage="post_check", outcome="skipped-guard", error_message=drift_text))
 
@@ -457,11 +499,13 @@ def test_record_run_post_check_drift_warns_and_emits_metric(
     assert drift_metrics == [("PostCheckDrift", 1, "post_check")]
 
 
+@pytest.mark.parametrize("outcome", ["ok", "skipped-guard"])
 def test_record_run_post_check_no_drift_does_not_warn_or_emit(
-    monkeypatch: pytest.MonkeyPatch, tmp_path, caplog: pytest.LogCaptureFixture
+    monkeypatch: pytest.MonkeyPatch, tmp_path, caplog: pytest.LogCaptureFixture, outcome: str
 ) -> None:
-    """`error_message is None` (the fresh-compute OR the no-drift guard-skip
-    branch) -- no `PostCheckDrift` channel at all."""
+    """`error_message is None` (the fresh-compute path, OR either door's own
+    no-drift case) -- no `PostCheckDrift` channel at all, regardless of
+    outcome."""
     monkeypatch.setattr(ledger, "time", types.SimpleNamespace(sleep=lambda _s: None))
     metric_calls: list[tuple[str, float, str | None]] = []
     monkeypatch.setattr(
@@ -474,7 +518,7 @@ def test_record_run_post_check_no_drift_does_not_warn_or_emit(
     record_run = ledger.build_record_run(lambda: None, _sql_config(tmp_path))  # type: ignore[arg-type]
 
     with caplog.at_level(logging.INFO, logger=ledger._LOGGER_NAME):
-        record_run(_run_fact(stage="post_check", outcome="skipped-guard", error_message=None))
+        record_run(_run_fact(stage="post_check", outcome=outcome, error_message=None))
 
     assert not any("drift" in r.getMessage().lower() for r in caplog.records)
     assert not any(c[0] == "PostCheckDrift" for c in metric_calls)
@@ -486,9 +530,10 @@ def test_record_run_post_check_failed_outcome_does_not_emit_drift(
     """A genuinely FAILED `post_check` transition (`outcome="failed"`,
     recorded via `run_facts.failed`, never `transition`) never reaches the
     drift channel, even though it too carries a non-`None` `error_message` --
-    guarding on `outcome == "skipped-guard"` (not merely `error_message is
-    not None`) keeps this precondition independent of `failed()`'s own
-    unrelated `error_message` derivation."""
+    guarding on `outcome != "failed"` (not merely `error_message is not
+    None`) keeps this precondition independent of `failed()`'s own unrelated
+    `error_message` derivation, the same shape as pre_check's own gate
+    below."""
     monkeypatch.setattr(ledger, "time", types.SimpleNamespace(sleep=lambda _s: None))
     metric_calls: list[tuple[str, float, str | None]] = []
     monkeypatch.setattr(
@@ -512,6 +557,156 @@ def test_record_run_post_check_failed_outcome_does_not_emit_drift(
 
     assert not any("post_check drift" in r.getMessage().lower() for r in caplog.records)
     assert not any(c[0] == "PostCheckDrift" for c in metric_calls)
+
+
+# --- pre_check drift WARNING + EMF (005.1 A-9, bead conveyer-azr.18) ---------
+#
+# Unlike post_check, `pre_check`'s own [DC-1] door 2 (fact-presence
+# demotion, §6.5) reaches this channel on `outcome="ok"` -- the quarantine
+# table's OWN guard was never present there, so `guard_skips` never accretes
+# "pre_check" -- while door 3 (guard-present subtraction) reaches it on
+# `outcome="skipped-guard"`, same as post_check's one door. `record_run`
+# gates on `stage == "pre_check" and error_message is not None` alone (no
+# outcome restriction) -- both cases below must emit.
+
+
+def test_record_run_pre_check_drift_warns_and_emits_metric_on_ok_outcome(
+    monkeypatch: pytest.MonkeyPatch, tmp_path, caplog: pytest.LogCaptureFixture
+) -> None:
+    monkeypatch.setattr(ledger, "time", types.SimpleNamespace(sleep=lambda _s: None))
+    metric_calls: list[tuple[str, float, str | None]] = []
+    monkeypatch.setattr(
+        ledger.observability,
+        "emit_metric",
+        lambda name, value, _pipeline, _feed_id, stage=None, **_kw: metric_calls.append(
+            (name, value, stage)
+        ),
+    )
+
+    def broken_catalog() -> None:
+        raise RuntimeError("boom")
+
+    record_run = ledger.build_record_run(broken_catalog, _sql_config(tmp_path))
+    drift_text = (
+        "pre_check drift: durable=0 recomputed=1 only_durable=0 only_recomputed=1 "
+        "admitted_cast_failures=0 check_version=abc123"
+    )
+    with caplog.at_level(logging.INFO, logger=ledger._LOGGER_NAME):
+        record_run(_run_fact(stage="pre_check", outcome="ok", error_message=drift_text))
+
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    drift_warnings = [r for r in warnings if "drift" in r.getMessage().lower()]
+    assert len(drift_warnings) == 1
+    assert drift_text in drift_warnings[0].getMessage()
+    assert drift_warnings[0].stage == "pre_check"
+    assert drift_warnings[0].batch_id == "b1"
+    drift_metrics = [c for c in metric_calls if c[0] == "PreCheckDrift"]
+    assert drift_metrics == [("PreCheckDrift", 1, "pre_check")]
+
+
+def test_record_run_pre_check_drift_warns_and_emits_metric_on_skipped_guard_outcome(
+    monkeypatch: pytest.MonkeyPatch, tmp_path, caplog: pytest.LogCaptureFixture
+) -> None:
+    monkeypatch.setattr(ledger, "time", types.SimpleNamespace(sleep=lambda _s: None))
+    metric_calls: list[tuple[str, float, str | None]] = []
+    monkeypatch.setattr(
+        ledger.observability,
+        "emit_metric",
+        lambda name, value, _pipeline, _feed_id, stage=None, **_kw: metric_calls.append(
+            (name, value, stage)
+        ),
+    )
+    record_run = ledger.build_record_run(lambda: None, _sql_config(tmp_path))  # type: ignore[arg-type]
+    drift_text = "pre_check drift: durable=1 recomputed=2 only_durable=0 only_recomputed=1"
+    with caplog.at_level(logging.INFO, logger=ledger._LOGGER_NAME):
+        record_run(_run_fact(stage="pre_check", outcome="skipped-guard", error_message=drift_text))
+
+    drift_warnings = [
+        r
+        for r in caplog.records
+        if r.levelno == logging.WARNING and "drift" in r.getMessage().lower()
+    ]
+    assert len(drift_warnings) == 1
+    assert drift_text in drift_warnings[0].getMessage()
+    drift_metrics = [c for c in metric_calls if c[0] == "PreCheckDrift"]
+    assert drift_metrics == [("PreCheckDrift", 1, "pre_check")]
+
+
+def test_record_run_pre_check_no_drift_does_not_warn_or_emit(
+    monkeypatch: pytest.MonkeyPatch, tmp_path, caplog: pytest.LogCaptureFixture
+) -> None:
+    monkeypatch.setattr(ledger, "time", types.SimpleNamespace(sleep=lambda _s: None))
+    metric_calls: list[tuple[str, float, str | None]] = []
+    monkeypatch.setattr(
+        ledger.observability,
+        "emit_metric",
+        lambda name, value, _pipeline, _feed_id, stage=None, **_kw: metric_calls.append(
+            (name, value, stage)
+        ),
+    )
+    record_run = ledger.build_record_run(lambda: None, _sql_config(tmp_path))  # type: ignore[arg-type]
+
+    with caplog.at_level(logging.INFO, logger=ledger._LOGGER_NAME):
+        record_run(_run_fact(stage="pre_check", outcome="ok", error_message=None))
+
+    assert not any("drift" in r.getMessage().lower() for r in caplog.records)
+    assert not any(c[0] == "PreCheckDrift" for c in metric_calls)
+
+
+def test_record_run_pre_check_failed_outcome_does_not_emit_drift(
+    monkeypatch: pytest.MonkeyPatch, tmp_path, caplog: pytest.LogCaptureFixture
+) -> None:
+    monkeypatch.setattr(ledger, "time", types.SimpleNamespace(sleep=lambda _s: None))
+    metric_calls: list[tuple[str, float, str | None]] = []
+    monkeypatch.setattr(
+        ledger.observability,
+        "emit_metric",
+        lambda name, value, _pipeline, _feed_id, stage=None, **_kw: metric_calls.append(
+            (name, value, stage)
+        ),
+    )
+    record_run = ledger.build_record_run(lambda: None, _sql_config(tmp_path))  # type: ignore[arg-type]
+
+    with caplog.at_level(logging.INFO, logger=ledger._LOGGER_NAME):
+        record_run(
+            _run_fact(
+                stage="pre_check",
+                outcome="failed",
+                error_type="AssertionError",
+                error_message="spine.stages.pre_check:83",
+            )
+        )
+
+    assert not any("pre_check drift" in r.getMessage().lower() for r in caplog.records)
+    assert not any(c[0] == "PreCheckDrift" for c in metric_calls)
+
+
+def test_record_run_pre_check_drift_does_not_leak_into_other_stage(
+    monkeypatch: pytest.MonkeyPatch, tmp_path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A non-`pre_check` stage carrying SOME `error_message` (e.g. post_check's
+    own drift text) never trips the `PreCheckDrift` channel."""
+    monkeypatch.setattr(ledger, "time", types.SimpleNamespace(sleep=lambda _s: None))
+    metric_calls: list[tuple[str, float, str | None]] = []
+    monkeypatch.setattr(
+        ledger.observability,
+        "emit_metric",
+        lambda name, value, _pipeline, _feed_id, stage=None, **_kw: metric_calls.append(
+            (name, value, stage)
+        ),
+    )
+    record_run = ledger.build_record_run(lambda: None, _sql_config(tmp_path))  # type: ignore[arg-type]
+
+    with caplog.at_level(logging.INFO, logger=ledger._LOGGER_NAME):
+        record_run(
+            _run_fact(
+                stage="post_check",
+                outcome="skipped-guard",
+                error_message="post-check drift: durable=1 recomputed=2 subset=False",
+            )
+        )
+
+    assert not any(c[0] == "PreCheckDrift" for c in metric_calls)
 
 
 # --- RunFact -> Arrow round trip, every nullable field combination -----------

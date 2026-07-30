@@ -20,6 +20,24 @@ stage constructs them (`pull`, `fold`) wraps the built dict once before
 This module does not enforce the wrapping (a frozen dataclass field's value
 is not itself made read-only by the dataclass) -- it is a construction-site
 contract, same as "set exactly once" itself.
+
+**005.1 §3.5 additions (bead conveyer-azr.18, n3-context-wiring)**:
+`read_spec_version`/`check_version` (A-11) are **seed-adjacent**, not
+post-seed-optional -- they carry no default, same as the other seed fields
+above, because they are pure functions of the parsed spec (`core.contract.
+read_spec_version`/`check_version`), computed exactly once by the entrypoint
+(`entrypoints/glue_main.py::_seed_batch_context`) right after spec parse and
+carried unchanged for the rest of the run; the reflective set-once assertion
+(`run.py::_assert_set_once`) already covers a no-default field as
+"already-set from the very first stage onward", so no exemption-list change
+is needed for either. `pre_check_drift` (A-9) is a genuine post-seed,
+stage-set field -- an EXACT mirror of `post_check_drift` below, just for
+`pre_check`'s own guard-skip rerun doors (§6.5): `None` until
+`stages/pre_check.py` (bead conveyer-azr.19, n3-admission-cut) sets it on a
+drift mismatch, folded into the ledger row's `error_message` by
+`core/run_facts.py::_stage_fields` and surfaced as WARNING + EMF
+`PreCheckDrift` by `effects/ledger.py::record_run`, exactly as
+`post_check_drift` already is.
 """
 
 from __future__ import annotations
@@ -60,6 +78,8 @@ class BatchContext:
     attempt_id: str  # I-5
     sfn_retry_count: int
     sfn_redrive_count: int
+    read_spec_version: str  # 005.1 A-11/§3.5: computed once at seed from spec.read
+    check_version: str  # 005.1 A-11/§3.5: computed once at seed from (raw_contract, read)
 
     # --- accreting exemption [E-13] ------------------------------------------
     guard_skips: tuple[str, ...] = ()  # tuples are immutable -- no default_factory needed
@@ -76,6 +96,11 @@ class BatchContext:
     valid_df: DataFrame | None = None
     pre_quarantined_count: int | None = None
     pre_quarantine_snapshot_id: int | None = None
+    pre_check_drift: str | None = None  # 005.1 A-9 [DC-1]: set on the guard-skip
+    # read-back subset-mismatch/fact-presence-demotion doors only (WARNING+EMF
+    # companion); counts only, no row values [S-7] -- folded into the ledger
+    # row's `error_message` by `core/run_facts.py::_stage_fields`, an exact
+    # mirror of `post_check_drift` below
 
     # --- pull ------------------------------------------------------------------
     co_effects: Mapping[str, DataFrame] | None = None  # pinned reads, I-6

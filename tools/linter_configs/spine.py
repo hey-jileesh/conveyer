@@ -48,7 +48,11 @@ not by the real walk.
   `SparkSession`, `getOrCreate`, `newSession`, `sparkContext`,
   `sparkSession`, `read`, `write`, `writeTo`, `sql`, `collect`, `toPandas`,
   `toLocalIterator`, `foreach`, `foreachPartition`, `checkpoint`, `cache`,
-  `persist`, `take`, `head`, `show`; banned calls
+  `persist`, `take`, `head`, `show`, `count` (critique F1, bead
+  conveyer-azr.30 — closes the one hole `.count()` sat in, previously the
+  sole eager Spark action absent from this list; see `_SPARK_BANNED_ATTR_
+  NAMES`'s own comment for the `F.count` aggregate trade-off this closes
+  without yet needing); banned calls
   `open`/`eval`/`exec`/`__import__`, `datetime.now`-family,
   `uuid.uuid4`-family.
 * `spine/effects/**` + `spine/stages/**`: idiom rules (engine-wide, below)
@@ -105,10 +109,47 @@ import purity_linter
 # import-free of `model.py`'s pydantic dependency, a §7.1/I-8 zip-purity
 # requirement for `entrypoints/router.py`, which imports `naming`). Same
 # raise-only shape as its model.py sibling, needing the same allowlist entry.
+#
+# 005.1 N0 (bead conveyer-azr.10, n0-canonical) addition --
+# `canonical.py::_reject` is a single raise-only helper (`raise
+# ValueError(f"canonical_json: {message}")`, `-> NoReturn`) that every
+# rejection in `core/canonical.py` (float, non-finite Decimal, naive
+# datetime [DC-3], non-str object key, unsupported type) calls through,
+# rather than each call site spelling its own `raise` -- one allowlist entry
+# instead of five, same shape as this list's other raise-only helpers.
+#
+# 005.1 N0 (bead conveyer-azr.11, n0-models) addition --
+# `contract.py::parse_column_type` (§3.2, D-5's "single interpreter of the
+# type grammar") is called from `core/model.py`'s `ColumnSpec` model
+# validators (decimal bounds, temporal fmt, min/max), not itself a
+# `@field_validator`/`@model_validator` -- same raise-only shape as this
+# list's other cross-module helpers. `model.py::_check_single_ascii_printable`
+# is the same shape again: a plain validator-support helper (§3.1's
+# `DialectModel.delimiter`/`.quote`, "exactly one ASCII printable char"),
+# shared across two fields' `@field_validator`s rather than duplicated in
+# each one -- exactly `_check_pipeline_slug_grammar`'s pattern.
+#
+# 005.1 N0 (bead conveyer-azr.12, n0-reading) addition --
+# `reading.py::parse_line` (§5.3, A-1) needs `try` (not just `raise`) to
+# convert a strict `csv.Error` into a `ParsedLine` value -- defects-as-values,
+# not an exception escaping the parse. Unlike this list's other entries, this
+# is the corpus's first exercise of the `purity-try` side of `ban_try_raise`
+# via the allowlist mechanism (every prior entry only needed the `raise` half)
+# -- §12.6 item 1 pins it with a dedicated MUST-PASS fixture
+# (`pass_core_parse_line_try.py`) in `test_linter_spine_corpus.py`.
+#
+# critique F3 (bead conveyer-azr.30) addition --
+# `reading.py::multiline_records` (§5.5, moved here from `effects/spark.py`)
+# needs `try` for the identical reason `parse_line` does, one function down:
+# its `while True: try: tokens = next(reader) except StopIteration: return`
+# loop turns the generator-exhaustion signal into a plain return, rather
+# than letting `StopIteration` escape as a raised exception -- same
+# `purity-try` shape as `parse_line`'s own `csv.Error` conversion.
 _TRY_RAISE_ALLOWLIST: frozenset[tuple[str, str]] = frozenset(
     {
         ("spine/core/model.py", "_check_pipeline_slug_grammar"),
         ("spine/core/model.py", "check_qualified_table"),
+        ("spine/core/model.py", "_check_single_ascii_printable"),
         ("spine/core/naming.py", "_check_pipeline_slug_grammar"),
         ("spine/core/naming.py", "execution_name"),
         ("spine/core/naming.py", "rerun_execution_name"),
@@ -116,6 +157,10 @@ _TRY_RAISE_ALLOWLIST: frozenset[tuple[str, str]] = frozenset(
         ("spine/core/naming.py", "check_qualified_table"),
         ("spine/core/merge.py", "_check_identifier"),
         ("spine/core/run_facts.py", "_stage_fields"),
+        ("spine/core/canonical.py", "_reject"),
+        ("spine/core/contract.py", "parse_column_type"),
+        ("spine/core/reading.py", "parse_line"),
+        ("spine/core/reading.py", "multiline_records"),
     }
 )
 
@@ -190,6 +235,21 @@ _FRAMES_TRANSFORMS_BANNED_IMPORT_ROOTS: tuple[str, ...] = (
     "spine.config",
 )
 
+# critique F1 (bead conveyer-azr.30): `count` closes the one hole this list
+# left open (`frames/quarantine.py::_assert_business_reason_grammar`, since
+# deleted, routed a `.count()` + raise through it deliberately, precisely
+# BECAUSE `take`/`collect` were banned and `count` was not — the canonical
+# "guardrails, not steering" erosion the critique names). No `frames/**`/
+# pipeline `transforms.py` call site uses the LEGITIMATE `F.count(...)`
+# aggregate today (verified: zero real-tree hits), so this ban is safe to
+# add outright — but `_attr_name_violations` (`tools/purity_linter.py`)
+# flags a bare attribute name regardless of receiver, so `F.count(...)`
+# WOULD trip this same rule the day one is genuinely needed. Unlike
+# `try_raise_allowlist`/`string_sql_exemption`, `banned_attr_names` has NO
+# `(file, function)` exemption mechanism yet (`_attr_name_violations` never
+# consults one) — a future bead needing a real `F.count` aggregate under
+# `frames/**` must add that exemption mechanism to `tools/purity_linter.py`
+# first, not silently work around this ban.
 _SPARK_BANNED_ATTR_NAMES: frozenset[str] = frozenset(
     {
         "SparkSession",
@@ -212,7 +272,24 @@ _SPARK_BANNED_ATTR_NAMES: frozenset[str] = frozenset(
         "take",
         "head",
         "show",
+        "count",
     }
+)
+
+# 005.1 N1 (bead conveyer-azr.14, §12.6 item 2): the string-SQL sink names
+# reviewed under BOTH `_FRAMES_TRANSFORMS_PROFILE` and `_EFFECTS_STAGES_PROFILE`
+# below — one authored set, not two that could drift apart. `expr` is the
+# addition this bead makes (was `{"where", "filter", "selectExpr", "sql"}`,
+# effects-stages-only): `F.expr(...)` is PySpark 3.5's only way to build a
+# `try_cast` expression (no `.try_cast()` Column method until 4.0), so an
+# f-string/`.format()`/`%`-formatted argument flowing into `F.expr(...)` is
+# now reviewed the same as the other three sinks, in BOTH profiles —
+# `frames/checks.py::_typed_expr` (§6.2) is the one `frames/` call site that
+# builds such text, and `_STRING_SQL_EXEMPTION` below only names a
+# MEANINGFUL escape hatch for it if `_FRAMES_TRANSFORMS_PROFILE`'s own sink
+# set would otherwise catch it.
+_STRING_SQL_SINKS: frozenset[str] = frozenset(
+    {"where", "filter", "selectExpr", "sql", "expr"}
 )
 
 _FRAMES_TRANSFORMS_PROFILE = purity_linter.ScopeProfile(
@@ -246,15 +323,17 @@ _FRAMES_TRANSFORMS_PROFILE = purity_linter.ScopeProfile(
     banned_attr_calls=_DATETIME_UUID_ATTR_CALLS,
     banned_attr_names=_SPARK_BANNED_ATTR_NAMES,
     banned_import_roots=_FRAMES_TRANSFORMS_BANNED_IMPORT_ROOTS,
+    string_sql_sinks=_STRING_SQL_SINKS,
 )
 
 # "spine/effects/** + spine/stages/**: idiom rules plus a string-SQL review
 # rule" (§12.3) — idiom-class applies to all of spine/** already (engine-wide
-# below); this profile only carries the string-SQL sink names.
+# below); this profile only carries the string-SQL sink names (shared with
+# `_FRAMES_TRANSFORMS_PROFILE` above, see `_STRING_SQL_SINKS`'s own note).
 _EFFECTS_STAGES_PROFILE = purity_linter.ScopeProfile(
     name="effects-stages",
     path_prefixes=(("spine", "effects"), ("spine", "stages")),
-    string_sql_sinks=frozenset({"where", "filter", "selectExpr", "sql"}),
+    string_sql_sinks=_STRING_SQL_SINKS,
 )
 
 # I-14: "no awsglue anywhere in spine/" — a package-wide rule, not scoped to
@@ -292,7 +371,9 @@ _PACKAGE_WIDE_PROFILE = purity_linter.ScopeProfile(
 # `try` remains banned everywhere in the core profile, including inside
 # validator bodies — this exemption is raise-only, matching the engine's
 # `_validator_decorated_raise_ids` (try/raise asymmetry is by design).
-_VALIDATOR_DECORATOR_NAMES: frozenset[str] = frozenset({"field_validator", "model_validator"})
+_VALIDATOR_DECORATOR_NAMES: frozenset[str] = frozenset(
+    {"field_validator", "model_validator"}
+)
 
 # TransientError exempted by config as in ingestion (§12.3 last bullet).
 _CLASS_SHAPE_ALLOWLIST: frozenset[tuple[str, str]] = frozenset(
@@ -305,9 +386,21 @@ _CLASS_SHAPE_ALLOWLIST: frozenset[tuple[str, str]] = frozenset(
 # from the string-SQL rule, by (file, function) — the ingestion exemption
 # mechanism (§12.3). Function name is provisional pending §7.6's effects/
 # spark.py (M2); update to match once authored.
+#
+# 005.1 N1 (bead conveyer-azr.14, §12.6 item 2) addition —
+# `frames/checks.py::_typed_expr` (§6.2): the ONE cast expression per
+# declared column, reused by both the castability check and the typed
+# projection (D-5's "no second cast to disagree"). PySpark 3.5's `Column`
+# API has no `.try_cast()` method (arrives in 4.0), so numeric/bool
+# typed-exprs are built via `F.expr(f"try_cast({quoted_name} AS {type})")`
+# — expr text composed ONLY from the grammar-validated column name
+# (backticks doubled, `core/merge.py::quote_identifier`'s rule) and the
+# compiler's own rendering of the parsed `ColumnType` (never authored/
+# free-form text) — the §6.7-merge-render precedent this bead follows.
 _STRING_SQL_EXEMPTION: frozenset[tuple[str, str]] = frozenset(
     {
         ("spine/effects/spark.py", "render_merge"),
+        ("spine/frames/checks.py", "_typed_expr"),
     }
 )
 

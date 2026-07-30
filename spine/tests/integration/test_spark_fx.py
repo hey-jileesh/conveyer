@@ -10,19 +10,34 @@ reconstructs the qualified name internally, matching `CoEffectDecl.table`'s
 own documented shape) — `_bare` strips the fixture's `spine_cat.` prefix once
 per table, so every call site below reads as "the fx call under test," not
 "prefix-stripping boilerplate."
+
+The n2-reader section (bead conveyer-azr.16, 005.1 §5; wired into `RunnerFx`/
+`SparkFx` by bead conveyer-azr.19, n3-admission-cut) is the one exception to
+"every fx call under test goes through `local_runner_fx`": its own tests
+still invoke `_build_read_objects_admission` directly against the shared
+`spark` session (three-arg `(object_uris, ReadSpecModel, RawContractModel)`
+signature, §5.8) rather than through `local_runner_fx.read_objects` — a
+deliberate choice kept even now that it IS the wired implementation, since
+these tests want a bare `ReadSpecModel`/`RawContractModel` per case, not a
+full `PipelineSpecModel`/`BatchContext`. The provisional I-P1 reader
+(`_build_read_objects`, CSV/UTF-8/header/FAILFAST) this section used to sit
+alongside is deleted (n3-admission-cut) — its own tests are gone with it.
 """
 
 from __future__ import annotations
 
-import csv
 import dataclasses
+import gzip
 import json
 from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
+from hypothesis import given, settings
+from hypothesis import strategies as st
 from py4j.protocol import Py4JJavaError
+from pydantic import ValidationError
 from pyspark.sql import SparkSession
 
 # `tests/` has no `__init__.py` anywhere (deliberate, see `tests/conftest.py`'s
@@ -37,6 +52,13 @@ from snapshot_asserts import (
     snapshot_ids,
 )
 from spine.core.merge import MergeSpec
+from spine.core.model import (
+    ColumnSpec,
+    DialectModel,
+    PipelineSpecModel,
+    RawContractModel,
+    ReadSpecModel,
+)
 from spine.effects import build
 from spine.effects import spark as spark_fx
 from spine.effects.records import MergeResult, RunnerFx, TransientError
@@ -72,96 +94,432 @@ def _create_state_table(spark: SparkSession, qualified_table: str) -> None:
     )
 
 
-# --- read_objects: provisional CSV/UTF-8/header/FAILFAST (I-P1) ------------
+# --- n2-reader (005.1 §5): _build_read_objects_admission (wired into ------
+# `RunnerFx`/`SparkFx`, bead conveyer-azr.19, n3-admission-cut) --------------
+#
+# The real reader (A-1, A-3, A-4) -- every test below builds it directly via
+# `spark_fx._build_read_objects_admission(spark)` (a bare `ReadSpecModel`/
+# `RawContractModel` per case), never `local_runner_fx` (module docstring).
+# Fixtures (§12.5's reader-level slice) are committed plaintext under
+# `tests/exemplar/identity/fixtures/reader/`; gzip variants are generated at
+# test setup (`_gzip_bytes`) -- no binaries in git.
+
+_READER_FIXTURES_DIR = (
+    Path(__file__).resolve().parent.parent / "exemplar" / "identity" / "fixtures" / "reader"
+)
 
 
-def test_read_objects_reads_header_csv_as_all_string_columns(
-    local_runner_fx: RunnerFx, tmp_path: Path
+def _reader_fixture_text(name: str) -> str:
+    return (_READER_FIXTURES_DIR / name).read_text(encoding="utf-8")
+
+
+def _gzip_bytes(text: str) -> bytes:
+    return gzip.compress(text.encode("utf-8"))
+
+
+def _contract(*columns: ColumnSpec) -> RawContractModel:
+    return RawContractModel(columns=list(columns))
+
+
+def _read_spec(
+    *, compression: str = "none", skip_leading_lines: int = 0, **dialect_kw: object
+) -> ReadSpecModel:
+    return ReadSpecModel(
+        compression=compression,
+        dialect=DialectModel(format="csv", **dialect_kw),  # type: ignore[arg-type]
+        skip_leading_lines=skip_leading_lines,
+    )
+
+
+def test_read_objects_admission_clean_multi_object_with_locators_and_extras(
+    spark: SparkSession, tmp_path: Path
 ) -> None:
-    path = tmp_path / "batch.csv"
-    path.write_text("id,amount\n1,10.5\n2,20.25\n")
+    read_objects = spark_fx._build_read_objects_admission(spark)
+    path_a = tmp_path / "clean_object_a.csv"
+    path_a.write_text(_reader_fixture_text("clean_object_a.csv"))
+    path_b = tmp_path / "clean_object_b.csv"
+    path_b.write_text(_reader_fixture_text("clean_object_b.csv"))
+    contract = _contract(
+        ColumnSpec(name="domain_id", required=True, nullable=False), ColumnSpec(name="payload")
+    )
 
-    df = local_runner_fx.read_objects((str(path),), {})
+    df = read_objects((str(path_a), str(path_b)), _read_spec(), contract)
 
-    assert [f.dataType.typeName() for f in df.schema.fields] == ["string", "string"]
-    rows = sorted((r["id"], r["amount"]) for r in df.collect())
-    assert rows == [("1", "10.5"), ("2", "20.25")]
+    assert df.schema.fieldNames() == [
+        "source_uri",
+        "object_seq",
+        "row_index",
+        "malformed_text",
+        "domain_id",
+        "payload",
+        "extras",
+    ]
+    rows = sorted(
+        (
+            r["object_seq"],
+            r["row_index"],
+            r["source_uri"],
+            r["domain_id"],
+            r["payload"],
+            dict(r["extras"]),
+        )
+        for r in df.collect()
+    )
+    # codepoint-sorted object_uris (A-3): "clean_object_a.csv" < "..._b.csv"
+    assert rows == [
+        (1, 1, str(path_a), "id-001", "alpha", {"extra_col": "zeta"}),
+        (1, 2, str(path_a), "id-002", "bravo", {"extra_col": "yankee"}),
+        (2, 1, str(path_b), "id-003", "charlie", {}),
+    ]
 
 
-def test_read_objects_failfast_raises_on_ragged_row(
-    local_runner_fx: RunnerFx, tmp_path: Path
+def test_read_objects_admission_captures_malformed_rows_verbatim(
+    spark: SparkSession, tmp_path: Path
 ) -> None:
-    path = tmp_path / "ragged.csv"
-    path.write_text("id,amount\n1,10.5\n2,20.25,extra\n")
+    """§5.3/§5.4: unterminated quote, a ragged (too-many-fields) row, and
+    junk-after-closing-quote all shape identically -- `malformed_text` the
+    decoded line verbatim, every declared column NULL, `extras = {}`."""
+    read_objects = spark_fx._build_read_objects_admission(spark)
+    path = tmp_path / "malformed_rows.csv"
+    path.write_text(_reader_fixture_text("malformed_rows.csv"))
+    contract = _contract(ColumnSpec(name="domain_id"), ColumnSpec(name="payload"))
 
-    df = local_runner_fx.read_objects((str(path),), {})
-    with pytest.raises(Exception, match="MALFORMED_CSV_RECORD|FAILFAST"):
-        df.collect()  # CSV parsing is lazy -- FAILFAST surfaces on the action
+    df = read_objects((str(path),), _read_spec(), contract)
 
-
-def test_read_objects_accepts_multiple_uris(local_runner_fx: RunnerFx, tmp_path: Path) -> None:
-    path_a = tmp_path / "a.csv"
-    path_b = tmp_path / "b.csv"
-    path_a.write_text("id\n1\n")
-    path_b.write_text("id\n2\n")
-
-    df = local_runner_fx.read_objects((str(path_a), str(path_b)), {})
-
-    assert sorted(r["id"] for r in df.collect()) == ["1", "2"]
-
-
-# --- nvh.38: RFC-4180 doubled-quote decoding (`escape='"'`) -----------------
+    rows = {
+        r["row_index"]: (r["malformed_text"], r["domain_id"], r["payload"], dict(r["extras"]))
+        for r in df.collect()
+    }
+    assert rows[1] == (None, "id-1", "ok", {})
+    assert rows[2] == ('id-2,"unterminated', None, None, {})
+    assert rows[3] == ("id-3,too,many,fields", None, None, {})
+    assert rows[4] == ('id-4,"abc"junk,x', None, None, {})
 
 
-def test_read_objects_decodes_doubled_quote_with_embedded_comma(
-    local_runner_fx: RunnerFx, tmp_path: Path
+def test_read_objects_admission_gzip_variant_with_bom_and_skip_leading_lines(
+    spark: SparkSession, tmp_path: Path
 ) -> None:
-    # The verifier's repro: a payload containing both a quote and a comma
-    # -- `csv.writer`'s QUOTE_MINIMAL wraps the field in quotes and doubles
-    # the embedded quote, e.g. `"has""embedded,quote"`. Under Spark's CSV
-    # default (`escape` = backslash), this doubled-quote encoding is
-    # misread as a ragged row and dies under FAILFAST.
-    path = tmp_path / "doubled_quote.csv"
-    with path.open("w", newline="") as f:
-        writer = csv.writer(f)
-        writer.writerow(["id", "payload"])
-        writer.writerow(["1", 'has"embedded,quote'])
+    """The gzip variant is generated HERE, at test setup, from the committed
+    plaintext fixture (§12.5) -- no `.gz` binary in git."""
+    read_objects = spark_fx._build_read_objects_admission(spark)
+    path = tmp_path / "bom_preamble.csv.gz"
+    path.write_bytes(_gzip_bytes(_reader_fixture_text("bom_preamble.csv")))
+    contract = _contract(ColumnSpec(name="domain_id"), ColumnSpec(name="payload"))
 
-    df = local_runner_fx.read_objects((str(path),), {})
-    rows = {r["id"]: r["payload"] for r in df.collect()}
+    df = read_objects((str(path),), _read_spec(compression="gzip", skip_leading_lines=1), contract)
 
-    assert rows == {"1": 'has"embedded,quote'}
+    rows = sorted((r["row_index"], r["domain_id"], r["payload"]) for r in df.collect())
+    assert rows == [(1, "id-1", "alpha"), (2, "id-2", "bravo")]
 
 
-def test_read_objects_decodes_doubled_quote_with_embedded_quote_only(
-    local_runner_fx: RunnerFx, tmp_path: Path
+# --- A-06: BOM strip, skip_leading_lines, row_index/physical-line mapping ---
+
+
+def test_read_objects_admission_bom_stripped_and_skipped_lines_never_become_records(
+    spark: SparkSession, tmp_path: Path
 ) -> None:
-    # A field containing only a quote (no comma) also gets QUOTE_MINIMAL
-    # quoting + doubling from `csv.writer` -- confirms the fix isn't
-    # comma-shape-specific.
-    path = tmp_path / "quote_only.csv"
-    with path.open("w", newline="") as f:
-        writer = csv.writer(f)
-        writer.writerow(["id", "payload"])
-        writer.writerow(["1", 'say "hi" now'])
+    read_objects = spark_fx._build_read_objects_admission(spark)
+    path = tmp_path / "bom_preamble.csv"
+    path.write_text(_reader_fixture_text("bom_preamble.csv"))
+    contract = _contract(ColumnSpec(name="domain_id"), ColumnSpec(name="payload"))
 
-    df = local_runner_fx.read_objects((str(path),), {})
-    rows = {r["id"]: r["payload"] for r in df.collect()}
+    df = read_objects((str(path),), _read_spec(skip_leading_lines=1), contract)
 
-    assert rows == {"1": 'say "hi" now'}
+    # If the leading U+FEFF had NOT been stripped, "domain_id" would carry
+    # it and required-column-missing would raise before this point -- a
+    # stronger proof than inspecting the header token directly.
+    rows = sorted((r["row_index"], r["domain_id"], r["payload"]) for r in df.collect())
+    assert rows == [(1, "id-1", "alpha"), (2, "id-2", "bravo")]
 
 
-def test_read_objects_failfast_still_raises_on_ragged_row_after_escape_fix(
-    local_runner_fx: RunnerFx, tmp_path: Path
+def test_read_objects_admission_row_index_maps_to_physical_line_per_a3_formula(
+    spark: SparkSession, tmp_path: Path
 ) -> None:
-    # Regression guard: `escape='"'` must not loosen FAILFAST's rejection
-    # of a genuinely malformed (wrong column count) row.
-    path = tmp_path / "ragged.csv"
-    path.write_text("id,amount\n1,10.5\n2,20.25,extra\n")
+    """A-3: `physical_line = skip_leading_lines + header + row_index`. Lines
+    (0-based): 0=preamble (skipped), 1=header, 2=row_index 1, 3=blank (no
+    record, no ordinal), 4=row_index 2."""
+    read_objects = spark_fx._build_read_objects_admission(spark)
+    path = tmp_path / "mapping.csv"
+    path.write_text("PREAMBLE\ndomain_id,payload\nid-1,a\n\nid-2,b\n")
+    contract = _contract(ColumnSpec(name="domain_id"), ColumnSpec(name="payload"))
 
-    df = local_runner_fx.read_objects((str(path),), {})
-    with pytest.raises(Exception, match="MALFORMED_CSV_RECORD|FAILFAST"):
-        df.collect()
+    df = read_objects((str(path),), _read_spec(skip_leading_lines=1), contract)
+
+    rows = sorted((r["row_index"], r["domain_id"], r["payload"]) for r in df.collect())
+    assert rows == [(1, "id-1", "a"), (2, "id-2", "b")]
+
+
+# --- A-12: header:false positional binding -----------------------------
+
+
+def test_read_objects_admission_header_false_positional_binding(
+    spark: SparkSession, tmp_path: Path
+) -> None:
+    read_objects = spark_fx._build_read_objects_admission(spark)
+    path = tmp_path / "headerless.csv"
+    path.write_text("id-1,alpha\nid-2,bravo\n")
+    contract = _contract(ColumnSpec(name="domain_id"), ColumnSpec(name="payload"))
+
+    df = read_objects((str(path),), _read_spec(header=False), contract)
+
+    rows = sorted(
+        (r["row_index"], r["domain_id"], r["payload"], dict(r["extras"])) for r in df.collect()
+    )
+    assert rows == [(1, "id-1", "alpha", {}), (2, "id-2", "bravo", {})]
+
+
+def test_read_objects_admission_header_false_short_and_long_rows_are_malformed(
+    spark: SparkSession, tmp_path: Path
+) -> None:
+    """[DC-2]: `extras` is always `{}` for headerless feeds -- longer AND
+    shorter rows are both malformed against the declared width, never
+    positionally re-bound or padded."""
+    read_objects = spark_fx._build_read_objects_admission(spark)
+    contract = _contract(ColumnSpec(name="domain_id"), ColumnSpec(name="payload"))
+    short_path = tmp_path / "short.csv"
+    short_path.write_text("id-1\n")
+    long_path = tmp_path / "long.csv"
+    long_path.write_text("id-2,alpha,extra\n")
+
+    short_row = read_objects((str(short_path),), _read_spec(header=False), contract).collect()[0]
+    long_row = read_objects((str(long_path),), _read_spec(header=False), contract).collect()[0]
+
+    assert (short_row["malformed_text"], short_row["domain_id"], short_row["payload"]) == (
+        "id-1",
+        None,
+        None,
+    )
+    assert dict(short_row["extras"]) == {}
+    assert (long_row["malformed_text"], long_row["domain_id"], long_row["payload"]) == (
+        "id-2,alpha,extra",
+        None,
+        None,
+    )
+    assert dict(long_row["extras"]) == {}
+
+
+def test_header_false_contract_with_a_required_column_is_rejected_at_spec_parse() -> None:
+    """A-12: the cross-model validator built in n0-spec-migration (`core/
+    model.py::PipelineSpecModel._check_header_false_forbids_required_
+    columns`) -- re-asserted at the reader-frame level per this bead's
+    brief (§14: "a `header: false` contract declaring any `required` column
+    is a spec-parse defect")."""
+    with pytest.raises(ValidationError, match=r"required:true column.*header: false"):
+        PipelineSpecModel(
+            pipeline="pipelines/reader-probe",
+            transforms_module="pipelines.reader_probe.transforms",
+            raw_table="db.reader_probe__raw",
+            quarantine_table="db.reader_probe__quarantine",
+            fact_table="db.reader_probe__facts",
+            state_table="db.reader_probe__state",
+            fold="default-lww",
+            domain_id_col="domain_id",
+            co_effects={},
+            serialize=False,
+            read=_read_spec(header=False),
+            raw_contract=_contract(ColumnSpec(name="domain_id", required=True, nullable=False)),
+            sla_minutes=60,
+        )
+
+
+# --- A-13: multiline: true -- embedded newline, unterminated-quote cost ----
+
+
+def test_read_objects_admission_multiline_embedded_newline_parses_as_one_record(
+    spark: SparkSession, tmp_path: Path
+) -> None:
+    read_objects = spark_fx._build_read_objects_admission(spark)
+    path = tmp_path / "multiline.csv"
+    path.write_text('domain_id,payload\nid-1,"hello\nworld"\nid-2,plain\n')
+    contract = _contract(ColumnSpec(name="domain_id"), ColumnSpec(name="payload"))
+
+    df = read_objects((str(path),), _read_spec(multiline=True), contract)
+
+    rows = sorted((r["row_index"], r["domain_id"], r["payload"]) for r in df.collect())
+    assert rows == [(1, "id-1", "hello\nworld"), (2, "id-2", "plain")]
+
+
+def test_read_objects_admission_multiline_unterminated_quote_consumes_remainder(
+    spark: SparkSession, tmp_path: Path
+) -> None:
+    """§5.5's declared trade-off: an unterminated quote consumes the file's
+    remainder into ONE field, rather than raising (unlike the `multiline:
+    false` per-line path's `strict=True`)."""
+    read_objects = spark_fx._build_read_objects_admission(spark)
+    path = tmp_path / "unterminated_multiline.csv"
+    path.write_text('domain_id,payload\nid-1,"hello\nid-2,plain\n')
+    contract = _contract(ColumnSpec(name="domain_id"), ColumnSpec(name="payload"))
+
+    df = read_objects((str(path),), _read_spec(multiline=True), contract)
+
+    rows = df.collect()
+    assert len(rows) == 1
+    assert rows[0]["row_index"] == 1
+    assert rows[0]["domain_id"] == "id-1"
+    assert rows[0]["payload"] == "hello\nid-2,plain\n"
+
+
+# --- §5.7 tier-1 defects: exact A-10 grammar, no URIs/filenames ([S-8]) ----
+
+
+def test_read_objects_admission_undecodable_object_defect(
+    spark: SparkSession, tmp_path: Path
+) -> None:
+    read_objects = spark_fx._build_read_objects_admission(spark)
+    path = tmp_path / "corrupt.csv.gz"
+    path.write_bytes(b"not a real gzip stream")
+    contract = _contract(ColumnSpec(name="domain_id"))
+
+    with pytest.raises(ValueError) as exc_info:
+        read_objects((str(path),), _read_spec(compression="gzip"), contract)
+
+    message = str(exc_info.value)
+    assert message == "admission-defect/undecodable-object: object_seq=1"
+    assert str(path) not in message
+    assert path.name not in message
+    # conveyer-azr.32/S-8: the underlying Py4JJavaError's text embeds the
+    # full JVM stack, including this object's URI -- `from None` must
+    # suppress it from the raised exception's `__cause__`, not just keep it
+    # out of the message string (a chained cause still rides an unhandled
+    # traceback into driver/executor logs).
+    assert exc_info.value.__cause__ is None
+
+
+def test_read_objects_admission_duplicate_header_column_defect(
+    spark: SparkSession, tmp_path: Path
+) -> None:
+    read_objects = spark_fx._build_read_objects_admission(spark)
+    path = tmp_path / "dup.csv"
+    path.write_text("domain_id,domain_id,payload\n1,2,3\n")
+    contract = _contract(ColumnSpec(name="domain_id"), ColumnSpec(name="payload"))
+
+    with pytest.raises(ValueError) as exc_info:
+        read_objects((str(path),), _read_spec(), contract)
+
+    message = str(exc_info.value)
+    assert message == (
+        "admission-defect/duplicate-header-column: object_seq=1 positions=[0, 1] name='domain_id'"
+    )
+    assert str(path) not in message
+    assert path.name not in message
+
+
+def test_read_objects_admission_duplicate_header_column_defect_hides_undeclared_token(
+    spark: SparkSession, tmp_path: Path
+) -> None:
+    """[DC-8]: an undeclared duplicated token's own text never appears in
+    the raised message, only its positions -- a mis-uploaded partner file's
+    first-line-is-data cell value must never ride the ledger's
+    `error_message`."""
+    read_objects = spark_fx._build_read_objects_admission(spark)
+    path = tmp_path / "dup_undeclared.csv"
+    path.write_text("domain_id,mystery,mystery\n1,a,b\n")
+    contract = _contract(ColumnSpec(name="domain_id"))
+
+    with pytest.raises(ValueError) as exc_info:
+        read_objects((str(path),), _read_spec(), contract)
+
+    message = str(exc_info.value)
+    assert message == "admission-defect/duplicate-header-column: object_seq=1 positions=[1, 2]"
+    assert "mystery" not in message
+
+
+def test_read_objects_admission_required_column_missing_defect(
+    spark: SparkSession, tmp_path: Path
+) -> None:
+    read_objects = spark_fx._build_read_objects_admission(spark)
+    path = tmp_path / "missing.csv"
+    path.write_text("payload\nfoo\n")
+    contract = _contract(
+        ColumnSpec(name="domain_id", required=True, nullable=False), ColumnSpec(name="payload")
+    )
+
+    with pytest.raises(ValueError) as exc_info:
+        read_objects((str(path),), _read_spec(), contract)
+
+    message = str(exc_info.value)
+    assert message == "admission-defect/required-column-missing: object_seq=1 columns=['domain_id']"
+    assert str(path) not in message
+    assert path.name not in message
+
+
+def test_read_objects_admission_compression_extension_mismatch_defect(
+    spark: SparkSession, tmp_path: Path
+) -> None:
+    read_objects = spark_fx._build_read_objects_admission(spark)
+    path = tmp_path / "plain.csv"
+    path.write_text("domain_id\n1\n")
+    contract = _contract(ColumnSpec(name="domain_id"))
+
+    with pytest.raises(ValueError) as exc_info:
+        read_objects((str(path),), _read_spec(compression="gzip"), contract)
+
+    message = str(exc_info.value)
+    assert message == "admission-defect/compression-extension-mismatch: object_seq=1"
+    assert str(path) not in message
+    assert path.name not in message
+
+
+def test_read_objects_admission_compression_extension_mismatch_reverse_direction(
+    spark: SparkSession, tmp_path: Path
+) -> None:
+    """`compression: none` forbids every Hadoop-actionable compression
+    extension, not just `.gz` -- the reverse direction from the previous
+    test (declared `gzip` against a plain file)."""
+    read_objects = spark_fx._build_read_objects_admission(spark)
+    path = tmp_path / "actually_plain.csv.gz"
+    path.write_bytes(_gzip_bytes("domain_id\n1\n"))
+    contract = _contract(ColumnSpec(name="domain_id"))
+
+    with pytest.raises(ValueError) as exc_info:
+        read_objects((str(path),), _read_spec(compression="none"), contract)
+
+    message = str(exc_info.value)
+    assert message == "admission-defect/compression-extension-mismatch: object_seq=1"
+    assert str(path) not in message
+
+
+def test_reserved_ladder_value_defect_at_spec_parse() -> None:
+    """§5.7's fifth code, `reserved-ladder-value`, is raised at `ReadSpecModel`
+    parse (A-2), never by the reader itself -- `zstd` can never construct a
+    `ReadSpecModel` for `read_objects` to be called with."""
+    with pytest.raises(ValidationError) as exc_info:
+        ReadSpecModel(compression="zstd", dialect=DialectModel(format="csv"))
+
+    assert "admission-defect/reserved-ladder-value: compression='zstd'" in str(exc_info.value)
+
+
+# --- Property test: locator determinism (A-3, §12.4) ------------------------
+
+_ROW_COUNTS_PER_OBJECT = st.lists(st.integers(min_value=0, max_value=4), min_size=1, max_size=3)
+
+
+@given(row_counts=_ROW_COUNTS_PER_OBJECT)
+@settings(max_examples=10, deadline=None)
+def test_read_objects_admission_locator_determinism(
+    tmp_path_factory: pytest.TempPathFactory, spark: SparkSession, row_counts: list[int]
+) -> None:
+    """Same object(s), read twice, MUST assign identical `(object_seq,
+    row_index)` locators both times (A-3) -- varying object count and
+    per-object row count via hypothesis, `tmp_path_factory` (session-scoped)
+    rather than the function-scoped `tmp_path` fixture, since each example
+    needs its own fresh directory."""
+    read_objects = spark_fx._build_read_objects_admission(spark)
+    base = tmp_path_factory.mktemp("locator_determinism")
+    uris = []
+    for object_index, row_count in enumerate(row_counts):
+        path = base / f"object_{object_index}.csv"
+        lines = ["domain_id,payload"] + [f"id-{object_index}-{i},v{i}" for i in range(row_count)]
+        path.write_text("\n".join(lines) + "\n")
+        uris.append(str(path))
+    contract = _contract(ColumnSpec(name="domain_id"), ColumnSpec(name="payload"))
+
+    first = read_objects(tuple(uris), _read_spec(), contract)
+    second = read_objects(tuple(uris), _read_spec(), contract)
+
+    locators_first = sorted((r["object_seq"], r["row_index"]) for r in first.collect())
+    locators_second = sorted((r["object_seq"], r["row_index"]) for r in second.collect())
+    assert locators_first == locators_second
 
 
 # --- read_table: pinned read (I-6), zero-snapshot sentinel [T-19] -----------
