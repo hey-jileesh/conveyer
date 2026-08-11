@@ -1,9 +1,9 @@
 # Pure Core
 ## `pull`, `apply`, `post_check` — Architecture Description (Draft)
 
-**Status:** Draft v0.5 — D-1–D-5 settled (design discussions, 2026-08-03–06); everything else is a drafted problem statement with its option space, held in §6 until settled · **Parent:** *001 Batch Data Processing Architecture* (§3.5, §5) · **Plan:** 003 §3.3 · **Spine:** 004 v1.1 / 004.1 v0.3 + errata notes (stage protocol, context accretion, guard/append mechanics — normative, unaltered here) · **Admission:** 005 v1.0 / 005.1 v0.3 (`valid_df` contract, quarantine one-shape, `row_hash`, the A-14 interim pair this doc rules on) · **Siblings:** 007 (co-drafted seam — candidate-fact columns), 008, 009 (authoring-surface freeze), 012 · **Position:** stages 3–5 of the sequence; the boundary where admitted rows become candidate facts · **Pattern:** transform as pure code; judgment as declared data; co-effects declared, never buried
+**Status:** Draft v0.7 (v0.6: attribution → D-6, authoring preview + v1.0 gate → §6; v0.7: critique pass, 2026-08-10 — 3 findings integrated: the `batch_check` fact-presence door (§5.4), the co-effect class check (D-2), the implicit-check position and taxonomy home (D-6/§7); one citation corrected) — D-1–D-6 settled; v1.0 gated on the carrier-x inventory (§6.4) · **Parent:** *001 Batch Data Processing Architecture* (§3.5, §5) · **Plan:** 003 §3.3 · **Spine:** 004 v1.1 / 004.1 v0.3 + errata notes (stage protocol, context accretion, guard/append mechanics — normative, unaltered here) · **Admission:** 005 v1.0 / 005.1 v0.3 (`valid_df` contract, quarantine one-shape, `row_hash`, the A-14 interim pair this doc rules on) · **Siblings:** 007 (co-drafted seam — candidate-fact columns), 008, 009 (authoring-surface freeze), 012 · **Position:** stages 3–5 of the sequence; the boundary where admitted rows become candidate facts · **Pattern:** transform as pure code; judgment as declared data; co-effects declared, never buried
 
-> **Conventions.** Positions are recorded as decisions **D-n** in Y-statement form (005's convention) so 007–009 and 012 can cite both the choice and its cost. v0.1 contains one settled decision (D-1) and an explicit work list (§6); a section drafted here is not binding until this doc reaches v1.0. Every section after the decision record opens with the problem it answers. This doc receives the registers of 004 §7.3, 004.1 §15.2, 005 §13.2, 005.1 §15.2, and errata-notes §2; each received obligation is recorded in §3 and cited where it lands.
+> **Conventions.** Positions are recorded as decisions **D-n** in Y-statement form (005's convention) so 007–009 and 012 can cite both the choice and its cost. The work list that held open positions through v0.5 is discharged; §6 now carries the 009 preview and the v1.0 gate. A section drafted here is not binding until this doc reaches v1.0. Every section after the decision record opens with the problem it answers. This doc receives the registers of 004 §7.3, 004.1 §15.2, 005 §13.2, 005.1 §15.2, and errata-notes §2; each received obligation is recorded in §3 and cited where it lands.
 
 ---
 
@@ -48,7 +48,7 @@ flowchart LR
 | 005 §7.2 | Cross-field checks remain post_check's until the grammar grows a declared form | §5.1 |
 | 005 §8.2 / Track A | `business/…` codes are business vocabulary, authored in the pipeline package, governed with the contracts; structurally identical rows — 006 owns their semantics | §5.1, §5.3 |
 | 005.1 §15.2 (A-14) | The interim pair to ratify or replace: reason grammar `^business/[a-z0-9][a-z0-9-]*$` at the violations seam; path-split subtraction (fresh: bag-subtract [DC-5], rerun: `row_hash`-keyed); the fact-presence demotion door at post_check [R2-1] | §5.4 |
-| 005.1 §15.2 | post_check attribution semantics: `record_key` on post rows, locators-on-post-rows (nullable — a candidate fact may derive from many raw rows) | §6.1 (producer settled by D-4) |
+| 005.1 §15.2 | post_check attribution semantics: `record_key` on post rows, locators-on-post-rows (nullable — a candidate fact may derive from many raw rows) | D-6 (producer settled by D-4) |
 | impl. register (conveyer-azr) | Hash subtraction is not multiplicity-preserving for occurrence-relative checks — the exact precondition this doc rules on; `checks.zero_failures()` is the sanctioned fresh-path filter seam (`typed_projection`'s failures column is private) | D-1, §5.4 |
 | 003 §5 item A | Cross-lane contract governance needs a **provisional** answer here (one authored source for taxonomy and rules); full design with the Event Model doc's owners | §5.3 |
 
@@ -75,7 +75,7 @@ In the context of the co-effect declaration grammar and snapshot semantics (003 
 - **`apply` perceives values, not places**: `co_effects` is a mapping *alias → dataframe pinned to the recorded snapshot id*. Nothing else crosses the seam. Repointing a physical table touches the declaration, never transform code — global names for global identities, local names in the package.
 - **Fold-boundary coherence for free**: an Iceberg snapshot of a current-state table is always a committed-fold boundary (folds are single atomic MERGEs), so per-table batch coherence comes from pinning itself — no `batch-completed` gating on the pull path.
 - **Rerun**: `pull` re-resolves *current* snapshots; drift is data (004 §8's detection-not-pinning posture — cited, not re-decided; this doc has no authority over spine mechanics).
-- **Bind-time checks**: declared table exists in the catalog; declared columns exist in its schema; every membership-check column reference ⊆ its co-effect's declared columns (when declared); `own_state: true` must reference the pipeline's own current-state table; duplicate aliases rejected.
+- **Bind-time checks**: declared table exists in the catalog; declared columns exist in its schema; every membership-check column reference ⊆ its co-effect's declared columns (when declared); `own_state: true` must reference the pipeline's own current-state table; duplicate aliases rejected; and **the class check (critique, 2026-08-10)** — the reference must name a **current-state table**: raw, quarantine, and ledger references are bind-time defects (the published-interface rule, 002 §9 / 005 D-10, enforced at the same seam that mints grants — otherwise `co_effects.yaml` could derive mechanically a grant 005 D-10 forbids, "just peek at raw" rebuilt as reviewed IaC), and fact-table references — published, but a standing invitation to re-derive state inside `apply` (a fold wearing a check's costume, 007 D-3's litmus) — wait on the growth rule, with a real customer and the perception contract's floor clause re-argued for accreting tables.
 - **The external-data rule, stated as flow**: external systems enter conveyer through ingestion (or the event lane) — landing → facts → fold — and the *resulting current-state table* is what a co-effect may name. This is 002's "upstream never parses" applied to `pull`: you never perceive an external system, you perceive the fold of its ingested facts. Corollary: reference data is time-travelable like everything else — "which roster did batch N see" is a ledger lookup plus `VERSION AS OF`.
 - **Growth, additive**: if a table ever becomes economically prohibitive to scan whole (cost, not overload — S3 has no connection pool to exhaust), a declared `filter:` field arrives *then*, with a real customer and §5.2's allowlist discipline, per the D-1 posture on speculative surface.
 
@@ -106,7 +106,18 @@ In the context of `apply`'s signature and the candidate-fact contract (003 §3.3
 
 In the context of `batch_check`'s control-value sourcing (§6's formerly open item), facing real feed feedback — commission feeds deliver a **detail** member and a **summary** member in one delivery, and a missing member fails the whole batch — **we chose**: `batch_check` control values may reference the **admitted rows of a declared sibling member of the same batch** (the summary-member class): the aggregate expression over the detail member's candidates compares against the summary member's admitted values — batch verdict, fail loud, no row quarantine, per §5.1; **delivery composition itself is admission's ground**, registered upstream (§7): declared members (name, match pattern, per-member read spec and raw contract, `required` flag) and a tier-1 defect (`missing-required-member` class — delivery-level failure, the gate shape 005 D-3 already permits); **absence detection is registration's ground**, registered to 002.1: *absence is not an event* — "the summary never came" is perceivable only against a declared pairing rule and deadline, so ingestion owns the timer and admission's tier-1 is the structural backstop when a partial delivery registers anyway — **and rejected** sourcing this class from a co-effect table (the control value is batch-local data that arrived *with* the batch; a co-effect read would complect this batch's verdict with another table's cadence and another pipeline's schedule), **and rejected** trailer-records-within-one-file now (no resident customer; future growth through the normal rule), **to achieve** reconciliation as a declared, value-determined batch verdict over data that arrived together and is validated together — closing the falsifier's untested kind with a real rule class — **accepting that** two-member feeds cannot be built until 005's member grammar lands, and that the summary member's own admission (its read spec, contract, and quarantine behavior) precedes any `batch_check` evaluation — stage order already guarantees this; the exactly-one-summary-row expectation and control-extraction mechanics are LLD grain, named for 006.1/009.
 
-*(Further decisions — attribution, the 009 authoring preview — are open; §6 states each problem. They enter this record as D-6… as they settle.)*
+### D-6 — post_check attribution: identity framework-derived where derivable; locators stay null; the full failed-check set on `reason_detail` — **settled**
+
+In the context of post_check quarantine attribution (005.1 §15.2's handed obligation, this doc's last open position), facing the one-shape's nullable identity columns (005 §8.1: `domain_id`, `record_key` "populated on post_check rows where known" — with *known* undefined until now) and 007's ratification of the declared surfaces (007 D-2 unblocking this item explicitly), **we chose**: the framework populates `domain_id` from the declared `domain_id_col` and `record_key` by the **same canonical derivation commit uses** (D-4's declaration; 007 D-1's mechanism; one shared function, pinned by 007.1's vector file — never a second implementation) **iff every declared key column is non-null** — partial key material derives nothing; **locators stay null on post rows**, ratifying 005.1 §8.2 — a candidate fact may derive from many raw rows, so post-stage attribution is by identity, never by position; and **005 §8.1's grain law extends to post rows**: `reason_code` = the first failing declared check in authored order, `reason_detail` = the full failed-check set (check ids and versions — bounded machine context, never cell values) — possible now *because* D-1 made the framework the interpreter of every check, where A-14's interim pipeline-authored `violations_df` could assert only one reason per row; pipelines author **zero attribution code** — **and rejected** threading raw locators through `apply` (D-4 already refused lineage visibility in business code; under many-to-one derivation any single locator is a lie wearing a column's authority), **and rejected** partial-key derivation over the non-null subset (a derived identity that collides across genuinely distinct identities is worse than no identity), **and rejected** leaving `record_key` unpopulated until commit derives it (quarantined candidates never reach commit — the rows 012 exists for would be exactly the keyless ones), **to achieve** quarantine rows that join facts and state on the lane's own identity vocabulary — "open violations for domains currently in state S" is one join; 012's queue groups by `domain_id`/`record_key` with no bespoke parsing — and remediation's second round trip preserved (the full failure set was known the whole time — 005 §8.1's argument, now holding at both writers), **accepting that** a candidate quarantined *because* its key material is missing is findable by batch, reason, and `row_snapshot` only — the floor for unkeyable rows, and the honest one.
+
+**Mechanics settled with it:**
+
+- **The NULL-`domain_id` implicit check** (007 D-3's demotion, via D-4's named mechanism) flows through this rule with no special case: `domain_id` null by definition; `record_key` derives iff the declared key columns exclude the null column.
+- **Value-identity, restated**: two value-identical violating candidates produce indistinguishable quarantine rows — same `row_hash`, same derived `record_key` (005 §8.1's stated property; the identity columns make it useful rather than merely harmless).
+- **Attribution is not identity**: rerun subtraction (§5.4) is untouched — `row_hash` remains the subtraction key; `record_key` exists for remediation joins, never for guard mechanics.
+- **Determinism of `reason_code`**: authored order in the checks file (§6.2) is evaluation order, fixed at bind; `check_version` stamps from the context accretion (005.1 §15.3's 004.1-erratum 3). **Position and home of the implicit check (critique, 2026-08-10)**: the framework-authored NULL-`domain_id` check evaluates **first, before all authored checks** — so `reason_code` on a null-`domain_id` row is deterministically `business/missing-domain-id`, authored failures riding `reason_detail` — and its code is **framework-reserved within the `business/…` namespace**, registered as an additive 005 §8.2 erratum (§7) and covered by §5.3's cross-lane vectors, so the event lane enforces the one check it cannot lift from `checks.yaml`.
+
+*(Decision record complete for v0.6; new decisions enter as D-7… if the critique pass or the carrier inventory reopens ground.)*
 
 ---
 
@@ -122,7 +133,7 @@ Three declared kinds at v0.1 — deliberately few; growth is a new kind, never a
 |---|---|---|---|
 | **row** | `expr` over the candidate row's columns, allowlisted subset (§5.2); `reason: business/…` | per-row → quarantine | verdict is a function of the row value alone |
 | **membership** | column(s) must exist in a declared co-effect's column(s); `reason: business/…` | per-row → quarantine | verdict is a function of (row value, co-effect snapshot value) — deterministic within an attempt; cross-attempt co-effect drift is already handled by the durable-authoritative rerun path + drift-as-data ([H-2]) |
-| **batch_check** | aggregate `expr` over the candidate set compared against a declared control value sourced from a sibling delivery member's admitted rows (D-5 — summary-member class) | per-batch → batch fails loud, no quarantine rows | attribution to rows is arbitrary by construction, so none is attempted — the aggregate is the verdict |
+| **batch_check** | aggregate `expr` over the candidate set compared against a declared control value sourced from a sibling delivery member's admitted rows (D-5 — summary-member class) | per-batch → batch fails loud, no quarantine rows (rerun with facts present: demoted to drift probe, §5.4) | attribution to rows is arbitrary by construction, so none is attempted — the aggregate is the verdict |
 
 Cross-field row rules (`net = gross − fees`) are row expressions — 005 §7.2's "until the grammar grows a declared form" is discharged by the **row** kind. Occurrence-relative rules (duplicate detection, "first occurrence wins") are *inexpressible* — deliberately: value-identical candidates collapse at 007's dedup anyway; a duplicate-quarantine check would do 007's job early with broken rerun semantics.
 
@@ -141,16 +152,60 @@ Rules are data in the pipeline package; the batch lane compiles them to Spark ex
 - **Fresh path:** `admitted = candidate` bag-subtracted against the in-memory violations via `frames/checks.py::violation_subtraction`, count identity asserted — unchanged [DC-5]. `checks.zero_failures()` remains the sanctioned filter seam.
 - **Guard-present rerun:** recompute candidates, hash (005.1 §7.3), anti-join the durable `row_hash` set for `(batch_id, "post_check")` — now sound *by construction*: every expressible check is value-determined, so verdicts on value-identical rows are identical and hash subtraction preserves multiplicity semantics for every check that can exist.
 - **Fact-presence door [R2-1]:** unchanged — facts present + no guard row ⇒ durable state authoritative, empty violation set, no append, recompute demoted to the `post_check_drift` probe.
+- **The door extends to batch verdicts (critique, 2026-08-10):** facts present for `batch_id` ⇒ `batch_check` is likewise **demoted to the drift probe** — the recomputed aggregate vs. its control is recorded as data, never raised; `batch_check` renders a verdict only when facts are absent. Without this, a kill-after-commit rerun re-evaluates the aggregate over candidates recomputed against re-resolved co-effect snapshots (D-2's rerun bullet) and can fail loud on every retry with its facts durably committed — the [H-2] wedge class reintroduced through a verdict channel that postdates [R2-1]'s design. Durable facts are authoritative through every door, row or batch.
 - **The count assertion** (I-12) stays fresh-path-only ([H-2]'s demotion unchanged).
 
 The 005 §8.1 precondition is hereby *ruled on*: it holds not as a documented assumption but because the surface cannot violate it. If a future declared kind is ever proposed whose verdicts are not value-determined, this section is the tripwire: it must be rejected or must carry its own identity mechanism as part of its design.
 
 ---
 
-## 6. Work List — Open Positions (option spaces, not decisions)
+## 6. Authoring Surface — Preview for 009 (v0.5's work list, discharged)
 
-1. **post_check attribution** (005.1 §15.2): with `record_key`'s producer now settled (D-4 — framework-derived from the declared columns), post_check quarantine rows can plausibly carry it whenever the candidate row's declared `record_key` columns are populated; locators stay nullable on post rows (a candidate fact may derive from many raw rows — attribution is by `domain_id`/`record_key`, not locator). Mostly drafting; settle after 007 ratifies the declared surfaces.
-2. **Authoring-surface preview for 009**: file layout of declared checks, co-effect declarations, fact schemas (D-4), and member references (D-5) in the pipeline package (yaml alongside `pipeline.yaml` vs. inside it); versioning (`check_version` already accretes in context, 004.1 §15.3-5).
+Both open positions are settled: attribution entered the record as D-6; this section discharges the second — the preview 009 freezes. **Nothing here is frozen**: layout and format are 009's decisions; this is the shape the settled decisions already imply, recorded so 009 starts from a proposal instead of a blank page.
+
+### 6.1 The declared surfaces, gathered
+
+Five declared surfaces now exist, each with a consumer that is not the pipeline author:
+
+| Surface | Declared in | Consumed by |
+|---|---|---|
+| Read spec + raw contract (delivery members arrive here, D-5 register) | 005's grammar | admission; bind-time checks |
+| Co-effect declarations — alias → table, `own_state`, `columns:` | D-2 | `pull`; IAM grants (S-15); bind-time coherence |
+| Declared checks (row / membership / batch_check) + their `business/…` reasons | D-1, D-5 | `post_check`; the event lane (Track A); D-6's attribution stamps |
+| Fact schemas — columns, `domain_id_col`, `record_key:`, `ordering:` | D-4 | candidate validation; commit/fold ([H-6] DDL, mechanically); 007's dedup and total order |
+| `apply` | D-4 | the only code in the package |
+
+### 6.2 Proposed layout (sketch — 009 freezes or overrules)
+
+```
+pipelines/<feed_id>/
+├── pipeline.yaml          # identity + wiring: feed_id, fact-type index, stage config; references, not content
+├── contracts/
+│   ├── read_spec.yaml     # 005's surface; delivery members land here when the D-5 grammar arrives
+│   └── raw_contract.yaml
+├── co_effects.yaml        # D-2 declarations
+├── checks.yaml            # D-1's kinds; authored order = evaluation order (D-6); reasons beside the checks that emit them
+├── facts/
+│   └── <fact_type>.yaml   # one file per declared fact type (D-4: schema, domain_id_col, record_key, ordering)
+├── transforms.py          # apply() — all the code there is
+└── tests/golden/          # 001 §7's fixture suite
+```
+
+The previewed position — **one file per surface, `pipeline.yaml` as index, never a monolith** — is argued from consumers, not taste: `checks.yaml` must be liftable by the event lane without dragging batch wiring (Track A's one-source requirement); `co_effects.yaml` is IaC input (S-15 — grants derive from it) and wants diffs that touch nothing else; fact schemas and checks version independently (an additive column and a new rule are different reviews); and review attention concentrates exactly where 001 §8 predicts — contracts and mappings — so the diff surface should isolate there.
+
+### 6.3 Versioning (preview)
+
+Per-surface versions exist for **provenance stamps, not resolution**: the deployed package is one content-pinned value (I-23); `check_version` accretes into context and the ledger (005.1 §15.3's 004.1-erratum 3) and stamps quarantine rows (D-6); the contract version already stamps admission's rows (005 §8.1). 009 decides the version fields' form; the invariant it must keep is that every governed surface's version is a column somewhere, so "which rules rejected this row" stays a lookup, never archaeology.
+
+### 6.4 The v1.0 gate — the carrier-x inventory, three questions
+
+One conversation gates three named deferrals (two are 007's; recorded together because they are one inquiry):
+
+1. **The rule inventory** (D-1's binding falsifier): the complete commission-statements rule list, each rule mapped to row / membership / batch_check. Prediction: zero code checks. A counterexample reopens the escape-hatch rejection *here*, before 009 freezes the surface.
+2. **Correction-omission semantics** (007 D-4's trigger): a corrected statement omits a line the original carried — does that assert nothing (default accretion holds), or "this line no longer exists" (the full-restatement feed class gains its first customer and its design starts)?
+3. **Restatement vs. increment** (007 D-3's trigger): does every feed assert each domain's complete state (grain law holds; default LWW folds it), or does any deliver increments to integrate (the custom-fold contract's design task activates — reversal-under-supersession being the input that cannot be guessed)?
+
+The critique pass does not wait on these; v1.0 of both docs does — each deferral is closable only by its answer.
 
 ---
 
@@ -161,9 +216,11 @@ The 005 §8.1 precondition is hereby *ruled on*: it holds not as a documented as
 - **002.1 — pairing rule and member-grain expectations** (D-5): the absence machinery already exists (002 §2 job 5 — `delivery-overdue` from the expectation schedule; 002.1's overdue-marker CAS) — the growth is **member grain**: expectations and pairing must understand a delivery as a declared member set, so "summary arrived, detail didn't, deadline passed" is an expressible overdue condition, and registration decides whether a partial pair waits or registers (and lets admission's tier-1 kill it). Interaction with supersession when a corrected member arrives late.
 - **007 — the D-4 surfaces** (restated from D-4's mechanics block): `record_key: [cols]`, `ordering: [cols]`, `domain_id_col`, canonical `record_key` derivation under shared vectors, and the NULL-`domain_id` mechanism option.
 - **009 / Track A** — the declared-rule authoring format and cross-lane vector governance (§5.3's provisional answer made full).
-- **006.1** — the LLD grain named throughout: bind-time validator inventory (D-2, D-4), control-extraction mechanics and the exactly-one-summary-row expectation (D-5), the expression-subset allowlist's concrete function list (§5.2).
+- **005 v1.x — §8.2 erratum, additive** (D-6): the `business/…` namespace gains one **framework-reserved** code, `business/missing-domain-id`, emitted by the implicit candidate-seam check (007 D-3's demotion) — evaluated before all authored checks, covered by the §5.3 vectors; "codes are authored in the pipeline package" acquires exactly this carve-out.
+- **005.1 v0.x — the post_check writer's attribution upgrade** (D-6): `record_key` populated by the shared canonical derivation where every declared key column is non-null (was: NULL until 006 rules); `reason_detail` = the full failed-check set (was: NULL); locators-null and `domain_id`-where-present ratified unchanged. One derivation function, two call sites (commit, post_check writer) — placement and vector pinning are 006.1/007.1 grain.
+- **006.1** — the LLD grain named throughout: bind-time validator inventory (D-2, D-4), control-extraction mechanics and the exactly-one-summary-row expectation (D-5), the expression-subset allowlist's concrete function list (§5.2), the shared `record_key` derivation seam (D-6, with 007.1).
 
-## 8. Trade-offs, Named (D-1–D-5)
+## 8. Trade-offs, Named (D-1–D-6)
 
 - **Grammar-growth latency** (D-1). The first inexpressible rule waits on a framework release. Accepted; mitigated by the smallness of check interpreters and by §4's falsifier having been run against the first real pipeline before freeze.
 - **Two interpreters to keep honest** (D-1). Cross-lane vectors are a standing maintenance surface — the cost of one rule source. The alternative (forked rule definitions) was rejected as the larger permanent cost.
@@ -174,6 +231,7 @@ The 005 §8.1 precondition is hereby *ruled on*: it holds not as a documented as
 - **A declaration surface that can lie slightly** (D-4). Declared fact schemas, `record_key`, and `ordering` are one more authored surface that can drift from intent; bind-time validation polices existence and coherence, not meaning. Accepted — the alternative put the same meaning in code where nothing polices it at all.
 - **Filename-borne business data waits** (D-4). A feed whose business period rides only in its filename cannot be built until the declared admission mapping exists (005 v1.x/009) — deliberate: the alternative was payload-classified strings flowing into published facts through an undeclared hole.
 - **Two-member feeds wait on upstream grammar** (D-5). The detail/summary feed cannot build until 005's member composition lands — the cost of putting composition where validation lives instead of special-casing it in the core. The reconciliation rule itself was free: `batch_check` existed before its first customer arrived.
+- **An identity floor for unkeyable rows** (D-6). A candidate quarantined for missing key material carries no derived identity — batch, reason, and snapshot are remediation's whole handle for exactly those rows. Accepted as the honest floor: fabricating identity where the defect *is* absent identity would plant a lie at the point remediation trusts identity most.
 
 ---
 
