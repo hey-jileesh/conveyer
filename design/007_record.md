@@ -1,0 +1,136 @@
+# Record
+## `commit` and `fold` — Architecture Description (Draft)
+
+**Status:** Draft v0.5 — D-1–D-6 settled (design discussions, 2026-08-10); work list fully discharged; ready for the critique pass once the carrier-x inventory closes the named deferrals · **Parent:** *001 Batch Data Processing Architecture* (§3.3, §3.7, §5) · **Plan:** 003 §3.4 · **Spine:** 004 v1.1 / 004.1 v0.3 + errata notes (guarded commits, single-flight, I-11's MERGE mechanics — normative, unaltered here) · **Siblings:** 006 (co-drafted candidate-fact seam — D-4's declared surfaces arrive here for ratification), 005/005.1 (canonical-JSON vectors, row_hash precedent), 008 (maintenance, payload freeze), 002.1 (supersession / Track E) · **Position:** stages 6–7; the boundary where candidate facts become durable facts, and facts become current state · **Pattern:** remember (facts) + derive (state); the fold is disposable, the facts are not
+
+> **Conventions.** Positions will be recorded as decisions **D-n** in Y-statement form (005/006's convention). Every received obligation is recorded in §3 and cited where it lands. Detail belonging to an LLD (007.1) or another cluster doc is named and deferred, not sketched.
+
+---
+
+## 1. Context — From Candidate Facts to Durable State
+
+**The problem.** 006 ends with per-type candidate frames conforming to declared fact schemas, identity and ordering present as declared columns (006 D-4), violations already routed (006 D-1). Nothing yet says what makes two facts *the same fact* (canonicalization, `content_hash`), how reruns and redeliveries become no-ops (dedup on `(batch_id, record_key, content_hash)`), what a corrected delivery does to the facts of the delivery it supersedes (Track E), or the contract by which facts become one row per `domain_id` of current state — including the proof obligation that makes arrival order irrelevant (`fold(all facts) ≡ incremental folds in any order`, 004 §7.3).
+
+The stakes, stated once: **facts are the system of record; state is a cache with a schema.** Every decision in this doc either preserves that (state disposable, rebuildable, time-travelable) or quietly inverts it (state becomes the record, facts become a log nobody replays). 001 §3.3's replay promise is only as real as this doc makes it.
+
+---
+
+## 2. Scope & Non-Goals
+
+**In scope:** fact canonicalization and the normative `content_hash`; dedup and the `delta_filter` seam; delta detection vs. superseded deliveries; the fold contract (default LWW, ordering semantics, proof obligations, custom-fold posture); MERGE mechanics, full-rebuild, as-of reads; fact/state table grants and write paths; ratification of 006 D-4's declared surfaces; the NULL-`domain_id` ruling.
+
+**Deferred:** `batch-completed` payload and maintenance cadence (008); compaction preserving `batch_id` clustering [T-9] (008); the authored file format freeze (009); cross-materialization (011); field-level DDL and MERGE plans (007.1).
+
+---
+
+## 3. Received Obligations (recorded, per the handing docs' instruction)
+
+| From | Obligation | Lands |
+|---|---|---|
+| 003 §3.4 | Normative content-hash algorithm: exactly what is hashed, exclusions (`batch_id`, received-at), stability across Spark versions | D-1 |
+| 003 §3.4 / Track E | Delta detection vs. superseded deliveries: default = corrected batch's genuine changes become the newest facts; per-feed-class overrides | D-2 (target), D-4 (semantics + override class) |
+| 004 §7.3 | Fold order-insensitivity is **load-bearing**: state rows carry their ordering key; MERGE conditional on winning the comparison; proof obligation exercised by the late-file *and* concurrent-sibling cases; a custom fold that cannot meet it is rejected or demoted to full-rebuild-only | D-3 |
+| 004.1 §15.2 [T-11] | Ordering comparison inherits I-11's pinned semantics as *stated decisions*: null-ranks-lowest, strict inequality, hash tiebreaker for totality | D-3 |
+| 004.1 §15.2 [H-6] | State-table DDL must carry the ordering columns — the MERGE compares src vs. tgt ordering structs | D-3, §5.5 |
+| 004.1 §15.2 [T-12] | One-row-per-`domain_id` cardinality precondition on current state | D-3 (the grain law) |
+| 004.1 §15.2 (I-11) | State-row deletion semantics: LWW never drops a row | D-3 (retraction design → §5.3/Track E) |
+| 004.1 §15.2 (I-24) | Whether NULL-`domain_id` facts demote from fail-fast to quarantine — 006 D-4 names the mechanism (framework-authored implicit check at the candidate seam, routed as data) if quarantine is chosen | D-3 (demoted to quarantine) |
+| 004.1 §15.2 | `delta_filter` seam content: dedup + delta detection | D-2 |
+| errata-notes §2 | State-table DDL **must** set `write.merge.mode = merge-on-read` — hard precondition for no-op detection; copy-on-write silently loses the signal | D-5 (bootstrap-enforced) |
+| errata-notes §2 | Custom-fold ordering-key resolution is absent in Phase 1 — default LWW is the only fold | D-3 (bind refusal makes it structural) |
+| 005.1 §15.2 | Canonical-JSON vectors at `contracts/fixtures/canonical-json/` — align fact-hash canonicalization **by vectors, not code**; the tagged-JSON fixture convention (`$decimal`/`$date`/`$timestamp`); 007 writes its own untagging parser | D-1 |
+| 006 D-4 | Declared surfaces to ratify: `record_key: [cols]` (dedup participant, framework-derived), `ordering: [cols]` (this doc pins the interpretation), `domain_id_col`; canonical `record_key` derivation joins `content_hash` under the shared-vectors discipline | D-1, D-2, D-3 — **fully ratified** |
+| 006 §6.1 | Attribution enablement: once the declared surfaces are ratified, 006 settles `record_key`-on-post_check-quarantine-rows | D-2 (unblocked — settle in 006) |
+
+---
+
+## 4. Decision Record
+
+### D-1 — `content_hash` covers all declared fact columns; recency is a stamp, never content; one canonical grammar, aligned by vectors — **settled**
+
+In the context of fact canonicalization and `content_hash` coverage (003 §3.4), facing the two-times distinction the ordering chain of 001 §3.7 already encodes — **business time** (event dates, periods, sequences *in the data*) is content the carrier asserted; **perception time** (when the delivery arrived) is provenance the pipeline stamped — **we chose**: `content_hash` = sha256 over the canonical-JSON rendering of **all declared fact columns** — payload, `domain_id_col`, and the declared `ordering:` columns — with every declared column present (nulls canonical) and the framework stamps (`batch_id`, lineage, `received_at`, source timestamp) excluded; canonicalization aligned to the committed vectors (`contracts/fixtures/canonical-json/`) with this cluster's **own untagging parser** (shared vectors, never shared code — 004 D-13); and version recency carried by the **stamped source timestamp**, second element of the §3.7 chain — never by the hash — **and rejected** payload-only hashing (a re-dated line — same amount, moved to a new period — would produce no new fact: business content dropped *by mechanism, silently*, the wrong side of the errors-as-data line), **and rejected** hashing any stamp (every redelivery becomes "change"; delta detection dies), **to achieve** idempotent redelivery (identical re-sends hash identical and drop at delta detection), corrections that win their tie deterministically *and rightly* (changed content ⇒ new hash; tied business ordering ⇒ the later source stamp decides — where a hash tiebreak alone would be deterministic and arbitrary), and volatile-column behavior as a **visible per-feed modeling choice** (declare a per-record volatile timestamp into the fact schema and re-sends accrete facts — if re-assertion is information for that domain, that is correct; if it is noise, the remedy is the declaration, not the mechanism), **accepting that** fact-table growth for feeds that declare re-assertion as information is storage the model spends on purpose.
+
+**Mechanics settled with it:**
+
+- **The hashed object**: a map of declared column name → canonical value, all declared columns always present; canonical rendering per 005.1 §7.1's conventions (`Decimal`/`date`/`timestamp` as bare canonical strings on the wire; the fixtures' tagged form authors inputs only).
+- **One grammar, multiple subjects**: admission's `row_hash` (raw snapshot) and commit's `content_hash` (declared fact columns) share the canonical grammar and the vectors, never the subject — a fact hash and a row hash are incomparable by construction, and that is a feature.
+- **`record_key` derivation** (006 D-4's handed surface, ratified here as mechanism): the same canonical rendering over the declared `record_key` columns' values; exact composition (hash vs. composite string) is 007.1 grain, pinned by its own vector file when it lands.
+- **Stability across Spark versions**: the vectors are the normative surface and CI pins them; the computation is a commit-stage UDF (005.1 §7.3's class) — one hash per fact, paid where facts are minted, keeping the admit path UDF-free.
+- **Boundary**: the source timestamp's precise definition (delivery `received_at` vs. partner file timestamp) belongs to the ordering contract (§5.4); D-1 needs only that it is stamped at commit and excluded from the hash.
+
+### D-2 — Within-batch value identity; divergent duplicates commit as facts; delta detection compares against the predecessor batch and fails open safe — **settled**
+
+In the context of dedup and the `delta_filter` seam (003 §3.4; 004.1 §15.2), facing the A→B→A litmus (a record that changes and changes back must re-commit) and the concurrent-sibling race (004 D-12), **we chose**: (a) **within-batch value identity** — candidate rows identical on `(record_key, content_hash)` collapse to one fact; rerun idempotency is owned by the commit guard alone (facts present for `batch_id` ⇒ skip — the filter plays no rerun role); (b) **divergent within-batch duplicates both commit** — same `record_key` and ordering, different content, are two assertions, and facts accrete; the fold's total order (ordering, source stamp, `content_hash`) picks current state deterministically, and the conflict is **observable data** — a metric and a trivially queryable condition (one `record_key`, one `batch_id`, >1 `content_hash`) — remediated by a corrected delivery; (c) **delta detection compares per `record_key` against the predecessor batch** — the superseded batch when Track E applies, else the feed's latest completed batch at resolution — dropping candidates whose `content_hash` is unchanged; the predecessor read is pinned and recorded (predecessor `batch_id` + snapshot id into context and ledger); no predecessor ⇒ everything is novel — **and rejected** all-history comparison ("have we ever seen this content" drops the return-to-A: state silently stays B — novelty erased by mechanism — and the per-key join against the whole fact table is unbounded, unaided by [T-9]'s `batch_id` clustering), **and rejected** quarantining divergent duplicates (a third quarantine writer, with interplay against post_check's rerun-subtraction soundness, buying nothing the fact table doesn't already keep), **and rejected** failing the batch on divergence (gates thousands of good rows on one contradicted line — 001 §2.2's rejected shape), **to achieve** novelty semantics that are bounded (one batch-clustered read), Track-E-aligned ("genuine changes" means changes *relative to what the batch corrects*), and **fail-open safe** — the load-bearing principle: *delta detection degrading costs duplicate facts, never wrong state*; correctness lives in the fold's order-insensitivity, the filter is economy plus the meaning of "genuine change" — **accepting that** between contradictory same-ordering assertions, state's winner is deterministic but semantically arbitrary until a correction arrives; and that a record absent from the predecessor but present two batches ago re-commits on return — re-emergence is information, and the price of the bounded read.
+
+**Mechanics settled with it:**
+
+- **Seam contract**: a framework-internal pure filter at commit — `(candidates, predecessor_facts) → novel subset`. Not a pipeline co-effect, no declaration; it is the stage's own mechanics, recorded like every read.
+- **Predecessor resolution**: the supersession ledger names the superseded batch (002.1) when one exists; else the feed's latest *completed* batch per the ledger. Under concurrent siblings the resolution can race — named residual, absorbed by fail-open (worst case: same content committed under two `batch_id`s; ties resolve stably; state unharmed).
+- **Deletion is not delta detection's job**: a record absent from the current delivery asserts nothing here — absence semantics (explicit retraction facts, LWW-never-drops) belong to §5.4 and Track E.
+- **Ratifications**: `record_key`'s role (dedup + delta identity) joins D-1's derivation — 006 D-4's handed surface is now fully ratified except ordering interpretation (§5.4). **006 §6.1 (attribution) is unblocked**: post_check quarantine rows may carry the framework-derived `record_key` wherever the candidate's declared key columns are populated.
+
+### D-3 — The fold contract: default LWW over one total order at domain grain; NULL `domain_id` demotes to quarantine; custom folds are a bind-time defect until their contract exists — **settled**
+
+In the context of the fold contract (003 §3.4; 004 §7.3's load-bearing order-insensitivity), facing [T-11]'s inherited comparison semantics and the question of what happens when a feed's shape outgrows last-write-wins, **we chose**:
+
+(a) **One total order, two applications**: an incoming fact beats the incumbent iff strictly greater under *(declared `ordering:` columns, lexicographic in declared order → source timestamp stamp → `content_hash`)*, nulls ranking lowest [T-11]; a full tie is the same value — a no-op, which is what merge-on-read's no-op detection perceives. The same comparison drives both the **intra-batch reduce** (winners per `domain_id` selected before MERGE — Iceberg MERGE errors on duplicate source matches, so the reduce is mechanical necessity, not optimization) and the **conditional MERGE** of winners against state.
+
+(b) **Source timestamp := delivery `received_at`** — framework-stamped at registration, always present, and it orders corrections correctly (a superseding delivery arrived later, by definition); **rejected** partner file timestamps (partner-authored payload [S-8], unreliably present, and partner clocks lie — perception time comes from the perceiver).
+
+(c) **The grain law** ([T-12] made concrete): default LWW folds at `domain_id` grain and requires each fact to be a **complete assertion of its domain's state** — fact grain, `record_key` grain, and state grain coincide. Anything coarser (rollups, totals) is perception — a view or 011's materialization — never the fold.
+
+(d) **NULL `domain_id` demotes from fail-fast (I-24) to quarantine**, via 006 D-4's named mechanism (framework-authored implicit check at the candidate seam, `business/missing-domain-id` class): a null in `domain_id_col` is *data-driven* — the contract permitted the null, `apply` faithfully projected it — and data failures route as data, never as batch death; an author who wants nulls impossible declares the source column non-nullable and the failure moves to admission where it belongs. I-24's fail-fast was interim posture.
+
+(e) **Custom folds: refuse loudly at bind, Phase 1** — same posture, same reasoning as 006's `own_state` refusal: the errata record that custom-fold ordering-key resolution does not exist, and a custom fold accepted without its mechanically-checked proof obligation is a published guarantee without a mechanism. The seam stays reserved with its contract shape sketched: **tier 1** — a reduction with proven order-insensitivity (`fold(all facts) ≡ incremental folds, any arrival order`, exercised against the late-file and concurrent-sibling cases) runs incrementally; **tier 2** — a fold that cannot prove it is demoted to full-rebuild-only mode (004 §7.3's provided fallback). The first increment-shaped feed is the *design input* that fills in the contract — notably corrected-increment reversal under Track E supersession, which cannot be designed well speculatively — not an inconvenience routed around.
+
+**We rejected** designing the custom-fold contract now (no customer; the reversal-under-supersession semantics would be guessed, then frozen by 009), **and rejected** letting increment integration migrate downstream to the domainDB projection — the boundary litmus, recorded as law: *if a projection can be deleted and rebuilt from Iceberg without losing information, it is a view and belongs downstream; if deleting it loses the only integrated state, it is a fold wearing a view's costume* — a projection that integrates increments becomes the system of record computed outside the fold's guarantees, inverting "state is a cache" silently. With `own_state` refused at 006 D-3 and custom folds refused here, incremental state computation cannot enter through the transform *or* the fold *or* the projection — an increment feed triggers the design task instead of getting built wrong, **to achieve** a fold whose entire behavior is one stated comparison plus one grain law — small enough to reason about informally, proven once by a framework property test (spine suite, generated fact sets, shuffled arrival orders) with R-07 as the runtime probe — **accepting that** the first increment-shaped feed waits on a real design effort (fold contract, reversal semantics, proof harness), and that state's answer for a domain whose feed restates completely is only ever the newest assertion — historical analysis is the fact table's job, by design.
+
+**Mechanics settled with it:** LWW never drops a state row (I-11 restated — deletion is an explicit-retraction design, Track E ground, not an absence inference); the ordering struct in every state DDL = declared columns + `source_ts` + `content_hash` ([H-6] discharged from the declaration mechanically); 006 D-4's `ordering:` surface is hereby fully ratified — interpretation pinned, columns hashed as content (D-1), comparison as stated here.
+
+### D-4 — Supersession: accretion always; absence asserts nothing by default; full-restatement retraction is a named per-feed-class override awaiting its customer — **settled**
+
+In the context of delta detection vs. superseded deliveries (003 §3.4, Track E), facing the corrected file that *omits* a line the original carried, **we chose**: the default Track E semantics as handed — a superseding batch's genuine changes (per D-2, relative to the batch it supersedes) become the newest facts; the superseded batch's facts are **never touched** — accretion, with state moving past them because the correction's later `received_at` wins ties; and **absence asserts nothing**: an omitted record produces no candidate, no fact, no state change — retraction must be *explicit* (a reversal or zeroing line in the feed) — with **full-restatement supersession** recorded as a named per-feed-class override (the superseding batch's `record_key` set replaces the superseded batch's; omitted keys generate framework-derived retraction facts; the fold flips state to retracted, never drops the row — I-11), **deferred to its first confirmed feed class** — **and rejected** designing retraction facts now (they touch fact schemas (006/009) and fold semantics; guessed then frozen is the failure mode this doc keeps refusing), **and rejected** inferring retraction from absence by default (absence is not an assertion — the same epistemics as 006 D-5's "absence is not an event"; a partner's incomplete correction would silently retract live records), **to achieve** correction semantics that are pure accretion with explicit novelty, **accepting that** a carrier whose corrections genuinely mean "this line no longer exists" mis-states under the default until its feed class is declared — the carrier-x inventory question ("what does a corrected statement omitting a line mean?") is recorded as the trigger.
+
+### D-5 — State mechanics: merge-on-read as DDL law; rebuild is a run mode proven by the same harness; as-of is two different questions — **settled**
+
+In the context of MERGE mechanics, rebuild, and as-of reads (003 §3.4), **we chose**: `write.merge.mode = merge-on-read` is **bootstrap-enforced DDL law** on every state table (errata #9 — copy-on-write silently loses the no-op signal, so the property is structural, not convention); **full rebuild is a framework run mode** — recompute state from all facts through the same fold, atomically swapped — kept *operational* by construction: the D-3 property test (`fold(all) ≡ incremental`, spine suite) is exactly the rebuild-equivalence proof, so every CI run re-earns the claim "state is disposable"; and **as-of splits into its two honest questions** — *as-of perception* (what did state look like after batch N) is Iceberg time travel plus the ledger's batch→snapshot mapping; *as-of business time* (what was true for period P) is a query over facts — D-1's bi-temporal-lite boundary restated as the consumer contract, **rejecting** any pretense that state tables answer business-time history (they answer "newest assertion," nothing else), **to achieve** a state layer whose loss is an inconvenience, never an event, **accepting that** merge-on-read shifts cost to readers between compactions — 008's maintenance ground, cadence already registered there.
+
+### D-6 — Write paths are stage-scoped IAM law; operational corrections are batches, never DML — **settled**
+
+In the context of fact- and state-table grants (003 §3.4; 002 §9 extended), **we chose**: fact tables append-only with **commit as the sole writer**; state tables with **fold as the sole MERGE principal**; consumers read-only on both (the published interfaces — raw and quarantine stay stage-scoped per 005 D-10); no principal — none — holds UPDATE or DELETE on fact tables, with maintenance's narrow delete grant (compaction, snapshot expiration) isolated to 008's role [S-12], never a pipeline grant; and **the incident-cleanup path stated as law**: an operational correction is a *batch* — a correction feed class entering through registration, admission, and commit like any delivery, leaving lineage, ledger rows, and facts — **and rejected** break-glass DML ("convenient" UPDATEs during incidents are the erosion vector 001 names; every one converts facts from values into places and ends the replay guarantee retroactively), **to achieve** immutability by construction on the tables the whole model rests on, **accepting that** incident remediation is slower than table surgery — deliberately: the speed of `UPDATE` is exactly the speed at which the system of record stops being one.
+
+*(Decision record complete for v0.5; new decisions enter as D-7… if the critique pass or the carrier inventory reopens ground.)*
+
+---
+
+## 5. Work List — the decision clusters, in proposed settlement order
+
+### 5.1 Canonicalization & `content_hash` — **settled as D-1**
+
+Coverage, exclusions, the two-times split, vector alignment, and `record_key` derivation all in D-1. Residue moved where it belongs: source-timestamp definition → §5.4; `record_key` composition detail → 007.1.
+
+### 5.2 Dedup & the `delta_filter` seam — **settled as D-2**
+
+Within-batch value identity, divergent-duplicate handling, predecessor-batch delta target, fail-open principle, seam contract — all in D-2. 006 §6.1 attribution unblocked. Residue: ordering interpretation → §5.4; supersession boundary detail → §5.3.
+
+### 5.3 Delta detection vs. supersession (Track E) — **settled as D-4**
+
+Accretion default, absence-asserts-nothing, the full-restatement override deferred to its feed class. Carrier inventory question recorded as the trigger.
+
+### 5.4 The fold contract — **settled as D-3**
+
+Total order, source-timestamp definition, grain law, intra-batch reduce, NULL-`domain_id` demotion, custom-fold bind refusal with the two-tier contract shape and the projection-boundary litmus — all in D-3. Residue: explicit-retraction (deletion) semantics → §5.3/Track E; proof-harness placement detail → 007.1.
+
+### 5.5 MERGE mechanics, rebuild, as-of — **settled as D-5**
+
+Merge-on-read as bootstrap-enforced law, rebuild proven by the D-3 harness, the two as-of questions split. MERGE plan detail → 007.1.
+
+### 5.6 Grants & write path — **settled as D-6**
+
+Stage-scoped writers as IAM law; corrections are batches; break-glass DML rejected with its cost named.
+
+---
+
+## 6. Related Documents
+
+**001** §3.3/§3.7/§5 · **003** §3.4 · **004 v1.1 / 004.1 v0.3 + errata notes** — I-11, [T-11]/[T-12]/[H-6], merge-on-read precondition, R-07 · **005/005.1** — canonical-JSON vectors, tagged-JSON convention, `row_hash` precedent · **006 v0.4** — D-1 (declared checks), D-4 (the handed surfaces this doc ratifies) · **002.1** — supersession ledger (Track E interplay) · **008, 009, 011** — receive this doc's register when it exists.
