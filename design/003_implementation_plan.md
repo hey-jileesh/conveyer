@@ -40,8 +40,8 @@ Each takes the 002 pattern: architecture doc (`00N`) then LLD (`00N.1`) when imp
 | Phase | Deliverable | Design docs | Depends on | What it proves |
 |---|---|---|---|---|
 | **1** | Stage sequence: spine + four clusters | **004–008** (+ `.1` LLDs) | 002 (done) | Identity pipeline runs end-to-end from a fixture delivery; reruns are no-ops; kill/restart converges |
-| **2** | Pipeline package contract + first real pipeline (commission statements) | **009** | Phase 1 | Thin-package model works on real data; template extracted from a working example (001 §10.1) |
-| **3** | Second pipeline (renewal statements) + generation spec ("skill") | **010** | Phase 2 | Abstraction test: two pipelines, one contract, no special cases; agents can stamp out pipelines (001 §8) |
+| **2** | Pipeline package contract + first real pipeline (carrier-x reference feed) | **009** | Phase 1 | Thin-package model works on real data; template extracted from a working example (001 §10.1) |
+| **3** | Second pipeline (carrier-y reference feed) + generation spec ("skill") | **010** | Phase 2 | Abstraction test: two pipelines, one contract, no special cases; agents can stamp out pipelines (001 §8) |
 | **4** | Cross-materialization to `domainDB` | **011** | Phase 2 | Publish seam feeds operational serving (001 §13.3) |
 | **5** | Quarantine remediation workflow | **012** | Phase 1 | "Errors as data" closes its loop: queue, ownership, SLA (001 §13.1) |
 | **6** | Scale proof: SG backfill + Glue→EMR thresholds | **013** | Phase 3 | Cost/volume story; declared placement criteria (001 §13.4) |
@@ -107,11 +107,11 @@ The execution context and stage protocol. Decisions to settle:
 
 ## 4. Phase 2 — Pipeline Package + First Pipeline (doc 009)
 
-Freeze the package contract (001 §7: `pipeline.yaml`, schemas, `transforms.py`, golden tests) by building the commission-statements pipeline against the real `carrier-x` feed. IaC: merging `pipeline.yaml` provisions job, Step Functions, EventBridge rule, grants.
+Freeze the package contract (001 §7: `pipeline.yaml`, schemas, `transforms.py`, golden tests) by building the exemplar pipeline against the real `carrier-x` feed. IaC: merging `pipeline.yaml` provisions job, Step Functions, EventBridge rule, grants.
 
 **Done when:** SFTP fixture → landing → facts → current state → `batch-completed` in a deployed environment; golden tests green in CI without AWS; package tree matches 001 §7 with nothing extra.
 
-**Decisions:** `pipeline.yaml` schema (FeedConfig analog); schema format/home for contracts — needs Track A's provisional answer; `record_key` + `fact_type` taxonomy for commissions tied to the Event Model; golden-fixture format shared with ingestion's conventions.
+**Decisions:** `pipeline.yaml` schema (FeedConfig analog); schema format/home for contracts — needs Track A's provisional answer; `record_key` + `fact_type` taxonomy for the carrier-x feed tied to the Event Model; golden-fixture format shared with ingestion's conventions.
 
 ---
 

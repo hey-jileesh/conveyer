@@ -132,7 +132,7 @@ Merge-on-read as bootstrap-enforced law, rebuild proven by the D-3 harness, the 
 
 Stage-scoped writers as IAM law; corrections are batches; break-glass DML rejected with its cost named.
 
-### 5.7 Feed-onboarding gates for the commissions pipeline (re-scoped 2026-08-20 — no longer doc gates)
+### 5.7 Feed-onboarding gates for the carrier-x exemplar pipeline (re-scoped 2026-08-20 — no longer doc gates)
 
 Neither of this doc's two carrier questions can change a settled decision — each selects which *already-designed* path applies to the feed — so both move from v1.0 gates to **Phase 2 build gates** (006 §6.4's re-scoping; the falsifier that could have reopened ground is discharged there):
 
