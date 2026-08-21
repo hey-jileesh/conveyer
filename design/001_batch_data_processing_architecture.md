@@ -18,7 +18,7 @@ The Data Intelligence Layer processes change through two lanes:
 | **Event lane** *(existing, as-is doc)* | Domain command processor (interceptor pipeline) | Milliseconds — interactive commands, event-driven workflow | Per-command validation, immediate ack, live snapshot freshness | MongoDB event store + change streams + `domainDB` |
 | **Batch lane** *(this document)* | Framework-run Spark jobs (Glue / EMR Serverless) | Seconds to minutes — files, feeds, backfills, high-volume history | Cost per TB, throughput, replay at scale, analytical co-location | Iceberg on S3 under SageMaker Lakehouse governance |
 
-**Routing rule per dataset:** does anything downstream need this change reflected in under a second? Event lane. Is seconds-to-minutes acceptable? Batch lane. Typical batch-lane residents: renewal and commission statement files, membership history, AOR/client-summary feeds, SG/LG backfills, and any historical replay.
+**Routing rule per dataset:** does anything downstream need this change reflected in under a second? Event lane. Is seconds-to-minutes acceptable? Batch lane. Typical batch-lane residents: carrier statement files, membership history, AOR/client-summary feeds, SG/LG backfills, and any historical replay.
 
 **What is shared, not forked:** the event/fact taxonomy and contracts (owned by the *Event Model* document), the **domain-id (aggregate-root id)** as the identity anchor, and business-rule definitions for any domain touched by both lanes. The lanes are two runtimes of one model — not two models.
 
@@ -63,7 +63,7 @@ The batch lane inherits the defining characteristics of the operational architec
 
 **3.9 Native analytical co-location.** Facts and current state land governed in the lakehouse. The analytical spoke consumes them directly under the same catalog and permission model — no sync hop for batch-lane data.
 
-**3.10 Domain-scoped aggregates.** Facts carry the same domain-id (aggregate-root id) as the event lane, so batch-lane facts and event-lane events join on the same aggregate (e.g., a commission fact and a quote-saved event on one client lifecycle).
+**3.10 Domain-scoped aggregates.** Facts carry the same domain-id (aggregate-root id) as the event lane, so batch-lane facts and event-lane events join on the same aggregate (e.g., a carrier-statement fact and a quote-saved event on one client lifecycle).
 
 ---
 
@@ -171,7 +171,7 @@ The framework is designed so that the implementation surface — pure functions 
 
 ## 10. Sequencing
 
-1. **Runner + first real pipeline end-to-end** — commission or renewal files (already batch, already needed). Extract the template from the working example, not from a vacuum.
+1. **Runner + first real pipeline end-to-end** — the carrier-x or carrier-y reference feed (already batch, already needed). Extract the template from the working example, not from a vacuum.
 2. **Second pipeline** (the other of the two) validates the template and the generation spec.
 3. **SG backfill as the third pipeline** — proves the scale story and connects Small Group into the lifecycle dataset.
 
