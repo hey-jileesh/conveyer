@@ -1,0 +1,26 @@
+[
+  {
+    "value": {
+      "agent_code": null,
+      "statement_period": "2026-07"
+    },
+    "canonical": "{\"agent_code\":null,\"statement_period\":\"2026-07\"}",
+    "sha256": "69529fcaa8510ad7bc5b02fb07429bf8fb430a8af447616f12923b0cf5b68acc"
+  },
+  {
+    "value": {
+      "agent_code": "",
+      "statement_period": "2026-07"
+    },
+    "canonical": "{\"agent_code\":\"\",\"statement_period\":\"2026-07\"}",
+    "sha256": "639bfeca7eabc4ca0d9b7521063dbe0db7a734df64029ab54c3e82a38400be74"
+  },
+  {
+    "value": {
+      "agent_code": "null",
+      "statement_period": "2026-07"
+    },
+    "canonical": "{\"agent_code\":\"null\",\"statement_period\":\"2026-07\"}",
+    "sha256": "5939e3fe556beb2c65406fa900cb00e8ec0564f092b46391c2e78c49ae32167d"
+  }
+]

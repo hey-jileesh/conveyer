@@ -1,0 +1,59 @@
+[
+  {
+    "value": {
+      "policy_no": "POL-0042"
+    },
+    "canonical": "{\"policy_no\":\"POL-0042\"}",
+    "sha256": "f368d57407412a0b6a05c15d6140e2a6b91b0c341b283f94bdccb7a4dc7add37"
+  },
+  {
+    "value": {
+      "statement_period": "2026-07",
+      "agent_code": "A7"
+    },
+    "canonical": "{\"agent_code\":\"A7\",\"statement_period\":\"2026-07\"}",
+    "sha256": "9a88c5e29f3797a15f246b69fd9dda327f986dfe20fcd4c7c8f145bf39c1e804"
+  },
+  {
+    "value": {
+      "line_no": 7
+    },
+    "canonical": "{\"line_no\":7}",
+    "sha256": "13f80f2499ddf0ea78194cdbabfb24e96b2173202013c005fa9403f4efc0e054"
+  },
+  {
+    "value": {
+      "line_no": "7"
+    },
+    "canonical": "{\"line_no\":\"7\"}",
+    "sha256": "3f305dd6411a6c0d596e4b39d451c47f7189cc05a7cdb790f0ee4dee0b390211"
+  },
+  {
+    "value": {
+      "agent_code": "x"
+    },
+    "canonical": "{\"agent_code\":\"x\"}",
+    "sha256": "cccc45f70725f346e3033a3dd01e20133c60d18685ceea3541c9b08c787ac5e5"
+  },
+  {
+    "value": {
+      "agent_id": "x"
+    },
+    "canonical": "{\"agent_id\":\"x\"}",
+    "sha256": "1a4d22f6bda5805a194e294dd380833a9ebae0bf9f89dcef906869aaba12384e"
+  },
+  {
+    "value": {
+      "flag": true
+    },
+    "canonical": "{\"flag\":true}",
+    "sha256": "2a8199939ad03f40b3086f82c20981e00cff6eabe05aa9d2aac65dbb068306f8"
+  },
+  {
+    "value": {
+      "flag": "true"
+    },
+    "canonical": "{\"flag\":\"true\"}",
+    "sha256": "29027e2b073b23263953200ce8aa87180bee7fc0b3059b876c44f1a113dfe8ef"
+  }
+]
