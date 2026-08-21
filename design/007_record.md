@@ -1,7 +1,7 @@
 # Record
-## `commit` and `fold` — Architecture Description (Draft)
+## `commit` and `fold` — Architecture Description
 
-**Status:** Draft v0.7 (v0.6: cross-refs to 006 D-6, §5.7 gate; v0.7: critique pass, 2026-08-10 — 3 findings integrated: the two-read predecessor set and honest race residual (D-2), the consumption-stated projection litmus (D-3), the unstamped-MERGE ruling (D-5, new §3 row); 3 notes named in D-1/D-3) — D-1–D-6 settled; work list fully discharged; v1.0 gated on the carrier-x inventory (006 §6.4 — two of the three questions are this doc's, §5.7) · **Parent:** *001 Batch Data Processing Architecture* (§3.3, §3.7, §5) · **Plan:** 003 §3.4 · **Spine:** 004 v1.1 / 004.1 v0.3 + errata notes (guarded commits, single-flight, I-11's MERGE mechanics — normative, unaltered here) · **Siblings:** 006 (co-drafted candidate-fact seam — D-4's declared surfaces arrive here for ratification), 005/005.1 (canonical-JSON vectors, row_hash precedent), 008 (maintenance, payload freeze), 002.1 (supersession / Track E) · **Position:** stages 6–7; the boundary where candidate facts become durable facts, and facts become current state · **Pattern:** remember (facts) + derive (state); the fold is disposable, the facts are not
+**Status:** **v1.0** (2026-08-20) — D-1–D-6 settled; work list fully discharged · Draft history: v0.5 decision record complete; v0.6 cross-refs + gate; v0.7 critique pass (3 findings: the two-read predecessor set + honest race residual D-2, the consumption-stated projection litmus D-3, the unstamped-MERGE ruling D-5; 3 notes in D-1/D-3); v1.0 gate re-scoped — the falsifier discharged in 006 D-1, this doc's two questions become Phase 2 feed-onboarding gates (§5.7) · **Parent:** *001 Batch Data Processing Architecture* (§3.3, §3.7, §5) · **Plan:** 003 §3.4 · **Spine:** 004 v1.1 / 004.1 v0.3 + errata notes (guarded commits, single-flight, I-11's MERGE mechanics — normative, unaltered here) · **Siblings:** 006 (co-drafted candidate-fact seam — D-4's declared surfaces arrive here for ratification), 005/005.1 (canonical-JSON vectors, row_hash precedent), 008 (maintenance, payload freeze), 002.1 (supersession / Track E) · **Position:** stages 6–7; the boundary where candidate facts become durable facts, and facts become current state · **Pattern:** remember (facts) + derive (state); the fold is disposable, the facts are not
 
 > **Conventions.** Positions will be recorded as decisions **D-n** in Y-statement form (005/006's convention). Every received obligation is recorded in §3 and cited where it lands. Detail belonging to an LLD (007.1) or another cluster doc is named and deferred, not sketched.
 
@@ -132,12 +132,17 @@ Merge-on-read as bootstrap-enforced law, rebuild proven by the D-3 harness, the 
 
 Stage-scoped writers as IAM law; corrections are batches; break-glass DML rejected with its cost named.
 
-### 5.7 The v1.0 gate — the carrier-x inventory (this doc's two questions)
+### 5.7 Feed-onboarding gates for the commissions pipeline (re-scoped 2026-08-20 — no longer doc gates)
 
-Recorded with 006's rule-inventory falsifier in 006 §6.4 — one inquiry, three questions, because all three go to the same carrier conversation. This doc's two: **correction-omission semantics** (D-4's trigger — a corrected statement omits a line the original carried: does that assert nothing, or retract?) and **restatement vs. increment** (D-3's trigger — does any feed deliver increments to integrate rather than complete assertions of domain state?). The critique pass does not wait on these; v1.0 does — each deferral is closable only by its answer.
+Neither of this doc's two carrier questions can change a settled decision — each selects which *already-designed* path applies to the feed — so both move from v1.0 gates to **Phase 2 build gates** (006 §6.4's re-scoping; the falsifier that could have reopened ground is discharged there):
+
+- **Correction-omission intent** (D-4): round 1 (2026-08-20) shows replace-style mechanics in the incumbent system — behaves as complete replacement, full-file corrections implied; intent unconfirmed. If the business confirms (b), D-4's named full-restatement override activates for this feed class, exactly as deferred; if (a), the default holds. Either way D-4 stands.
+- **Restatement vs. increment** (D-3): landed **mixed, confirmed** — adjustment lines coexist with restatements, identified by transaction subtype/category, never by amount sign. This activates the domain-grain session D-3 plans for (`conveyer-p3g`): re-grain adjustment lines to complete-at-line-grain (keeping default LWW — pursued first), or open the custom-fold contract design task. Prerequisite: negative-line semantics (reversal vs. genuinely negative — a business answer, `conveyer-frj` round 2).
+
+The Q2×Q3 pairing — complete-replacement corrections over adjustment lines, i.e. reversal-under-supersession — is one design input, sequenced: confirm Q2 intent → grain session → only then the custom-fold decision.
 
 ---
 
 ## 6. Related Documents
 
-**001** §3.3/§3.7/§5 · **003** §3.4 · **004 v1.1 / 004.1 v0.3 + errata notes** — I-11, [T-11]/[T-12]/[H-6], merge-on-read precondition, R-07 · **005/005.1** — canonical-JSON vectors, tagged-JSON convention, `row_hash` precedent · **006 v0.7** — D-1 (declared checks), D-4 (the handed surfaces this doc ratifies), D-6 (attribution — the enablement this doc's D-2 granted, consumed) · **002.1** — supersession ledger (Track E interplay) · **008, 009, 011** — receive this doc's register when it exists.
+**001** §3.3/§3.7/§5 · **003** §3.4 · **004 v1.1 / 004.1 v0.3 + errata notes** — I-11, [T-11]/[T-12]/[H-6], merge-on-read precondition, R-07 · **005/005.1** — canonical-JSON vectors, tagged-JSON convention, `row_hash` precedent · **006 v1.0** — D-1 (declared checks), D-4 (the handed surfaces this doc ratifies), D-6 (attribution — the enablement this doc's D-2 granted, consumed) · **002.1** — supersession ledger (Track E interplay) · **008, 009, 011** — receive this doc's register when it exists.
