@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | Proposed — input to `conveyer-hpp.13`; to be ruled **jointly with OQ-5** (run-ledger grain), per the DC-1 register row in 006.1 §16.2 |
+| **Status** | **Accepted** (2026-08-29) — via the joint ruling: ADR-OQ5's adoption (`design/adr-oq5-batch-progress-grain.md`, Option D) settles the marker schema at the guard grain under invariants L-1…L-4, discharging the DC-1 joint-ruling requirement |
 | **Date** | 2026-08-26 |
 | **Reviewed** | 2026-08-26 — argument form confirmed (a disqualification from failure-mode shape, not a robustness preference); hardened with invariants **M-1…M-3** and the Option-0 reframe below |
 | **Decision owners** | The 007.1-completion session (`conveyer-hpp.13`); 008 co-owns the consuming mechanics |
@@ -78,7 +78,7 @@ These are part of the proposal, not implementation advice: each closes a path by
 
 - **M-1 — Facts, not a pointer.** Marker rows are append-only facts under the same IAM regime as the fact tables; "latest completed" is a derived read, never a stored/updated value. If a marker row can be UPDATEd, the table has become a mutable pointer — value re-complected with time — and the silent-staleness hole returns through the back door.
 - **M-2 — Ordering is data-borne, never wall-clock.** "Latest" is ordered by something in the data — ingestion's delivery sequence carried onto the batch — with `committed_at` as provenance only. Ordering two near-simultaneous completions of one feed by timestamp is timestamp-as-truth: it re-imports the concurrent-sibling residual this option claims to narrow. This ordering choice is part of the OQ-5 joint ruling.
-- **M-3 — Retention is load-bearing; writes are guard-idempotent.** Pruning may remove rows *strictly older than* each feed's latest completed row, never the frontier — a pruned frontier reconstructs Option A's invisible loss mode inside Option B. And marker writes carry the same idempotency-key discipline as the guarded appends they sit beside (the guard idiom supplies it; the ruling must state it rather than assume it), so a rerun of a killed commit is a no-op. *(Strengthened by ADR-OQ2 N-4: while the Track E coherence probe consumes this table's `delivery_key`/`delivery_content_hash` columns, the frontier rule is not enough — the table is never pruned in Phase 1, and if retention is ever introduced, a probe lookback exceeding the horizon reads as unknown ⇒ refuse to drop.)*
+- **M-3 — Retention is load-bearing; writes are guard-idempotent.** Pruning may remove rows *strictly older than* each feed's latest completed row, never the frontier — a pruned frontier reconstructs Option A's invisible loss mode inside Option B. And marker writes carry the same idempotency-key discipline as the guarded appends they sit beside (the guard idiom supplies it; the ruling must state it rather than assume it), so a rerun of a killed commit is a no-op. *(Strengthened by ADR-OQ2 N-4: while the Track E coherence probe consumes this table's `delivery_key`/`delivery_content_hash` columns, the frontier rule is not enough — the table is never pruned in Phase 1, and if retention is ever introduced, a probe lookback exceeding the horizon reads as unknown ⇒ refuse to drop. Strengthened by ADR-OQ5 L-2: the write order inside commit is **marker-first** — no fact append may precede its marker row — so a killed attempt leaves marker-without-facts, over-refusal in the permitted direction, and probe soundness never depends on a rerun occurring.)*
 
 ## Consequences
 
