@@ -1,0 +1,110 @@
+[
+  {
+    "value": {
+      "k1": "a|b",
+      "k2": "c"
+    },
+    "canonical": "{\"k1\":\"a|b\",\"k2\":\"c\"}",
+    "sha256": "7c1d2aa43b48187bfb61f68ab98e0b587f93d2d6c0263efbde132c7ef7588696"
+  },
+  {
+    "value": {
+      "k1": "a",
+      "k2": "b|c"
+    },
+    "canonical": "{\"k1\":\"a\",\"k2\":\"b|c\"}",
+    "sha256": "9ea1b27d533d6300e858ca2e52925c316a608f58e54f9bde8b57917751f00efa"
+  },
+  {
+    "value": {
+      "k1": "a\",\"k2\":\"b"
+    },
+    "canonical": "{\"k1\":\"a\\\",\\\"k2\\\":\\\"b\"}",
+    "sha256": "f2744eee1cac5501297f0e7ec5c8010c20109535173b8789941c897edbc9850c"
+  },
+  {
+    "value": {
+      "name": "🀄"
+    },
+    "canonical": "{\"name\":\"🀄\"}",
+    "sha256": "35f11d5cff9c09d0e1edaf7299d0d120482ea6cffeb60136c4c330f15a376ae0"
+  },
+  {
+    "value": {
+      "name": "�"
+    },
+    "canonical": "{\"name\":\"�\"}",
+    "sha256": "a4abf994709b6764b36b971cdbdb065f17f00cbb5d5182a21d7a508c3b320a79"
+  },
+  {
+    "value": {
+      "amount": {
+        "$decimal": "1.2"
+      }
+    },
+    "canonical": "{\"amount\":\"1.2\"}",
+    "sha256": "73d51ba73c0d63bf67c6dc33876f1c001d5906f519588c26a6f3c0df7f68b2a0"
+  },
+  {
+    "value": {
+      "amount": {
+        "$decimal": "1.20"
+      }
+    },
+    "canonical": "{\"amount\":\"1.20\"}",
+    "sha256": "10fbb0e3a42471a434fc54b3768b66682b46c62b22207fa1b1facb285f675f3f"
+  },
+  {
+    "value": {
+      "as_of": {
+        "$date": "2026-06-30"
+      }
+    },
+    "canonical": "{\"as_of\":\"2026-06-30\"}",
+    "sha256": "a618ddd59ed9d47e031db749d3acfa0b1c0e7530c35fa3754b1e5bbba4b82b76"
+  },
+  {
+    "value": {
+      "seen_at": {
+        "$timestamp": "2026-01-02T03:04:05-05:00"
+      }
+    },
+    "canonical": "{\"seen_at\":\"2026-01-02T08:04:05.000000Z\"}",
+    "sha256": "b60750c83c919b1e83760da3920e16da8b657c66d392ef36fe5bafd224a47f3d"
+  },
+  {
+    "value": {
+      "seq": 9223372036854775807
+    },
+    "canonical": "{\"seq\":9223372036854775807}",
+    "sha256": "a0453eeb2ff17364ca0afe90ec662c9c971333a799fd9eac68527c41b1d58380"
+  },
+  {
+    "value": {
+      "line_no": -7
+    },
+    "canonical": "{\"line_no\":-7}",
+    "sha256": "d04534e8aff8dcd2cb4afacfed0142c4a4aaf9c20aef7db137b64ed66c7d9e48"
+  },
+  {
+    "value": {
+      "seq": -9223372036854775808
+    },
+    "canonical": "{\"seq\":-9223372036854775808}",
+    "sha256": "9640a06d1936cb881e7d9a337a159a0e01851e896de88794884fa1596dbfe985"
+  },
+  {
+    "value": {
+      "name": "\u00e9"
+    },
+    "canonical": "{\"name\":\"\u00e9\"}",
+    "sha256": "2f16b8477146a1b2ba7d6bb7cf7c9979c191cc2838a107dbf5f0d920b4cb3ba1"
+  },
+  {
+    "value": {
+      "name": "e\u0301"
+    },
+    "canonical": "{\"name\":\"e\u0301\"}",
+    "sha256": "6a547588c4055916e090ed61467326046dd52810679d03bfb84d862a7123522e"
+  }
+]
