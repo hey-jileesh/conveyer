@@ -115,6 +115,8 @@ The framework runner executes a **fixed stage sequence**; a pipeline package sup
 
 **Fact table baseline schema:** `domain_id`, `aggregate_seq` / event-time, `fact_type`, `batch_id`, `record_key`, `content_hash`, source lineage, payload (typed struct) — partitioned by `bucket(domain_id)` plus a time dimension.
 
+> **Erratum (2026-08-30 — 007.1 F-3, per `design/adr-oq6-fact-partition-spec.md`, Accepted):** the partition clause above is **superseded for fact tables**. Every correctness-path fact-table read (commit guards, fact-presence doors, `read_batch`, delta predecessor reads, rerun anti-joins) is `batch_id`-keyed, so fact tables — and 007.1's batch-marker table — partition **`identity(batch_id)`**: absent-batch probes become metadata-only misses, and the compaction-clustering discipline dissolves structurally (each partition receives exactly one append and is never written again). The `bucket(domain_id)` + time instinct is **re-aimed, not refuted**: it describes the domain-keyed *perception* profile, which lives on the state tables — where 007.1 F-3 weighs it on its own merits and rules unpartitioned-with-sort-order (its PS-3: facts and state never share a layout by analogy). Occasional analytical reads over facts ride Iceberg column stats, with additive partition-spec evolution reserved under 008's cardinality review.
+
 ---
 
 ## 7. Pipeline Package — The Unit of Implementation
