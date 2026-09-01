@@ -310,8 +310,20 @@ def test_header_false_contract_with_a_required_column_is_rejected_at_spec_parse(
             transforms_module="pipelines.reader_probe.transforms",
             raw_table="db.reader_probe__raw",
             quarantine_table="db.reader_probe__quarantine",
-            fact_table="db.reader_probe__facts",
-            state_table="db.reader_probe__state",
+            # 006.1 P-1: singular fact_table/state_table replaced by a
+            # per-type `fact_types` mapping -- this fixture just needs SOME
+            # valid declaration, not to exercise fact-type semantics.
+            fact_types={
+                "probe": {
+                    "fact_table": "db.reader_probe__facts",
+                    "state_table": "db.reader_probe__state",
+                    "schema": {
+                        "columns": [{"name": "domain_id", "type": "string"}],
+                        "domain_id_col": "domain_id",
+                        "record_key": ["domain_id"],
+                    },
+                }
+            },
             fold="default-lww",
             domain_id_col="domain_id",
             co_effects={},

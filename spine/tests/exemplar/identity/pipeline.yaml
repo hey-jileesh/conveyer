@@ -1,4 +1,4 @@
-# Identity exemplar — deployed-shape PipelineSpec (LLD §12.2, §6.2).
+# Identity exemplar — deployed-shape PipelineSpec (LLD 006.1 §4/§12.2, 004.1 §6.2).
 #
 # The DEPLOYED shape: real table names per §5's `<db>.<slug>__<suffix>`
 # convention. Scenario tests (tests/integration/test_scenarios_core.py)
@@ -7,12 +7,31 @@
 # is to prove the deployed shape itself parses cleanly into `PipelineSpecModel`
 # (a dedicated test asserts exactly that), so both the "authored" and
 # "exercised" shapes stay honest with each other.
+#
+# 006.1 P-1 migration (bead conveyer-6pg.13, B3): the singular
+# `fact_table`/`state_table` fields are replaced by the per-type `fact_types`
+# mapping; `checks:` declares the (empty, for this clean variant) business
+# rules surface.
 pipeline: pipelines/identity
 transforms_module: pipelines.identity.transforms
 raw_table: conveyer_dev_lake.identity__raw
 quarantine_table: conveyer_dev_lake.identity__quarantine
-fact_table: conveyer_dev_lake.identity__facts
-state_table: conveyer_dev_lake.identity__state
+fact_types:
+  identity:
+    fact_table: conveyer_dev_lake.identity__facts
+    state_table: conveyer_dev_lake.identity__state
+    schema:
+      columns:
+        - name: domain_id
+          type: string
+        - name: event_time
+          type: string
+        - name: payload
+          type: string
+      domain_id_col: domain_id
+      record_key: [domain_id]
+checks:
+  checks: []
 fold: default-lww
 domain_id_col: domain_id
 co_effects: {}

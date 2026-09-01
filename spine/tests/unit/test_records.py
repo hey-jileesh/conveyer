@@ -5,8 +5,10 @@ subclass and the ONLY exception type this module defines; `MergeResult` is a
 frozen dataclass with the `(snapshot_id, summary, attributable)` shape (the
 third field, nvh.40 [F1], defaults `True` -- distinguishing an unattributable
 own-commit resolution from a logical no-op, both `(None, None)` otherwise);
-`RunnerFx` is a frozen dataclass carrying exactly §7.6's full field list and
-is constructible from plain callables (record-of-functions, no framework).
+`RunnerFx` is a frozen dataclass carrying exactly §7.6's full field list --
+additively extended by 007.1 §4.3/§6.3's five marker read/write callables
+(F-9, bead conveyer-6pg.21, B9b) -- and is constructible from plain
+callables (record-of-functions, no framework).
 """
 
 from __future__ import annotations
@@ -57,9 +59,17 @@ _EXPECTED_FIELDS = {
     "read_table",
     "read_batch",
     "table_has_batch",
+    "describe_table",
     "append",
     "merge",
     "resolve_batch_snapshot",
+    # 007.1 §4.3/§6.3 (F-9, bead conveyer-6pg.21, B9b): the marker table's
+    # own read/write effects, additive.
+    "marker_row_present",
+    "append_marker_row",
+    "read_marker_completions",
+    "read_marker_presence",
+    "read_marker_target",
     "record_run",
     "emit",
     "now",
@@ -78,9 +88,15 @@ def test_runner_fx_is_frozen_and_constructible_from_plain_callables() -> None:
         read_table=lambda t: ("df", 1),
         read_batch=lambda t, b: "df",
         table_has_batch=lambda t, b, k: False,
+        describe_table=lambda t: None,
         append=lambda t, df, batch_id, stage_key: (0, {}),
         merge=lambda spec, df: MergeResult(None, None),
         resolve_batch_snapshot=lambda t, b, k: None,
+        marker_row_present=lambda t, b, s, n: False,
+        append_marker_row=lambda t, write: None,
+        read_marker_completions=lambda t, feed_id: (),
+        read_marker_presence=lambda t, feed_id: (),
+        read_marker_target=lambda t, b: (),
         record_run=lambda rf: None,
         emit=lambda dt, model: None,
         now=lambda: datetime.now(UTC),

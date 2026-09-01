@@ -18,7 +18,7 @@ from pyspark.sql.types import (
     StructField,
     StructType,
 )
-from spine.core.model import ColumnSpec, RawContractModel
+from spine.core.model import ColumnSpec, FactColumnSpec, FactSchemaModel, RawContractModel
 from spine.frames import checks
 
 _SCHEMA = StructType(
@@ -37,59 +37,10 @@ def _sample(spark: SparkSession):
     )
 
 
-# --- violation_subtraction: multiplicity-preserving bag subtraction [C-8] ---
-
-
-def test_violation_subtraction_count_identity_no_duplicates(spark: SparkSession) -> None:
-    candidate = spark.createDataFrame([("a", 1), ("b", 2), ("c", 3)], ["k", "v"])
-    violations = spark.createDataFrame([("b", 2)], ["k", "v"])
-
-    admitted = checks.violation_subtraction(candidate, violations)
-
-    assert sorted((r["k"], r["v"]) for r in admitted.collect()) == [("a", 1), ("c", 3)]
-    assert candidate.count() == admitted.count() + violations.count()
-
-
-def test_violation_subtraction_preserves_multiplicity_of_duplicate_rows(
-    spark: SparkSession,
-) -> None:
-    # 3 identical (a, 1) rows in candidate; only 2 flagged as violations ->
-    # exactly 1 copy of (a, 1) must remain admitted (bag subtraction, not a
-    # naive value-based anti-join which would remove all 3).
-    candidate = spark.createDataFrame([("a", 1), ("a", 1), ("a", 1), ("b", 2)], ["k", "v"])
-    violations = spark.createDataFrame([("a", 1), ("a", 1)], ["k", "v"])
-
-    admitted = checks.violation_subtraction(candidate, violations)
-    rows = sorted((r["k"], r["v"]) for r in admitted.collect())
-
-    assert rows == [("a", 1), ("b", 2)]
-    assert candidate.count() == admitted.count() + violations.count()
-
-
-def test_violation_subtraction_over_supplied_violations_saturates_at_zero(
-    spark: SparkSession,
-) -> None:
-    # violations claims MORE copies of (a, 1) than candidate actually has --
-    # a contract-violating input (violations must be a genuine subset), but
-    # violation_subtraction must still be a total function, never raise.
-    candidate = spark.createDataFrame([("a", 1), ("a", 1), ("b", 2)], ["k", "v"])
-    violations = spark.createDataFrame([("a", 1), ("a", 1), ("a", 1), ("a", 1)], ["k", "v"])
-
-    admitted = checks.violation_subtraction(candidate, violations)
-
-    assert sorted((r["k"], r["v"]) for r in admitted.collect()) == [("b", 2)]
-
-
-def test_violation_subtraction_no_shared_columns_returns_candidate_unchanged(
-    spark: SparkSession,
-) -> None:
-    candidate = spark.createDataFrame([("a", 1)], ["k", "v"])
-    violations = spark.createDataFrame([("z",)], ["unrelated"])
-
-    admitted = checks.violation_subtraction(candidate, violations)
-
-    assert sorted((r["k"], r["v"]) for r in admitted.collect()) == [("a", 1)]
-
+# `violation_subtraction` is RETIRED (006.1 P-7(c)/§8.1, bead conveyer-6pg.13,
+# B3) -- its own coverage (multiplicity-preserving bag subtraction, [C-8])
+# is removed here alongside it; see `frames/checks.py`'s own module
+# docstring for the full retirement rationale.
 
 # --- check_count_identity: pure values, never raises ------------------------
 
@@ -581,13 +532,30 @@ def test_zero_failures_never_drops_the_internal_column_before_typed_projection(
 # --- hash_subtraction: post_check's §8.2.4 guard-skip rerun mechanism -------
 
 
+# 006.1 §8.3 (bead conveyer-6pg.13, B3): `candidate_row_hash` now needs a
+# `fact_type` + `FactSchemaModel` (the tag, P-7(b)) -- one shared 3-column
+# schema (`domain_id`/`n`/`payload`, matching every candidate frame below;
+# `hash_subtraction` itself only ever reads `row_hash`, so an extra
+# undeclared `payload` column on the 2-column tests is harmless).
+_HASH_FACT_TYPE = "t"
+_HASH_SCHEMA = FactSchemaModel(
+    columns=[
+        FactColumnSpec(name="domain_id", type="string"),
+        FactColumnSpec(name="n", type="int"),
+        FactColumnSpec(name="payload", type="string"),
+    ],
+    domain_id_col="domain_id",
+    record_key=["domain_id"],
+)
+
+
 def test_hash_subtraction_removes_only_the_durably_hashed_rows(spark: SparkSession) -> None:
     from spine.frames import quarantine
 
     candidate = spark.createDataFrame(
         [("a", 1, "p1"), ("b", 2, "p2"), ("c", 3, "p3")], ["domain_id", "n", "payload"]
     )
-    hashed_candidate = quarantine.candidate_row_hash(candidate)
+    hashed_candidate = quarantine.candidate_row_hash(candidate, _HASH_FACT_TYPE, _HASH_SCHEMA)
     b_hash = hashed_candidate.filter(F.col("domain_id") == "b").select("row_hash").collect()[0][0]
     durable = spark.createDataFrame([(b_hash,)], ["row_hash"])
 
@@ -600,8 +568,8 @@ def test_hash_subtraction_removes_only_the_durably_hashed_rows(spark: SparkSessi
 def test_hash_subtraction_no_durable_hashes_admits_everything(spark: SparkSession) -> None:
     from spine.frames import quarantine
 
-    candidate = spark.createDataFrame([("a", 1)], ["domain_id", "n"])
-    hashed_candidate = quarantine.candidate_row_hash(candidate)
+    candidate = spark.createDataFrame([("a", 1, "p1")], ["domain_id", "n", "payload"])
+    hashed_candidate = quarantine.candidate_row_hash(candidate, _HASH_FACT_TYPE, _HASH_SCHEMA)
     durable = spark.createDataFrame([], schema=StructType([StructField("row_hash", StringType())]))
 
     admitted = checks.hash_subtraction(hashed_candidate, durable)
@@ -617,8 +585,10 @@ def test_hash_subtraction_tolerates_extra_columns_on_durable_row_hashes_frame(
     only its `row_hash` column is read here."""
     from spine.frames import quarantine
 
-    candidate = spark.createDataFrame([("a", 1), ("b", 2)], ["domain_id", "n"])
-    hashed_candidate = quarantine.candidate_row_hash(candidate)
+    candidate = spark.createDataFrame(
+        [("a", 1, "p1"), ("b", 2, "p2")], ["domain_id", "n", "payload"]
+    )
+    hashed_candidate = quarantine.candidate_row_hash(candidate, _HASH_FACT_TYPE, _HASH_SCHEMA)
     a_hash = hashed_candidate.filter(F.col("domain_id") == "a").select("row_hash").collect()[0][0]
     durable_full = spark.createDataFrame([(a_hash, "business/x")], ["row_hash", "reason_code"])
 

@@ -5,8 +5,17 @@ first (M1 scope). `bind_transforms` (M3, bead conveyer-nvh.19) is covered by
 a binding matrix below: missing export, non-callable export, bad arity,
 out-of-namespace module (both a defensive-bypass-of-the-model-validator
 case and a hostile `pipelines.__init__` probe that legitimately passes the
-`pipelines.` grammar), absent fold defaulting to `frames.default_lww_fold`,
-and a broken import raising a clearly-wrapped `ImportError`.
+`pipelines.` grammar), and a broken import raising a clearly-wrapped
+`ImportError`.
+
+**Critique gate wf_24a3125f-ecc F2 (bead conveyer-6pg.31): `Transforms`
+drops `fold`; `bind_transforms` no longer looks for a `fold` export at
+all.** Every test below that used to construct a `Transforms(..., fold=...)`
+or assert fold-defaulting/`spec.fold=="custom"`-WARNING behavior is either
+dropped (the mechanism it covered no longer exists) or trimmed to drop the
+now-nonexistent `fold=` kwarg -- `frames/folds.py` (the v1-era `default_lww_
+fold` machinery this file used to import for the fold-defaulting assertion)
+is deleted outright.
 
 The binding matrix imports real throwaway modules under the REAL `pipelines`
 package's namespace (`spine/pipelines/__init__.py`, ships in the wheel,
@@ -33,6 +42,7 @@ import pipelines
 import pytest
 from spine.binding import Transforms, bind_transforms
 from spine.core.model import (
+    ChecksModel,
     CoEffectDecl,
     ColumnSpec,
     DialectModel,
@@ -43,14 +53,13 @@ from spine.core.model import (
 
 
 def test_transforms_is_a_frozen_record_of_functions() -> None:
-    transforms = Transforms(
-        apply=lambda valid_df, co_effects: valid_df,
-        post_check=lambda candidate_df, co_effects: candidate_df,
-        fold=lambda state_slice, facts_df: facts_df,
-    )
-    assert transforms.apply("valid", {}) == "valid"
-    assert transforms.post_check("candidate", {}) == "candidate"
-    assert transforms.fold("slice", "facts") == "facts"
+    # 006.1 §4.4 (bead conveyer-6pg.13, B3): `Transforms` drops `post_check`;
+    # `apply` now returns a `Mapping[str, DataFrame]`. Critique gate
+    # wf_24a3125f-ecc F2 (bead conveyer-6pg.31): `Transforms` drops `fold`
+    # too -- `apply` is its ONLY field now.
+    transforms = Transforms(apply=lambda valid_df, co_effects: {"t": valid_df})
+    assert transforms.apply("valid", {}) == {"t": "valid"}
+    assert not hasattr(transforms, "fold")
     with pytest.raises(dataclasses.FrozenInstanceError):
         transforms.apply = lambda a, b: a  # type: ignore[misc]
 
@@ -64,8 +73,21 @@ def _make_spec(**overrides: object) -> PipelineSpecModel:
         transforms_module="pipelines.commissions.transforms",
         raw_table="lake.commissions__raw",
         quarantine_table="lake.commissions__quarantine",
-        fact_table="lake.commissions__facts",
-        state_table="lake.commissions__state",
+        # 006.1 P-1: singular fact_table/state_table replaced by a per-type
+        # `fact_types` mapping -- this fixture just needs SOME valid spec,
+        # not to exercise fact-type semantics (binding.py never reads
+        # fact_types).
+        fact_types={
+            "detail": {
+                "fact_table": "lake.commissions__facts",
+                "state_table": "lake.commissions__state",
+                "schema": {
+                    "columns": [{"name": "domain_id", "type": "string"}],
+                    "domain_id_col": "domain_id",
+                    "record_key": ["domain_id"],
+                },
+            }
+        },
         read={"dialect": {"format": "csv"}},
         raw_contract={"columns": [{"name": "id"}]},
     )
@@ -92,36 +114,32 @@ def temp_pipelines_module(tmp_path: Path) -> Iterator[Path]:
                 del sys.modules[name]
 
 
-def test_bind_transforms_missing_export_raises_clearly(
+def test_bind_transforms_missing_apply_export_raises_clearly(
     temp_pipelines_module: Path,
 ) -> None:
+    # 006.1 §4.4 (bead conveyer-6pg.13, B3): `apply` is the ONLY required
+    # export now -- a module exporting neither is a missing-`apply` defect,
+    # not a missing-`post_check` one (that export is no longer looked for
+    # at all here; a STALE `post_check` export is S4's concern instead,
+    # `core/bind_checks.py`'s own module docstring).
     (temp_pipelines_module / "missing_export.py").write_text(
         textwrap.dedent(
             """
-            def apply(valid_df, co_effects):
-                return valid_df
+            def fold(state_slice, facts_df):
+                return facts_df
             """
         )
     )
     spec = _make_spec(transforms_module="pipelines.missing_export")
 
-    with pytest.raises(AttributeError, match="post_check"):
+    with pytest.raises(AttributeError, match="apply"):
         bind_transforms(spec)
 
 
 def test_bind_transforms_non_callable_export_raises_clearly(
     temp_pipelines_module: Path,
 ) -> None:
-    (temp_pipelines_module / "non_callable.py").write_text(
-        textwrap.dedent(
-            """
-            apply = "not a function"
-
-            def post_check(candidate_df, co_effects):
-                return candidate_df
-            """
-        )
-    )
+    (temp_pipelines_module / "non_callable.py").write_text('apply = "not a function"\n')
     spec = _make_spec(transforms_module="pipelines.non_callable")
 
     with pytest.raises(TypeError, match="apply"):
@@ -133,39 +151,13 @@ def test_bind_transforms_bad_arity_raises_clearly(temp_pipelines_module: Path) -
         textwrap.dedent(
             """
             def apply(valid_df):
-                return valid_df
-
-            def post_check(candidate_df, co_effects):
-                return candidate_df
+                return {"t": valid_df}
             """
         )
     )
     spec = _make_spec(transforms_module="pipelines.bad_arity")
 
     with pytest.raises(TypeError, match="exactly 2 positional"):
-        bind_transforms(spec)
-
-
-def test_bind_transforms_custom_fold_bad_arity_raises_clearly(
-    temp_pipelines_module: Path,
-) -> None:
-    (temp_pipelines_module / "bad_fold_arity.py").write_text(
-        textwrap.dedent(
-            """
-            def apply(valid_df, co_effects):
-                return valid_df
-
-            def post_check(candidate_df, co_effects):
-                return candidate_df
-
-            def fold(state_slice, facts_df, extra):
-                return facts_df
-            """
-        )
-    )
-    spec = _make_spec(transforms_module="pipelines.bad_fold_arity")
-
-    with pytest.raises(TypeError, match=r"fold.*exactly 2 positional"):
         bind_transforms(spec)
 
 
@@ -179,8 +171,8 @@ def test_bind_transforms_rejects_out_of_namespace_module_defensively() -> None:
         co_effects={},
         raw_table="lake.commissions__raw",
         quarantine_table="lake.commissions__quarantine",
-        fact_table="lake.commissions__facts",
-        state_table="lake.commissions__state",
+        fact_types={},  # 006.1 P-1; `model_construct` bypasses validation, shape only
+        checks=ChecksModel(),
         fold="default-lww",
         serialize=False,
         domain_id_col="domain_id",
@@ -196,8 +188,8 @@ def test_bind_transforms_rejects_out_of_namespace_module_defensively() -> None:
 def test_bind_transforms_hostile_pipelines_init_probe_fails_closed() -> None:
     """`pipelines.__init__` legitimately matches the `^pipelines\\.` grammar
     (I-10) and IS importable (it resolves to the real `pipelines` package's
-    own docstring-only init module) -- but that module exports neither
-    `apply` nor `post_check`, so binding still fails closed, clearly."""
+    own docstring-only init module) -- but that module exports no `apply`,
+    so binding still fails closed, clearly."""
     spec = _make_spec(transforms_module="pipelines.__init__")
 
     with pytest.raises(AttributeError, match="apply"):
@@ -216,81 +208,62 @@ def test_bind_transforms_broken_import_raises_import_error_wrapped_clearly(
         bind_transforms(spec)
 
 
-def test_bind_transforms_binds_the_modules_own_callables(
+def test_bind_transforms_binds_the_modules_own_apply(
     temp_pipelines_module: Path,
 ) -> None:
-    (temp_pipelines_module / "good_with_fold.py").write_text(
+    (temp_pipelines_module / "good_apply_only.py").write_text(
         textwrap.dedent(
             """
             def apply(valid_df, co_effects):
-                return valid_df
+                return {"t": valid_df}
+            """
+        )
+    )
+    spec = _make_spec(transforms_module="pipelines.good_apply_only")
 
-            def post_check(candidate_df, co_effects):
-                return candidate_df
+    transforms = bind_transforms(spec)
+
+    assert transforms.apply("valid", {}) == {"t": "valid"}
+    assert not hasattr(transforms, "fold")
+
+
+def test_bind_transforms_ignores_a_module_that_also_exports_fold(
+    temp_pipelines_module: Path,
+) -> None:
+    """Critique gate wf_24a3125f-ecc F2 (bead conveyer-6pg.31): `bind_
+    transforms` no longer looks for a `fold` export at all -- binding
+    succeeds identically whether or not the module happens to define one,
+    the SAME asymmetric "not looked for, not refused here" contract S4
+    already gives a stale `post_check` export (this module's own
+    docstring). A module still exporting `fold` is a bind-defect (`stale-
+    fold-export`), but that refusal is `core/bind_checks.py`'s concern,
+    exercised in `tests/unit/test_bind_checks.py`/`test_bind_defect_
+    matrix.py`, not this function's own."""
+    (temp_pipelines_module / "good_with_stray_fold.py").write_text(
+        textwrap.dedent(
+            """
+            def apply(valid_df, co_effects):
+                return {"t": valid_df}
 
             def fold(state_slice, facts_df):
                 return facts_df
             """
         )
     )
-    spec = _make_spec(transforms_module="pipelines.good_with_fold")
+    spec = _make_spec(transforms_module="pipelines.good_with_stray_fold")
 
     transforms = bind_transforms(spec)
 
-    assert transforms.apply("valid", {}) == "valid"
-    assert transforms.post_check("candidate", {}) == "candidate"
-    assert transforms.fold("slice", "facts") == "facts"
+    assert transforms.apply("valid", {}) == {"t": "valid"}
+    assert not hasattr(transforms, "fold")
 
 
-def test_bind_transforms_absent_fold_binds_default_lww_partial(
-    temp_pipelines_module: Path,
-) -> None:
-    """No `fold` export -> `frames.default_lww_fold` partial-applied with
-    `spec.domain_id_col` -- verified by shape (the bound function, its
-    `functools.partial` target, and its remaining 2-positional-arg
-    signature), not by invoking it against real data: `default_lww_fold` is
-    a plan builder needing pyspark installed but no live `SparkSession` to
-    import/partial-apply, and this test stays session-free."""
-    import functools
-    import inspect
+# --- F4: one spec-shape WARNING, once per bind (bead conveyer-nvh.43) -------
 
-    from spine.frames import folds
-
-    (temp_pipelines_module / "no_fold_transforms.py").write_text(
-        textwrap.dedent(
-            """
-            def apply(valid_df, co_effects):
-                return valid_df
-
-            def post_check(candidate_df, co_effects):
-                return candidate_df
-            """
-        )
-    )
-    spec = _make_spec(transforms_module="pipelines.no_fold_transforms", domain_id_col="policy_id")
-
-    transforms = bind_transforms(spec)
-
-    assert isinstance(transforms.fold, functools.partial)
-    assert transforms.fold.func is folds.default_lww_fold
-    assert transforms.fold.keywords == {"domain_id_col": "policy_id"}
-    remaining = [
-        p
-        for p in inspect.signature(transforms.fold).parameters.values()
-        if p.kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
-    ]
-    assert [p.name for p in remaining] == ["state_slice_df", "facts_df"]
-
-
-# --- F4/F12-guard: two spec-shape WARNINGs, once per bind (bead conveyer-nvh.43) --
-
-_VALID_APPLY_POST_CHECK = textwrap.dedent(
+_VALID_APPLY = textwrap.dedent(
     """
     def apply(valid_df, co_effects):
-        return valid_df
-
-    def post_check(candidate_df, co_effects):
-        return candidate_df
+        return {"t": valid_df}
     """
 )
 
@@ -298,7 +271,7 @@ _VALID_APPLY_POST_CHECK = textwrap.dedent(
 def test_bind_transforms_own_state_without_serialize_warns_once(
     temp_pipelines_module: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
-    (temp_pipelines_module / "own_state_no_serialize.py").write_text(_VALID_APPLY_POST_CHECK)
+    (temp_pipelines_module / "own_state_no_serialize.py").write_text(_VALID_APPLY)
     spec = _make_spec(
         transforms_module="pipelines.own_state_no_serialize",
         co_effects={"self": CoEffectDecl(table="lake.commissions__state", own_state=True)},
@@ -315,7 +288,7 @@ def test_bind_transforms_own_state_without_serialize_warns_once(
 def test_bind_transforms_own_state_with_serialize_does_not_warn(
     temp_pipelines_module: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
-    (temp_pipelines_module / "own_state_with_serialize.py").write_text(_VALID_APPLY_POST_CHECK)
+    (temp_pipelines_module / "own_state_with_serialize.py").write_text(_VALID_APPLY)
     spec = _make_spec(
         transforms_module="pipelines.own_state_with_serialize",
         co_effects={"self": CoEffectDecl(table="lake.commissions__state", own_state=True)},
@@ -328,24 +301,19 @@ def test_bind_transforms_own_state_with_serialize_does_not_warn(
     assert caplog.records == []
 
 
-def test_bind_transforms_fold_custom_warns_once(
+def test_bind_transforms_valid_spec_does_not_warn(
     temp_pipelines_module: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
-    (temp_pipelines_module / "custom_fold_spec_flag.py").write_text(_VALID_APPLY_POST_CHECK)
-    spec = _make_spec(transforms_module="pipelines.custom_fold_spec_flag", fold="custom")
-
-    with caplog.at_level(logging.WARNING, logger="spine.binding"):
-        bind_transforms(spec)
-
-    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
-    assert any("custom" in r.getMessage() and spec.pipeline in r.getMessage() for r in warnings)
-
-
-def test_bind_transforms_default_lww_fold_does_not_warn(
-    temp_pipelines_module: Path, caplog: pytest.LogCaptureFixture
-) -> None:
-    (temp_pipelines_module / "default_fold_spec_flag.py").write_text(_VALID_APPLY_POST_CHECK)
-    spec = _make_spec(transforms_module="pipelines.default_fold_spec_flag", fold="default-lww")
+    # Critique gate wf_24a3125f-ecc F2 (bead conveyer-6pg.31) deleted the
+    # F12-guard `spec.fold == "custom"` WARNING this section used to also
+    # cover (`test_bind_transforms_fold_custom_warns_once`/`..._default_lww_
+    # fold_does_not_warn`, both removed) -- it warned about the dead
+    # default-lww fold-defaulting wiring this bead also removed, and was
+    # unreachable anyway (`spec.fold == "custom"` already raises at S3
+    # parse). Only the F4 own_state/serialize WARNING survives; this test
+    # is its own "clean spec, no warning" control case.
+    (temp_pipelines_module / "clean_spec_flag.py").write_text(_VALID_APPLY)
+    spec = _make_spec(transforms_module="pipelines.clean_spec_flag")
 
     with caplog.at_level(logging.WARNING, logger="spine.binding"):
         bind_transforms(spec)

@@ -13,6 +13,7 @@ dependencies = [
     "pyspark==3.5.*",
     "pyiceberg[glue,pyarrow]>=0.7",
     "PyYAML>=6",
+    "sqlglot==30.17.0",
 ]
 
 [dependency-groups]
@@ -44,6 +45,16 @@ packages = ["spine", "pipelines"]
 target-version = "py311"
 line-length = 100
 src = ["spine", "pipelines", "tools", "tests"]
+# 007.1 §10/§16 (bead conveyer-6pg.23, B11-local): `tests/probes/` holds the
+# two OQ-7/OQ-6 kernel probes committed VERBATIM (byte-exact from their own
+# module docstrings, per the probe beads' own design fields) as evidence-
+# preserving artifacts -- a probe *establishes* an engine behavior once on
+# the pinned stack, never reformatted after the fact (reformatting would
+# break the verbatim-commit obligation itself). Excluded from ruff's own
+# scope for the identical reason the purity linter's `walk_roots` already
+# excludes all of `tests/` -- these are frozen artifacts, not maintained
+# source.
+extend-exclude = ["tests/probes"]
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "UP", "B"]

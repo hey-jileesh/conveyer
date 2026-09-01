@@ -32,6 +32,39 @@ starts setting the field in bead conveyer-azr.19, n3-admission-cut)**: the
 `pre_check` branch folds `ctx_after.pre_check_drift` into `error_message` on
 the identical, non-failed-transition-only terms — the exact mirror
 `context.py`'s own docstring promises.
+
+**007.1 §4.2/§12 (errata item 20, bead conveyer-6pg.21, B9b): the per-table
+maps, additive (L-4).** Six new fields, all `None` on every stage but
+`commit`/`fold`: `facts_appended_by_table`/`snapshot_ids_by_table` (commit,
+sourced from `ctx_after.facts_appended_by_table`/`.commit_snapshot_ids`) and
+`rows_merged_by_table`/`snapshot_ids_by_table` (fold, sourced from
+`ctx_after.rows_merged_by_table`/`.fold_snapshot_ids`) — **`snapshot_ids_by_
+table` is ONE ledger column serving BOTH stage rows** (§12: "the commit
+row's ... snapshot_ids_by_table ← ... commit_snapshot_ids; the fold row's
+... snapshot_ids_by_table ← ... fold_snapshot_ids"), the same pattern the
+pre-existing singular `snapshot_id` column already uses across five stages.
+Plus commit's own delta-resolution recordings (§4.2's three remaining
+set-once slots, F-5): `delta_predecessor_batch_ids`, `delta_read_snapshot_
+ids`, `delta_probe_refusal`.
+
+**The pre-existing singular `facts_appended`/`snapshot_id` (commit) follow
+§12's "totals / one-snapshot symmetric rule" — a deliberate, DOCUMENTED
+choice, since the LLD names the rule without spelling out its exact
+arithmetic**: `facts_appended` = `sum(facts_appended_by_table.values())` (a
+well-defined total regardless of declared-type count); `snapshot_id` = the
+map's own single value when `commit_snapshot_ids` carries EXACTLY one entry,
+else `None` (an N-table attempt's own commit has no single representative
+snapshot id to report in a scalar column — never guessed, never the first-
+in-iteration-order value). This is a **behavior change** from the pre-B9b
+singular-fact-type era, worth naming: the old `ctx.fact_snapshot_id` used
+`fx.resolve_batch_snapshot` on EITHER path (guard-skip included, recovering
+a PRIOR attempt's snapshot via the stamped-summary lookup); the new
+`commit_snapshot_ids` map explicitly excludes guard-skip/zero-fact tables
+by construction (`BatchContext.commit_snapshot_ids`'s own docstring:
+"absent key = skip / zero-fact no-op") — so a wholly-guard-skipped commit
+attempt now reports `snapshot_id = None` where the old singular field would
+have recovered a real (stale-attempt) value. This is the LLD's OWN §4.2
+design, not a regression introduced here.
 """
 
 from __future__ import annotations
@@ -74,6 +107,19 @@ class RunFact:  # one row per stage transition per attempt — §6.5 column tabl
     merge_summary: Mapping[str, str] | None = None
     error_type: str | None = None
     error_message: str | None = None
+    # 007.1 §4.2/§12 (errata item 20, B9b): the per-table maps, additive (L-4) --
+    # see module docstring for the full field-level ground.
+    facts_appended_by_table: Mapping[str, int] | None = None  # commit only
+    snapshot_ids_by_table: Mapping[str, int] | None = None  # commit OR fold -- one shared column
+    rows_merged_by_table: Mapping[str, int] | None = None  # fold only
+    delta_predecessor_batch_ids: tuple[str, ...] | None = None  # commit only (F-5)
+    delta_read_snapshot_ids: Mapping[str, int] | None = None  # commit only (F-5)
+    delta_probe_refusal: str | None = None  # commit only (F-5)
+    # critique gate wf_24a3125f-ecc F1 (bead conveyer-6pg.30): the L-4-
+    # additive class, exactly `delta_read_snapshot_ids`'s own path -- see
+    # module docstring's account and `effects/ledger.py::
+    # _emit_divergent_duplicates`.
+    divergent_duplicates_by_table: Mapping[str, int] | None = None  # commit only
 
 
 def _common_fields(
@@ -97,19 +143,23 @@ def _common_fields(
     }
 
 
-def _rows_merged(merge_summary: Mapping[str, str] | None) -> int:
-    """`rows_merged` per §7.5's fold algorithm: `None` `merge_summary` means
-    either an explicit no-op merge or a skipped (empty-facts) fold -- both
-    are the "nothing changed" case the doc pins to `rows_merged = 0`. When a
-    merge DID commit, `added-records` is Iceberg's own summary count of rows
-    written by the MERGE (matched-and-rewritten rows surface as added
-    records under copy-on-write, same as newly-inserted ones) -- recorded
-    assumption, to be confirmed once `effects/spark.py`'s `fx.merge` (M2,
-    bead conveyer-nvh.18) is exercised against real Spark/Iceberg summaries."""
-    if merge_summary is None:
-        return 0
-    added = merge_summary.get("added-records")
-    return int(added) if added is not None else 0
+def one_snapshot(snapshots: Mapping[str, int] | None) -> int | None:
+    """§12's "one-snapshot form" for a stage's singular `snapshot_id` column
+    (module docstring's own documented choice): `None` snapshots (the stage
+    has not run, or produced no per-table map) or an empty/multi-entry map
+    both report `None` -- only a map carrying EXACTLY one entry has an
+    unambiguous single value to show in a scalar column. `commit_snapshot_
+    ids`'/`fold_snapshot_ids`'s own docstrings: "absent key = skip / zero-
+    fact no-op", so a wholly-guard-skipped, wholly-zero-fact, or wholly-no-op
+    N-table attempt legitimately reports `None` here, never a stale or
+    arbitrarily-chosen entry. **Public (not `_`-prefixed, B10, bead
+    conveyer-6pg.22)**: `stages/publish.py` applies this SAME rule to its
+    own `state_snapshot_id`/`fact_snapshot_id` event-payload projections
+    (that module's own docstring has the account) -- one shared derivation,
+    not a second copy of the "exactly one entry" logic."""
+    if snapshots is None or len(snapshots) != 1:
+        return None
+    return next(iter(snapshots.values()))
 
 
 def _stage_fields(stage: str, ctx_after: BatchContext) -> dict[str, Any]:
@@ -145,16 +195,35 @@ def _stage_fields(stage: str, ctx_after: BatchContext) -> dict[str, Any]:
             fields["error_message"] = ctx_after.post_check_drift
         return fields
     if stage == "commit":
+        by_table = ctx_after.facts_appended_by_table
+        snaps = ctx_after.commit_snapshot_ids
         return {
-            "facts_appended": ctx_after.facts_appended,
-            "snapshot_id": ctx_after.fact_snapshot_id,
+            "facts_appended": sum(by_table.values()) if by_table is not None else None,
+            "snapshot_id": one_snapshot(snaps),
+            "facts_appended_by_table": by_table,
+            "snapshot_ids_by_table": snaps,
+            "delta_predecessor_batch_ids": ctx_after.delta_predecessor_batch_ids,
+            "delta_read_snapshot_ids": ctx_after.delta_read_snapshot_ids,
+            "delta_probe_refusal": ctx_after.delta_probe_refusal,
+            "divergent_duplicates_by_table": ctx_after.divergent_duplicates_by_table,
         }
     if stage == "fold":
+        # B10 (bead conveyer-6pg.22): the SAME totals / one-snapshot
+        # symmetric rule as commit's branch above, applied to fold's own
+        # per-table maps. The old singular `BatchContext.state_snapshot_id`/
+        # `.state_read_snapshot_id`/`.merge_summary` fields this branch used
+        # to derive from were deleted outright (critique gate
+        # wf_24a3125f-ecc ruling 1, bead conveyer-6pg.29, F4) -- this row's
+        # own `RunFact.state_read_snapshot_id`/`.merge_summary` columns
+        # (L-4, ledger-governed, unaffected by that deletion) stay `None`
+        # here by omission, same as before.
+        rows_by_table = ctx_after.rows_merged_by_table
+        fold_snaps = ctx_after.fold_snapshot_ids
         return {
-            "snapshot_id": ctx_after.state_snapshot_id,
-            "state_read_snapshot_id": ctx_after.state_read_snapshot_id,
-            "merge_summary": ctx_after.merge_summary,
-            "rows_merged": _rows_merged(ctx_after.merge_summary),
+            "snapshot_id": one_snapshot(fold_snaps),
+            "rows_merged": sum(rows_by_table.values()) if rows_by_table is not None else None,
+            "rows_merged_by_table": rows_by_table,
+            "snapshot_ids_by_table": fold_snaps,
         }
     if stage == "publish":
         return {}

@@ -1,8 +1,117 @@
 {
   "$defs": {
+    "BatchCheckModel": {
+      "additionalProperties": false,
+      "properties": {
+        "aggregate": {
+          "maxLength": 4096,
+          "title": "Aggregate",
+          "type": "string"
+        },
+        "control": {
+          "$ref": "#/$defs/BatchControlModel"
+        },
+        "fact_type": {
+          "title": "Fact Type",
+          "type": "string"
+        },
+        "id": {
+          "maxLength": 128,
+          "pattern": "^[a-z0-9][a-z0-9-]*$",
+          "title": "Id",
+          "type": "string"
+        },
+        "kind": {
+          "const": "batch_check",
+          "title": "Kind",
+          "type": "string"
+        },
+        "tolerance": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Tolerance"
+        }
+      },
+      "required": [
+        "kind",
+        "id",
+        "fact_type",
+        "aggregate",
+        "control"
+      ],
+      "title": "BatchCheckModel",
+      "type": "object"
+    },
+    "BatchControlModel": {
+      "additionalProperties": false,
+      "properties": {
+        "expr": {
+          "maxLength": 4096,
+          "title": "Expr",
+          "type": "string"
+        },
+        "member": {
+          "title": "Member",
+          "type": "string"
+        }
+      },
+      "required": [
+        "member",
+        "expr"
+      ],
+      "title": "BatchControlModel",
+      "type": "object"
+    },
+    "ChecksModel": {
+      "additionalProperties": false,
+      "properties": {
+        "checks": {
+          "default": [],
+          "items": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/RowCheckModel"
+              },
+              {
+                "$ref": "#/$defs/MembershipCheckModel"
+              },
+              {
+                "$ref": "#/$defs/BatchCheckModel"
+              }
+            ]
+          },
+          "title": "Checks",
+          "type": "array"
+        }
+      },
+      "title": "ChecksModel",
+      "type": "object"
+    },
     "CoEffectDecl": {
       "additionalProperties": false,
       "properties": {
+        "columns": {
+          "anyOf": [
+            {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Columns"
+        },
         "own_state": {
           "default": false,
           "title": "Own State",
@@ -137,6 +246,148 @@
       "title": "DialectModel",
       "type": "object"
     },
+    "FactColumnSpec": {
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "maxLength": 128,
+          "pattern": "^[A-Za-z_][A-Za-z0-9_]*$",
+          "title": "Name",
+          "type": "string"
+        },
+        "type": {
+          "pattern": "^(string|int|long|bool|decimal\\([1-9][0-9]?,(0|[1-9][0-9]?)\\)|date|timestamp)$",
+          "title": "Type",
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "type"
+      ],
+      "title": "FactColumnSpec",
+      "type": "object"
+    },
+    "FactSchemaModel": {
+      "additionalProperties": false,
+      "properties": {
+        "columns": {
+          "items": {
+            "$ref": "#/$defs/FactColumnSpec"
+          },
+          "maxItems": 1024,
+          "minItems": 1,
+          "title": "Columns",
+          "type": "array"
+        },
+        "domain_id_col": {
+          "title": "Domain Id Col",
+          "type": "string"
+        },
+        "ordering": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "title": "Ordering",
+          "type": "array"
+        },
+        "record_key": {
+          "items": {
+            "type": "string"
+          },
+          "minItems": 1,
+          "title": "Record Key",
+          "type": "array"
+        }
+      },
+      "required": [
+        "columns",
+        "domain_id_col",
+        "record_key"
+      ],
+      "title": "FactSchemaModel",
+      "type": "object"
+    },
+    "FactTypeModel": {
+      "additionalProperties": false,
+      "properties": {
+        "fact_table": {
+          "title": "Fact Table",
+          "type": "string"
+        },
+        "schema": {
+          "$ref": "#/$defs/FactSchemaModel"
+        },
+        "state_table": {
+          "title": "State Table",
+          "type": "string"
+        }
+      },
+      "required": [
+        "fact_table",
+        "state_table",
+        "schema"
+      ],
+      "title": "FactTypeModel",
+      "type": "object"
+    },
+    "MembershipCheckModel": {
+      "additionalProperties": false,
+      "properties": {
+        "co_effect": {
+          "title": "Co Effect",
+          "type": "string"
+        },
+        "columns": {
+          "items": {
+            "type": "string"
+          },
+          "minItems": 1,
+          "title": "Columns",
+          "type": "array"
+        },
+        "fact_type": {
+          "title": "Fact Type",
+          "type": "string"
+        },
+        "id": {
+          "maxLength": 128,
+          "pattern": "^[a-z0-9][a-z0-9-]*$",
+          "title": "Id",
+          "type": "string"
+        },
+        "kind": {
+          "const": "membership",
+          "title": "Kind",
+          "type": "string"
+        },
+        "reason": {
+          "pattern": "^business/[a-z0-9][a-z0-9-]*$",
+          "title": "Reason",
+          "type": "string"
+        },
+        "ref_columns": {
+          "items": {
+            "type": "string"
+          },
+          "minItems": 1,
+          "title": "Ref Columns",
+          "type": "array"
+        }
+      },
+      "required": [
+        "kind",
+        "id",
+        "fact_type",
+        "columns",
+        "co_effect",
+        "ref_columns",
+        "reason"
+      ],
+      "title": "MembershipCheckModel",
+      "type": "object"
+    },
     "RawContractModel": {
       "additionalProperties": false,
       "properties": {
@@ -196,10 +447,55 @@
       ],
       "title": "ReadSpecModel",
       "type": "object"
+    },
+    "RowCheckModel": {
+      "additionalProperties": false,
+      "properties": {
+        "expr": {
+          "maxLength": 4096,
+          "title": "Expr",
+          "type": "string"
+        },
+        "fact_type": {
+          "title": "Fact Type",
+          "type": "string"
+        },
+        "id": {
+          "maxLength": 128,
+          "pattern": "^[a-z0-9][a-z0-9-]*$",
+          "title": "Id",
+          "type": "string"
+        },
+        "kind": {
+          "const": "row",
+          "title": "Kind",
+          "type": "string"
+        },
+        "reason": {
+          "pattern": "^business/[a-z0-9][a-z0-9-]*$",
+          "title": "Reason",
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "id",
+        "fact_type",
+        "expr",
+        "reason"
+      ],
+      "title": "RowCheckModel",
+      "type": "object"
     }
   },
   "additionalProperties": false,
   "properties": {
+    "checks": {
+      "$ref": "#/$defs/ChecksModel",
+      "default": {
+        "checks": []
+      }
+    },
     "co_effects": {
       "additionalProperties": {
         "$ref": "#/$defs/CoEffectDecl"
@@ -213,9 +509,13 @@
       "title": "Domain Id Col",
       "type": "string"
     },
-    "fact_table": {
-      "title": "Fact Table",
-      "type": "string"
+    "fact_types": {
+      "additionalProperties": {
+        "$ref": "#/$defs/FactTypeModel"
+      },
+      "minProperties": 1,
+      "title": "Fact Types",
+      "type": "object"
     },
     "fold": {
       "default": "default-lww",
@@ -254,10 +554,6 @@
       "title": "Sla Minutes",
       "type": "integer"
     },
-    "state_table": {
-      "title": "State Table",
-      "type": "string"
-    },
     "transforms_module": {
       "pattern": "^pipelines\\.[a-z0-9_]+(\\.[a-z0-9_]+)*$",
       "title": "Transforms Module",
@@ -269,8 +565,7 @@
     "transforms_module",
     "raw_table",
     "quarantine_table",
-    "fact_table",
-    "state_table",
+    "fact_types",
     "read",
     "raw_contract"
   ],

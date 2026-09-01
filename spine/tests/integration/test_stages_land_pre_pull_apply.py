@@ -17,6 +17,18 @@ flags, D-5), so one fixed base contract suffices for every test in this
 file regardless of which columns a given test's OWN `raw_contract` (via
 `_make_spec`'s `required_columns`) later declares `required`/`nullable:
 false`.
+
+**006.1 P-1/§4.4 migration (bead conveyer-6pg.13, B3):** `_make_spec` now
+builds the per-type `fact_types` mapping (one type, `_FACT_TYPE = "m3"`,
+declaring the SAME `id`/`amount` string columns the raw contract admits —
+`apply`'s pass-through returns them unchanged) instead of the deleted
+singular `fact_table`/`state_table` fields; `_passthrough_transforms`'s
+`apply` now returns the one-entry `Mapping[str, DataFrame]` §4.4 requires
+and carries no `post_check` (`Transforms` itself dropped the field). The
+`apply`-specific tests below now use REAL, minimally-shaped Spark
+`DataFrame`s (not opaque marker objects) — `stages/apply.py`'s own new
+runtime return-shape law (§4.4) inspects `DataFrame.schema`, so a
+non-`DataFrame` stand-in can no longer flow through it.
 """
 
 from __future__ import annotations
@@ -38,8 +50,18 @@ from spine.bootstrap.create_admission_tables import (
 )
 from spine.config import RunConfig
 from spine.context import BatchContext
+from spine.core.checks import checks_version
 from spine.core.contract import check_version, read_spec_version
-from spine.core.model import CoEffectDecl, ColumnSpec, PipelineSpecModel, RawContractModel
+from spine.core.model import (
+    ChecksModel,
+    CoEffectDecl,
+    ColumnSpec,
+    FactColumnSpec,
+    FactSchemaModel,
+    FactTypeModel,
+    PipelineSpecModel,
+    RawContractModel,
+)
 from spine.effects.records import RunnerFx
 from spine.stages import apply, land, pre_check, pull
 
@@ -56,6 +78,21 @@ _CATALOG_PREFIX = "spine_cat."
 # `required_columns`) marks `required: true, nullable: false`.
 _CONTRACT_COLUMN_NAMES = ("id", "amount")
 _BASE_RAW_CONTRACT = RawContractModel(columns=[ColumnSpec(name=c) for c in _CONTRACT_COLUMN_NAMES])
+
+# 006.1 P-1: the one declared fact type this suite's specs carry -- `apply`'s
+# pass-through returns `valid_df` unchanged, so the declared candidate
+# columns are the SAME `id`/`amount` names, both `string` (D-5: raw is
+# always string; `typed_projection` over an undeclared-type column stays
+# `string` too).
+_FACT_TYPE = "m3"
+_FACT_SCHEMA = FactSchemaModel(
+    columns=[
+        FactColumnSpec(name="id", type="string"),
+        FactColumnSpec(name="amount", type="string"),
+    ],
+    domain_id_col="id",
+    record_key=["id"],
+)
 
 
 def _bare(qualified_table: str) -> str:
@@ -86,11 +123,7 @@ def _create_coeff_table(spark: SparkSession, qualified_table: str, *, seed_row: 
 
 
 def _passthrough_transforms() -> Transforms:
-    return Transforms(
-        apply=lambda valid_df, co_effects: valid_df,
-        post_check=lambda candidate_df, co_effects: candidate_df,
-        fold=lambda state_slice, facts_df: facts_df,
-    )
+    return Transforms(apply=lambda valid_df, co_effects: {_FACT_TYPE: valid_df})
 
 
 # `_make_spec`'s `required_columns` param (a TEST-local name, not a model
@@ -125,8 +158,14 @@ def _make_spec(
         co_effects=co_effects or {},
         raw_table=raw_table,
         quarantine_table=quarantine_table,
-        fact_table=fact_table,
-        state_table="spine_test_tables.unused_state",
+        fact_types={
+            _FACT_TYPE: FactTypeModel(
+                fact_table=fact_table,
+                state_table="spine_test_tables.unused_state",
+                schema=_FACT_SCHEMA,
+            )
+        },
+        checks=ChecksModel(),
         read={"dialect": {"format": "csv"}},
         raw_contract=_raw_contract(required_columns),
         serialize=serialize,
@@ -157,6 +196,7 @@ def _make_seed(
         sfn_redrive_count=0,
         read_spec_version=read_spec_version(spec.read),
         check_version=check_version(spec.raw_contract, spec.read),
+        checks_version=checks_version(spec.checks),
     )
 
 
@@ -413,38 +453,36 @@ def test_pull_own_state_without_serialize_reads_but_logs_nothing(
 
 
 def test_apply_calls_transforms_apply_with_valid_df_and_co_effects_only(
+    spark: SparkSession,
     local_runner_fx: RunnerFx,
 ) -> None:
     seen: dict[str, object] = {}
+    marker_valid_df = spark.createDataFrame([("1", "10.5")], ["id", "amount"])
+    marker_co_effects: dict[str, DataFrame] = {}
 
-    def _apply(valid_df: DataFrame, co_effects: object) -> DataFrame:
+    def _apply(valid_df: DataFrame, co_effects: object) -> dict[str, DataFrame]:
         seen["valid_df"] = valid_df
         seen["co_effects"] = co_effects
-        return valid_df
+        return {_FACT_TYPE: valid_df}
 
     spec = _make_spec(
         raw_table="spine_test_tables.unused_raw", quarantine_table="spine_test_tables.unused_qtn"
     )
-    transforms = Transforms(
-        apply=_apply,
-        post_check=lambda candidate_df, co_effects: candidate_df,
-        fold=lambda state_slice, facts_df: facts_df,
-    )
+    transforms = Transforms(apply=_apply)
     seed = _make_seed(
         spec=spec, batch_id=_batch_id(8), object_uris=("s3://unused/x",), transforms=transforms
     )
-    marker_valid_df = object()
-    marker_co_effects = object()
-    ctx = replace(seed, valid_df=marker_valid_df, co_effects=marker_co_effects)  # type: ignore[arg-type]
+    ctx = replace(seed, valid_df=marker_valid_df, co_effects=marker_co_effects)
 
     after = apply.run(ctx, local_runner_fx)
 
-    assert after.candidate_facts_df is marker_valid_df
+    assert after.candidate_facts is not None
+    assert after.candidate_facts[_FACT_TYPE] is marker_valid_df
     assert seen["valid_df"] is marker_valid_df
     assert seen["co_effects"] is marker_co_effects
 
 
-def test_apply_never_calls_fx() -> None:
+def test_apply_never_calls_fx(spark: SparkSession) -> None:
     class _PoisonFx:
         def __getattr__(self, name: str) -> object:
             raise AssertionError(f"apply must never call fx.{name} -- it is pure (§7.5)")
@@ -453,8 +491,10 @@ def test_apply_never_calls_fx() -> None:
         raw_table="spine_test_tables.unused_raw", quarantine_table="spine_test_tables.unused_qtn"
     )
     seed = _make_seed(spec=spec, batch_id=_batch_id(9), object_uris=("s3://unused/x",))
-    ctx = replace(seed, valid_df="marker-df", co_effects={})  # type: ignore[arg-type]
+    marker_valid_df = spark.createDataFrame([("1", "10.5")], ["id", "amount"])
+    ctx = replace(seed, valid_df=marker_valid_df, co_effects={})
 
     after = apply.run(ctx, _PoisonFx())  # type: ignore[arg-type]
 
-    assert after.candidate_facts_df == "marker-df"
+    assert after.candidate_facts is not None
+    assert after.candidate_facts[_FACT_TYPE] is marker_valid_df

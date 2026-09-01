@@ -104,6 +104,15 @@ MUST_FAIL_CASES: list[tuple[str, str, tuple[str, ...]]] = [
         "spine/frames/x.py",
         ("purity-banned-attr:count",),
     ),
+    # [DC2-2] (bead conveyer-6pg.23, B11-local): `.overwrite(` on a state
+    # table, OUTSIDE the one blessed rebuild/swap module -- simulated at a
+    # generic `spine/effects/**` path, deliberately NOT the exempted
+    # `spine/effects/rebuild.py` rel_path.
+    (
+        "fail_effects_state_overwrite.py",
+        "spine/effects/x.py",
+        ("purity-banned-attr:overwrite",),
+    ),
 ]
 
 MUST_PASS_CASES: list[tuple[str, str]] = [
@@ -119,6 +128,14 @@ MUST_PASS_CASES: list[tuple[str, str]] = [
     # `spine/core/reading.py` the allowlist entry names, since the engine
     # keys allowlist membership off `(rel_path, function_name)`.
     ("pass_core_parse_line_try.py", "spine/core/reading.py"),
+    # 006.1 §13.4 item 3 (bead conveyer-6pg.14, B4): the corpus's own
+    # exercise of "the new `sqlglot` dependency, core profile permits it" --
+    # modeled on `spine/core/check_grammar.py`'s real import shape.
+    ("pass_core_check_grammar.py", "spine/core/x.py"),
+    # [DC2-2] (bead conveyer-6pg.23, B11-local): the IDENTICAL `.overwrite(`
+    # shape as the MUST-FAIL case above, but simulated at the ONE blessed
+    # module's own exact rel_path -- `banned_attr_exemption` licenses it.
+    ("pass_effects_rebuild_overwrite.py", "spine/effects/rebuild.py"),
 ]
 
 
@@ -192,6 +209,37 @@ def test_string_sql_exemption_targets_a_real_function(rel_path: str, function_na
     violations = purity_linter.lint_file(path, root, _CONFIG)
     string_sql = [v for v in violations if v.rule.startswith("idiom-string-sql")]
     assert string_sql == [], f"unexpected string-SQL violations in {rel_path}: {string_sql}"
+
+
+@pytest.mark.parametrize("rel_path,attr_name", sorted(_CONFIG.banned_attr_exemption))
+def test_banned_attr_exemption_targets_a_real_file_and_stays_clean(
+    rel_path: str, attr_name: str
+) -> None:
+    """007.1 [DC2-2]/[DS2-2] (bead conveyer-6pg.23, B11-local): every
+    `(rel_path, attr_name)` pair in `banned_attr_exemption` still names a
+    real file (not a stale name after a rename), and linting that REAL file
+    reports zero `purity-banned-attr:<attr_name>` violations -- the same
+    "real function, zero real violations" pattern `test_string_sql_
+    exemption_targets_a_real_function` already establishes for the sibling
+    exemption mechanism, applied to this new one."""
+    root = Path(__file__).resolve().parents[2]  # .../conveyer/spine
+    path = root / rel_path
+    assert path.is_file(), f"banned_attr_exemption names a missing file: {rel_path}"
+
+    violations = purity_linter.lint_file(path, root, _CONFIG)
+    banned_attr = [v for v in violations if v.rule == f"purity-banned-attr:{attr_name}"]
+    assert banned_attr == [], f"unexpected banned-attr violations in {rel_path}: {banned_attr}"
+
+
+def test_banned_attr_exemption_is_scoped_to_its_own_file_only() -> None:
+    """The exemption must not blanket-relax the `overwrite` ban across all
+    of `spine/effects/**` -- the IDENTICAL `.overwrite(` shape, simulated
+    at any OTHER rel_path under the same profile, must still fail."""
+    source = _fixture_source("pass_effects_rebuild_overwrite.py")
+    violations = purity_linter.lint_source(source, "spine/effects/not_rebuild.py", _CONFIG)
+    assert any(v.rule == "purity-banned-attr:overwrite" for v in violations), (
+        f"expected the ban to fire outside the exempted file, got {violations}"
+    )
 
 
 @pytest.mark.parametrize(

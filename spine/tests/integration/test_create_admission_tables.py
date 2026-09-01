@@ -78,6 +78,12 @@ def _snapshot_count(spark: SparkSession, qualified_table: str) -> int:
     return spark.sql(f"SELECT COUNT(*) AS c FROM {qualified_table}.snapshots").collect()[0]["c"]
 
 
+def _table_class(spark: SparkSession, qualified_table: str) -> str | None:
+    rows = spark.sql(f"SHOW TBLPROPERTIES {qualified_table}").collect()
+    props = {r["key"]: r["value"] for r in rows}
+    return props.get("conveyer.table-class")
+
+
 # --- raw table: fresh creation ------------------------------------------------
 
 
@@ -262,6 +268,73 @@ def test_bootstrap_quarantine_table_schema_drift_raises(
         assert "drift" in str(exc)
 
 
+# --- conveyer.table-class stamping (006.1 §16.3 item 5, F-10's anchor) -----
+
+
+def test_bootstrap_raw_table_stamps_table_class_at_create(
+    spark: SparkSession, unique_table: Callable[[str], str]
+) -> None:
+    qt = unique_table("raw")
+    bootstrap_raw_table(spark, qt, _contract())
+    assert _table_class(spark, qt) == "raw"
+
+
+def test_bootstrap_raw_table_backfills_table_class_on_a_pre_existing_table(
+    spark: SparkSession, unique_table: Callable[[str], str]
+) -> None:
+    """The dev backfill runbook (006.1 §16.3 item 5, `render_set_table_
+    class_sql`'s own docstring): a table provisioned BEFORE this stamping
+    landed has no `conveyer.table-class` property at all -- re-running
+    `bootstrap-admission` against it (no separate script, no manual `ALTER
+    TABLE`) backfills the stamp."""
+    qt = unique_table("raw")
+    contract = _contract()
+    bootstrap_raw_table(spark, qt, contract)
+    spark.sql(f"ALTER TABLE {qt} UNSET TBLPROPERTIES ('conveyer.table-class')")
+    assert _table_class(spark, qt) is None
+
+    bootstrap_raw_table(spark, qt, contract)
+
+    assert _table_class(spark, qt) == "raw"
+
+
+def test_bootstrap_raw_table_restamp_is_idempotent_and_creates_no_snapshot(
+    spark: SparkSession, unique_table: Callable[[str], str]
+) -> None:
+    qt = unique_table("raw")
+    contract = _contract()
+    bootstrap_raw_table(spark, qt, contract)
+    before_snaps = _snapshot_count(spark, qt)
+
+    bootstrap_raw_table(spark, qt, contract)  # second run: unconditional re-stamp
+
+    assert _table_class(spark, qt) == "raw"
+    # Table-property writes are metadata-only -- the re-stamp must never
+    # show up as a data snapshot (A-14's own no-op-DDL invariant, extended).
+    assert _snapshot_count(spark, qt) == before_snaps == 0
+
+
+def test_bootstrap_quarantine_table_stamps_table_class_at_create(
+    spark: SparkSession, unique_table: Callable[[str], str]
+) -> None:
+    qt = unique_table("qtn")
+    bootstrap_quarantine_table(spark, qt)
+    assert _table_class(spark, qt) == "quarantine"
+
+
+def test_bootstrap_quarantine_table_backfills_table_class_on_a_pre_existing_table(
+    spark: SparkSession, unique_table: Callable[[str], str]
+) -> None:
+    qt = unique_table("qtn")
+    bootstrap_quarantine_table(spark, qt)
+    spark.sql(f"ALTER TABLE {qt} UNSET TBLPROPERTIES ('conveyer.table-class')")
+    assert _table_class(spark, qt) is None
+
+    bootstrap_quarantine_table(spark, qt)
+
+    assert _table_class(spark, qt) == "quarantine"
+
+
 # --- orchestration: one spec, both tables -----------------------------------
 
 
@@ -275,8 +348,20 @@ def test_bootstrap_admission_tables_creates_raw_and_quarantine(
         transforms_module="pipelines.admission_probe.transforms",
         raw_table=_bare(raw_qt),
         quarantine_table=_bare(qtn_qt),
-        fact_table=_bare(unique_table("fact")),
-        state_table=_bare(unique_table("state")),
+        # 006.1 P-1: singular fact_table/state_table replaced by a per-type
+        # `fact_types` mapping -- this fixture just needs SOME valid
+        # declaration (`bootstrap_admission_tables` never reads fact_types).
+        fact_types={
+            "probe": {
+                "fact_table": _bare(unique_table("fact")),
+                "state_table": _bare(unique_table("state")),
+                "schema": {
+                    "columns": [{"name": "domain_id", "type": "string"}],
+                    "domain_id_col": "domain_id",
+                    "record_key": ["domain_id"],
+                },
+            }
+        },
         read=ReadSpecModel(dialect=DialectModel(format="csv", header=True)),
         raw_contract=_contract("payload"),
     )

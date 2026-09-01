@@ -85,6 +85,17 @@ Makefile has no terraform of its own to run.
                                                    # `pipeline.yaml` URI (s3:// in a real deploy,
                                                    # file:// for a local/dev dry run) -- run once per
                                                    # pipeline being deployed, not once per environment.
+5c. make -C spine bootstrap-record-tables ENV=dev SPEC=<pipeline spec URI>
+                                                   # PER PIPELINE, once per deploy, AFTER 5b and before
+                                                   # smoke (007.1 LLD §6.5): idempotent, additive-only
+                                                   # fact/state/marker Iceberg table creation, per the
+                                                   # pipeline's `fact_types` mapping (006.1 P-1). Also
+                                                   # emits/refreshes `table-classes.json` BESIDE the
+                                                   # deployed spec (same `SPEC` directory, F-10) -- the
+                                                   # bind-time authority `entrypoints/glue_main.py`
+                                                   # loads for [DC-1]'s marker-table probe; re-run
+                                                   # whenever `fact_types` changes shape, not only on a
+                                                   # brand-new pipeline.
 6. make -C spine smoke ENV=dev                    # via the identity FEED (ingestion front door,
                                                    # conveyer-internal/identity-smoke, §12.6); polls
                                                    # the run ledger for a publish/ok row, the facts
@@ -118,6 +129,69 @@ Dev-only migration (N5), identity exemplar only:
   real §4.1/§4.2 shape, then re-run smoke. Dev-only disposable data -- a real
   pipeline's production tables never carry the provisional shape, so this step
   is never needed for one.
+```
+
+### B5 deploy-refresh checklist (006.1 LLD §14 B5)
+
+Local half shipped by `conveyer-6pg.15`; executed by `conveyer-6pg.16`
+(B5-gate) — human-supervised, LEAVE OPEN, mirrors the `conveyer-nvh.32`/
+`conveyer-4ot.27`/N5 precedent above: no AWS mutation by any agent.
+
+```
+1. Spec redeploy -- no NEW authoring needed: `tests/exemplar/identity/
+   pipeline.yaml` already carries the per-type `fact_types` shape (006.1
+   P-1, migrated at B3/`conveyer-6pg.13`) -- push it to
+   s3://${p}-artifacts/spine/specs/pipelines--identity/pipeline.yaml and
+   `terraform apply -var spine_pipeline_spec_uri=<pushed URI>` (steps 3-4
+   above); confirms the deployed Glue job's `--conveyer-pipeline-spec-uri`
+   argv resolves the new shape, not a stale singular `fact_table`/
+   `state_table` one.
+
+2. Dev quarantine re-create (P-7), identity exemplar only -- DROP
+   `<lake_db>.identity__quarantine` ONLY (not `identity__raw` -- P-7 never
+   touches raw's shape) and re-run step 5b (`bootstrap-admission`) to
+   recreate it. Why: P-7 adds one reserved key (`_conveyer_fact_type`) to
+   every NEW quarantine row's `row_snapshot` JSON so `row_hash` can
+   discriminate which fact type a quarantined row belongs to (§8.1's
+   per-type rerun subtraction); rows quarantined by a pre-P-7 deploy lack
+   that key. No DDL changes -- the tag lives inside the existing
+   `row_snapshot` column's JSON value, never a new column, so
+   `bootstrap-admission`'s own exact-schema assertion is untouched by this
+   step; it is a DATA disposal, not a schema migration. P-7's own decision
+   record (006.1 §2): "accepting ... that pre-tag durable quarantine rows
+   in the dev exemplar are re-created rather than migrated (dev-disposable,
+   §14)". Dev-only, same framing as N5 above -- a real pipeline's
+   quarantine table is never pre-tag, so this step is never needed for one.
+
+3. Record tables + inventory refresh -- step 5c above
+   (`bootstrap-record-tables`), idempotent; re-run whenever `fact_types`
+   changed shape since the last deploy (harmless no-op otherwise). Confirms
+   `table-classes.json` (F-10) is content-current beside the redeployed
+   spec -- the bind-time authority `entrypoints/glue_main.py` loads before
+   ANY stage runs ([DC-1]'s marker-table probe).
+
+4. `make -C spine smoke ENV=dev` (step 6 above) -- confirms the redeployed
+   spec + refreshed table set round-trips one real batch end to end
+   (publish/ok ledger row, a facts-table row, an EMF-marked log line).
+
+5. Glue G-08 parity -- `make -C spine glue-parity` (Makefile target added
+   this bead), run the SAME way against the deployed Glue job's own
+   wheel/environment (a `spark-submit`/ad hoc job run against a live Glue
+   5.0 cluster -- the probe needs no seed/delivery/catalog access of its
+   own, `spine/probes/g08_parity.py`'s own docstring) rather than a
+   laptop's local Spark. Expect `45/45 discriminator rows passed on this
+   engine` in the job's continuous-logging output and exit code 0 -- a
+   LOCAL rehearsal of the identical command already passed 45/45 under
+   local Spark (this bead, `conveyer-6pg.15`); this step is what settles
+   whether Glue 5.0's real JVM agrees (§13.1's own class of claim: "only a
+   real account can confirm").
+
+This bead (`conveyer-6pg.15`, B5-local) ships every artifact steps 1-5 need
+— the already-migrated spec, this checklist's own instructions for step 2's
+DROP (never the DROP itself), the `bootstrap-record-tables` step 5c wiring,
+and the `glue-parity` probe/Makefile target — each validated locally end to
+end (every command above runs clean against a local/dry-run substrate; only
+the AWS-account-specific parts of steps 1-5 are deferred to B5-gate).
 ```
 
 ### Reader cost note: `multiline: true` parses on the driver (005.1 LLD §5.5, critique F3)

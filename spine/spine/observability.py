@@ -29,6 +29,7 @@ from __future__ import annotations
 import json
 import logging
 import sys
+from collections.abc import Mapping
 from datetime import UTC, datetime
 from typing import IO
 
@@ -100,14 +101,32 @@ def emit_metric(
     feed_id: str,
     stage: str | None = None,
     unit: str = "Count",
+    extra_dims: Mapping[str, str] | None = None,
 ) -> None:
     """CloudWatch EMF, hand-rolled dict, printed to stdout (§11.1) —
     namespace `Conveyer/Spine`, dimensions `pipeline`, `feed_id` (+ `stage`
     on stage metrics, when the caller supplies one). No metrics client or
     library is used anywhere in this codebase (§11.1 idiom); CloudWatch
     parses EMF straight out of Glue's continuous-logging stdout capture.
+
+    `extra_dims` (007.1 §12, B9b: `DeltaProbeRefusals`'s `reason` dimension,
+    `DivergentDuplicates`'s `table` dimension) adds further NAME-DIMENSIONED
+    values, insertion order, after `stage` — every key becomes both a
+    `Dimensions` entry and a top-level payload key, the same shape `stage`
+    already has. `None`/omitted (every EXISTING caller) leaves the payload
+    byte-identical to before this parameter existed — a strictly additive
+    extension, not a reshape. **[S-7]/[S-18] is the caller's obligation, not
+    this function's**: every value threaded through `extra_dims` must
+    already be an enum code or a lineage identifier (table name, reason
+    code) — never `delivery_key`/hash/row-derived payload material; this
+    function enforces nothing beyond the fixed `emit_metric` signature
+    itself, the same posture the module docstring already states.
     """
-    dims = ["pipeline", "feed_id"] + (["stage"] if stage is not None else [])
+    dims = ["pipeline", "feed_id"]
+    if stage is not None:
+        dims.append("stage")
+    if extra_dims:
+        dims.extend(extra_dims.keys())
     payload: dict[str, object] = {
         "_aws": {
             "Timestamp": int(datetime.now(UTC).timestamp() * 1000),
@@ -125,4 +144,6 @@ def emit_metric(
     }
     if stage is not None:
         payload["stage"] = stage
+    if extra_dims:
+        payload.update(extra_dims)
     print(json.dumps(payload))  # noqa: T201 -- the sanctioned §11.1 mechanism

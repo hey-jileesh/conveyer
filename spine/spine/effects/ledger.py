@@ -118,6 +118,20 @@ never calls `_stage_fields`) — so gating on `error_message is not None`
 alone would have wrongly routed that text through this channel too.
 `stages/pre_check.py` (bead conveyer-azr.19, n3-admission-cut) is what
 actually sets `ctx.pre_check_drift` on its two rerun doors, per §6.5.
+
+**Divergent-duplicates WARNING + EMF (moved here from `stages/commit.py`,
+critique gate wf_24a3125f-ecc F1, bead conveyer-6pg.30):** §12's
+`DivergentDuplicates` metric (D-2(b)'s observable-data condition, per fact
+table) used to be emitted directly by `stages/commit.py` itself, the ONLY
+`observability.*` call in any stage (004 §13.3 breach) and outside this
+module's never-raise envelope. `stages/commit.py` now only computes the
+pure per-table count into `ctx.divergent_duplicates_by_table`; this module
+derives the WARNING + EMF purely from the `RunFact`, gated on `stage ==
+"commit" and divergent_duplicates_by_table is not None`, the same shape as
+`delta_probe_refusal`'s own gate. See `_emit_divergent_duplicates`'s own
+docstring for why the EMF (per table, unconditional) and the WARNING log
+(per table, count > 0 only) deliberately use different gates from each
+other.
 """
 
 from __future__ import annotations
@@ -141,6 +155,7 @@ from pyiceberg.schema import Schema
 from pyiceberg.transforms import DayTransform
 from pyiceberg.types import (
     IntegerType,
+    ListType,
     LongType,
     MapType,
     NestedField,
@@ -192,6 +207,50 @@ RUN_LEDGER_SCHEMA = Schema(
     NestedField(25, "error_type", StringType(), required=False),
     NestedField(26, "error_message", StringType(), required=False),
     NestedField(27, "recorded_at", TimestamptzType(), required=True),
+    # 007.1 §4.2/§12 (errata item 20, bead conveyer-6pg.21, B9b): the per-
+    # table maps, additive-only (L-4) -- new field ids only, 1-27 untouched.
+    NestedField(
+        28,
+        "facts_appended_by_table",
+        MapType(29, StringType(), 30, LongType(), value_required=True),
+        required=False,
+    ),
+    NestedField(
+        31,
+        "snapshot_ids_by_table",
+        MapType(32, StringType(), 33, LongType(), value_required=True),
+        required=False,
+    ),
+    NestedField(
+        34,
+        "rows_merged_by_table",
+        MapType(35, StringType(), 36, LongType(), value_required=True),
+        required=False,
+    ),
+    NestedField(
+        37,
+        "delta_predecessor_batch_ids",
+        ListType(38, StringType(), element_required=True),
+        required=False,
+    ),
+    NestedField(
+        39,
+        "delta_read_snapshot_ids",
+        MapType(40, StringType(), 41, LongType(), value_required=True),
+        required=False,
+    ),
+    NestedField(42, "delta_probe_refusal", StringType(), required=False),
+    # critique gate wf_24a3125f-ecc F1 (bead conveyer-6pg.30): additive-only
+    # (L-4) -- new field ids only, 1-42 untouched. Moved commit's own
+    # `DivergentDuplicates` metric onto this per-table map so `record_run`
+    # (not `stages/commit.py`) derives the WARNING+EMF, mirroring
+    # `delta_read_snapshot_ids`'s own path.
+    NestedField(
+        43,
+        "divergent_duplicates_by_table",
+        MapType(44, StringType(), 45, LongType(), value_required=True),
+        required=False,
+    ),
 )
 
 # day(started_at), §6.5.
@@ -397,6 +456,88 @@ def _emit_pre_check_drift(run_fact: RunFact) -> None:
     )
 
 
+def _emit_delta_probe_refusal(run_fact: RunFact) -> None:
+    """007.1 §7.2/§12 (F-5, B9b): an exact mirror of `_emit_post_check_drift`
+    / `_emit_pre_check_drift` above, for commit's own `delta_probe_refusal`
+    -- WARNING + EMF `DeltaProbeRefusals`, reason-dimensioned (ADR-OQ2's four
+    codes, verbatim). `run_fact.delta_probe_refusal` is already the value-
+    free payload ([S-7]/[S-18]: the reason code IS the entire payload, per
+    `stages/commit.py`'s own `resolve_predecessors` call -- no `delivery_
+    key`/hash/batch content ever reaches this channel, by construction of
+    what `ctx.delta_probe_refusal` is ever set to)."""
+    logger = logging.getLogger(_LOGGER_NAME)
+    logger.warning(
+        "delta probe refusal (007.1 §7.2, F-5): %s",
+        run_fact.delta_probe_refusal,
+        extra={
+            "batch_id": run_fact.batch_id,
+            "pipeline": run_fact.pipeline,
+            "feed_id": run_fact.feed_id,
+            "attempt_id": run_fact.attempt_id,
+            "stage": run_fact.stage,
+        },
+    )
+    observability.emit_metric(
+        "DeltaProbeRefusals",
+        1,
+        run_fact.pipeline,
+        run_fact.feed_id,
+        stage=run_fact.stage,
+        extra_dims={"reason": run_fact.delta_probe_refusal or ""},
+    )
+
+
+def _emit_divergent_duplicates(run_fact: RunFact) -> None:
+    """007.1 §12 (D-2(b)) -- WARNING + EMF `DivergentDuplicates`, table-
+    dimensioned, mirroring `_emit_delta_probe_refusal` above. Moved here from
+    `stages/commit.py`'s own naked `observability.emit_metric` call (critique
+    gate wf_24a3125f-ecc F1, bead conveyer-6pg.30): that call was the ONLY
+    `observability.*` reference in any `stages/*.py` module (004 §13.3 breach)
+    and sat outside `record_run`'s never-raise envelope, so a broken metrics
+    sink could fail `commit` itself. `run_fact.divergent_duplicates_by_table`
+    is already the value-free payload ([S-7]/[S-18]: table names and counts
+    only, never row content) -- `stages/commit.py` now only computes the pure
+    per-table count and records it into the context.
+
+    **EMF emitted for every table entry in the map, unconditionally
+    (including a zero count)** -- an exact continuation of the pre-fix
+    stage-side cadence (the metric was emitted for every non-guard-skipped,
+    structurally-valid table reached, regardless of value), preserving
+    CloudWatch's continuous per-batch datapoint for this "the metric is the
+    page" symptomatic signal (§12's own words). **The WARNING log, by
+    contrast, only fires for a table whose count is actually positive** -- a
+    deliberate, documented deviation from the drift channels' "gate the
+    whole emission" shape above: those channels' own `RunFact` field is only
+    ever non-`None` when something anomalous happened, so gating on presence
+    alone is correct there, but `divergent_duplicates_by_table` carries an
+    entry for every reached table on every healthy commit -- warning on
+    every one of them would make WARNING-level logs noise, not signal.
+    """
+    logger = logging.getLogger(_LOGGER_NAME)
+    for table, count in (run_fact.divergent_duplicates_by_table or {}).items():
+        if count > 0:
+            logger.warning(
+                "divergent duplicates (007.1 §12, D-2(b)): table=%s count=%d",
+                table,
+                count,
+                extra={
+                    "batch_id": run_fact.batch_id,
+                    "pipeline": run_fact.pipeline,
+                    "feed_id": run_fact.feed_id,
+                    "attempt_id": run_fact.attempt_id,
+                    "stage": run_fact.stage,
+                },
+            )
+        observability.emit_metric(
+            "DivergentDuplicates",
+            count,
+            run_fact.pipeline,
+            run_fact.feed_id,
+            stage=run_fact.stage,
+            extra_dims={"table": table},
+        )
+
+
 def _log_ledger_loss(run_fact: RunFact, row: Mapping[str, Any]) -> None:
     """On budget exhaustion: WARNING with the row, `error_message` OMITTED
     [S-7] -- this channel's own WARNING line is exactly as indefinitely
@@ -485,6 +626,25 @@ def build_record_run(
                 and run_fact.error_message is not None
             ):
                 _emit_pre_check_drift(run_fact)
+            # 007.1 §7.2/§12 (F-5, B9b): gated on `stage == "commit"` alone
+            # (never `outcome != "failed"` -- unlike the two drift channels
+            # above, `ctx.delta_probe_refusal` is set by `stages/commit.py`
+            # itself on its OWN non-raising path; a genuinely FAILED commit
+            # transition never reaches `_stage_fields`, so `run_fact.
+            # delta_probe_refusal` is `None` there regardless -- the
+            # `is not None` check alone already excludes it, matching
+            # `outcome == "failed"`'s own effect without a redundant clause).
+            if run_fact.stage == "commit" and run_fact.delta_probe_refusal is not None:
+                _emit_delta_probe_refusal(run_fact)
+            # critique gate wf_24a3125f-ecc F1 (bead conveyer-6pg.30): gated
+            # on `stage == "commit"` and the map being present at all (a
+            # genuinely FAILED commit transition never reaches
+            # `_stage_fields`, so `divergent_duplicates_by_table` is `None`
+            # there regardless -- the `is not None` check alone already
+            # excludes it, same reasoning as `delta_probe_refusal`'s own
+            # gate immediately above).
+            if run_fact.stage == "commit" and run_fact.divergent_duplicates_by_table is not None:
+                _emit_divergent_duplicates(run_fact)
         except Exception:  # noqa: BLE001 -- §11.3: record_run NEVER raises
             pass
 

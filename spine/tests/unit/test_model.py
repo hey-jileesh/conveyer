@@ -17,7 +17,7 @@ import pytest
 from hypothesis import given, settings
 from hypothesis import strategies as st
 from pydantic import ValidationError
-from spine.core import model
+from spine.core import model, record
 
 _FIXTURES_DIR = (
     Path(__file__).resolve().parents[3]
@@ -101,14 +101,31 @@ def test_object_uris_rejects_1025_char_entry() -> None:
 
 
 # --- §6.2 PipelineSpecModel / CoEffectDecl: extra="forbid" ------------------
+# --- 006.1 P-1: fact_table/state_table deleted, fact_types (per-type) added -
+
+_VALID_FACT_SCHEMA: dict[str, Any] = {
+    "columns": [
+        {"name": "domain_id", "type": "string"},
+        {"name": "amount", "type": "decimal(10,2)"},
+        {"name": "period", "type": "date"},
+    ],
+    "domain_id_col": "domain_id",
+    "record_key": ["domain_id"],
+    "ordering": ["period"],
+}
+
+_VALID_FACT_TYPE: dict[str, Any] = {
+    "fact_table": "lake.commissions__facts",
+    "state_table": "lake.commissions__state",
+    "schema": _VALID_FACT_SCHEMA,
+}
 
 _VALID_SPEC: dict[str, Any] = {
     "pipeline": "pipelines/commissions",
     "transforms_module": "pipelines.commissions.transforms",
     "raw_table": "lake.commissions__raw",
     "quarantine_table": "lake.commissions__quarantine",
-    "fact_table": "lake.commissions__facts",
-    "state_table": "lake.commissions__state",
+    "fact_types": {"detail": _VALID_FACT_TYPE},
     "read": {"dialect": {"format": "csv"}},
     "raw_contract": {"columns": [{"name": "id"}]},
 }
@@ -121,6 +138,63 @@ def test_pipeline_spec_model_accepts_valid_shape() -> None:
     assert spec.sla_minutes == 480
     assert spec.read.dialect.format == "csv"
     assert spec.raw_contract.columns[0].name == "id"
+    assert list(spec.fact_types) == ["detail"]
+    assert spec.checks.checks == []
+
+
+def test_pipeline_spec_model_no_longer_accepts_singular_fact_state_tables() -> None:
+    # P-1's hard cut (A-12 idiom): the singular fields are gone, not
+    # optional/deprecated -- constructing with them is `extra="forbid"`.
+    data = {k: v for k, v in _VALID_SPEC.items() if k != "fact_types"}
+    data["fact_table"] = "lake.commissions__facts"
+    data["state_table"] = "lake.commissions__state"
+    with pytest.raises(ValidationError):
+        model.PipelineSpecModel(**data)
+
+
+def test_pipeline_spec_model_requires_non_empty_fact_types() -> None:
+    with pytest.raises(ValidationError):
+        model.PipelineSpecModel(**{**_VALID_SPEC, "fact_types": {}})
+
+
+def test_pipeline_spec_model_rejects_custom_fold() -> None:
+    with pytest.raises(ValidationError, match="custom-fold-refused"):
+        model.PipelineSpecModel(**{**_VALID_SPEC, "fold": "custom"})
+
+
+def test_pipeline_spec_model_rejects_table_collision_across_fact_types() -> None:
+    with pytest.raises(ValidationError, match="fact-table-collision"):
+        model.PipelineSpecModel(
+            **{
+                **_VALID_SPEC,
+                "fact_types": {
+                    "a": _VALID_FACT_TYPE,
+                    "b": {**_VALID_FACT_TYPE, "fact_table": "lake.other__facts"},
+                },
+            }
+        )
+
+
+def test_pipeline_spec_model_rejects_bad_fact_type_name() -> None:
+    with pytest.raises(ValidationError, match="fact-table-collision"):
+        model.PipelineSpecModel(**{**_VALID_SPEC, "fact_types": {"Not Valid!": _VALID_FACT_TYPE}})
+
+
+def test_pipeline_spec_model_multiple_fact_types_round_trip() -> None:
+    spec = model.PipelineSpecModel(
+        **{
+            **_VALID_SPEC,
+            "fact_types": {
+                "detail": _VALID_FACT_TYPE,
+                "summary": {
+                    **_VALID_FACT_TYPE,
+                    "fact_table": "lake.commissions_summary__facts",
+                    "state_table": "lake.commissions_summary__state",
+                },
+            },
+        }
+    )
+    assert list(spec.fact_types) == ["detail", "summary"]  # insertion order preserved (P-1)
 
 
 # --- 005.1 §3.4/A-12: `read`/`raw_contract` required, `required_columns`/`read`-dict deleted ---
@@ -681,3 +755,384 @@ def test_property_every_conveyer_prefixed_name_rejected(suffix: str) -> None:
     name = f"_conveyer_{suffix}"
     with pytest.raises(ValidationError):
         model.RawContractModel(columns=[model.ColumnSpec(name=name)])
+
+
+# --- 006.1 §4.1 FactColumnSpec / FactSchemaModel ----------------------------
+
+
+def test_fact_column_spec_accepts_every_kind() -> None:
+    for type_str in ["string", "int", "long", "bool", "decimal(10,2)", "date", "timestamp"]:
+        assert model.FactColumnSpec(name="a", type=type_str).type == type_str
+
+
+def test_fact_column_spec_rejects_fmt_bearing_type() -> None:
+    # 006.1's fact-column grammar has NO fmt params (candidates are already
+    # typed) -- unlike 005.1's raw-contract `date(fmt)`/`timestamp(fmt)`.
+    with pytest.raises(ValidationError):
+        model.FactColumnSpec(name="a", type="date(yyyy-MM-dd)")
+
+
+def test_fact_column_spec_rejects_float_double() -> None:
+    for type_str in ["float", "double"]:
+        with pytest.raises(ValidationError):
+            model.FactColumnSpec(name="a", type=type_str)
+
+
+def test_fact_schema_model_accepts_valid_shape() -> None:
+    schema = model.FactSchemaModel(**_VALID_FACT_SCHEMA)
+    assert schema.domain_id_col == "domain_id"
+    assert schema.record_key == ["domain_id"]
+    assert schema.ordering == ["period"]
+
+
+def test_fact_schema_model_allows_empty_ordering_default() -> None:
+    schema = model.FactSchemaModel(
+        columns=[{"name": "domain_id", "type": "string"}],
+        domain_id_col="domain_id",
+        record_key=["domain_id"],
+    )
+    assert schema.ordering == []
+
+
+def test_fact_schema_model_rejects_duplicate_column_names() -> None:
+    with pytest.raises(ValidationError, match="fact-column-reserved-name"):
+        model.FactSchemaModel(
+            columns=[{"name": "a", "type": "string"}, {"name": "a", "type": "string"}],
+            domain_id_col="a",
+            record_key=["a"],
+        )
+
+
+@pytest.mark.parametrize("framework_name", sorted(record.FACT_STAMP_COLUMNS))
+def test_fact_schema_model_rejects_each_framework_stamp_column_name(framework_name: str) -> None:
+    with pytest.raises(ValidationError, match="fact-column-reserved-name"):
+        model.FactSchemaModel(
+            columns=[{"name": framework_name, "type": "string"}],
+            domain_id_col=framework_name,
+            record_key=[framework_name],
+        )
+
+
+def test_fact_schema_model_rejects_conveyer_prefixed_column_name() -> None:
+    with pytest.raises(ValidationError, match="fact-column-reserved-name"):
+        model.FactSchemaModel(
+            columns=[{"name": "_conveyer_x", "type": "string"}],
+            domain_id_col="_conveyer_x",
+            record_key=["_conveyer_x"],
+        )
+
+
+def test_fact_schema_model_rejects_domain_id_col_not_declared() -> None:
+    with pytest.raises(ValidationError, match="fact-schema-unknown-column-ref"):
+        model.FactSchemaModel(
+            columns=[{"name": "a", "type": "string"}], domain_id_col="zzz", record_key=["a"]
+        )
+
+
+def test_fact_schema_model_rejects_record_key_unknown_column() -> None:
+    with pytest.raises(ValidationError, match="fact-schema-unknown-column-ref"):
+        model.FactSchemaModel(
+            columns=[{"name": "a", "type": "string"}], domain_id_col="a", record_key=["zzz"]
+        )
+
+
+def test_fact_schema_model_rejects_ordering_unknown_column() -> None:
+    with pytest.raises(ValidationError, match="fact-schema-unknown-column-ref"):
+        model.FactSchemaModel(
+            columns=[{"name": "a", "type": "string"}],
+            domain_id_col="a",
+            record_key=["a"],
+            ordering=["zzz"],
+        )
+
+
+def test_fact_schema_model_rejects_empty_record_key() -> None:
+    with pytest.raises(ValidationError):
+        model.FactSchemaModel(
+            columns=[{"name": "a", "type": "string"}], domain_id_col="a", record_key=[]
+        )
+
+
+def test_fact_schema_model_rejects_decimal_scale_greater_than_precision() -> None:
+    with pytest.raises(ValidationError, match="scale must be <= precision"):
+        model.FactSchemaModel(
+            columns=[{"name": "a", "type": "string"}, {"name": "amt", "type": "decimal(5,10)"}],
+            domain_id_col="a",
+            record_key=["a"],
+        )
+
+
+def test_fact_schema_model_rejects_decimal_precision_over_38() -> None:
+    with pytest.raises(ValidationError, match="DC-10"):
+        model.FactSchemaModel(
+            columns=[{"name": "a", "type": "string"}, {"name": "amt", "type": "decimal(39,2)"}],
+            domain_id_col="a",
+            record_key=["a"],
+        )
+
+
+def test_fact_schema_model_rejects_bool_ordering_column() -> None:
+    # F5: `bool` is fact-column-grammar-valid but NOT in
+    # `record.ORDERING_COMPARABLE_TYPES` -- excluded (no customer, no
+    # recency meaning) -- the validator imports the one code constant.
+    with pytest.raises(ValidationError, match="ordering-type-not-comparable"):
+        model.FactSchemaModel(
+            columns=[{"name": "a", "type": "string"}, {"name": "flag", "type": "bool"}],
+            domain_id_col="a",
+            record_key=["a"],
+            ordering=["flag"],
+        )
+
+
+@pytest.mark.parametrize("kind", sorted(record.ORDERING_COMPARABLE_TYPES))
+def test_fact_schema_model_accepts_every_ordering_comparable_kind(kind: str) -> None:
+    type_str = "decimal(10,2)" if kind == "decimal" else kind
+    schema = model.FactSchemaModel(
+        columns=[{"name": "a", "type": "string"}, {"name": "b", "type": type_str}],
+        domain_id_col="a",
+        record_key=["a"],
+        ordering=["b"],
+    )
+    assert schema.ordering == ["b"]
+
+
+# --- 006.1 §4.2 ChecksModel / per-kind check models -------------------------
+
+_ROW_CHECK: dict[str, Any] = {
+    "kind": "row",
+    "id": "chk-negative-amount",
+    "fact_type": "detail",
+    "expr": "amount > 0",
+    "reason": "business/negative-amount",
+}
+
+
+def test_row_check_model_accepts_valid_shape() -> None:
+    check = model.RowCheckModel(**_ROW_CHECK)
+    assert check.kind == "row"
+    assert check.id == "chk-negative-amount"
+
+
+def test_row_check_model_rejects_reserved_id() -> None:
+    with pytest.raises(ValidationError, match="check-id-reserved"):
+        model.RowCheckModel(**{**_ROW_CHECK, "id": "missing-domain-id"})
+
+
+def test_row_check_model_rejects_reserved_reason() -> None:
+    with pytest.raises(ValidationError, match="check-reason-reserved"):
+        model.RowCheckModel(**{**_ROW_CHECK, "reason": "business/missing-domain-id"})
+
+
+@pytest.mark.parametrize("reason", ["negative-amount", "Business/x", "business/", "business/X"])
+def test_row_check_model_rejects_malformed_reason(reason: str) -> None:
+    with pytest.raises(ValidationError):
+        model.RowCheckModel(**{**_ROW_CHECK, "reason": reason})
+
+
+def test_row_check_model_rejects_extra_field() -> None:
+    with pytest.raises(ValidationError):
+        model.RowCheckModel(**{**_ROW_CHECK, "unexpected": True})
+
+
+_MEMBERSHIP_CHECK: dict[str, Any] = {
+    "kind": "membership",
+    "id": "chk-unknown-code",
+    "fact_type": "detail",
+    "columns": ["domain_id"],
+    "co_effect": "rate_cards",
+    "ref_columns": ["code"],
+    "reason": "business/unknown-code",
+}
+
+
+def test_membership_check_model_accepts_valid_shape() -> None:
+    check = model.MembershipCheckModel(**_MEMBERSHIP_CHECK)
+    assert check.co_effect == "rate_cards"
+
+
+def test_membership_check_model_rejects_arity_mismatch() -> None:
+    with pytest.raises(ValidationError, match="membership-columns-outside-declaration"):
+        model.MembershipCheckModel(
+            **{**_MEMBERSHIP_CHECK, "columns": ["a", "b"], "ref_columns": ["c"]}
+        )
+
+
+_BATCH_CHECK: dict[str, Any] = {
+    "kind": "batch_check",
+    "id": "chk-reconcile",
+    "fact_type": "detail",
+    "aggregate": "sum(amount)",
+    "control": {"member": "summary", "expr": "total"},
+}
+
+
+def test_batch_check_model_own_fields_parse_independently() -> None:
+    # The kind is fully specified/parseable on its own (P-6) -- the
+    # structural K7 wait lives on `ChecksModel`, not on this model.
+    check = model.BatchCheckModel(**_BATCH_CHECK)
+    assert check.control.member == "summary"
+    assert check.tolerance is None
+
+
+def test_batch_check_model_accepts_non_negative_tolerance() -> None:
+    check = model.BatchCheckModel(**{**_BATCH_CHECK, "tolerance": "0.01"})
+    assert check.tolerance == "0.01"
+
+
+def test_batch_check_model_rejects_negative_tolerance() -> None:
+    with pytest.raises(ValidationError):
+        model.BatchCheckModel(**{**_BATCH_CHECK, "tolerance": "-0.01"})
+
+
+def test_checks_model_defaults_to_empty() -> None:
+    assert model.ChecksModel().checks == []
+
+
+def test_checks_model_routes_discriminated_union_by_kind() -> None:
+    checks = model.ChecksModel(checks=[_ROW_CHECK, _MEMBERSHIP_CHECK])
+    assert [type(c).__name__ for c in checks.checks] == ["RowCheckModel", "MembershipCheckModel"]
+
+
+def test_checks_model_rejects_duplicate_ids_across_kinds() -> None:
+    with pytest.raises(ValidationError, match="check-duplicate-id"):
+        model.ChecksModel(checks=[_ROW_CHECK, {**_MEMBERSHIP_CHECK, "id": _ROW_CHECK["id"]}])
+
+
+def test_checks_model_rejects_any_batch_check_awaiting_member_grammar() -> None:
+    with pytest.raises(ValidationError, match="batch-check-awaiting-member-grammar"):
+        model.ChecksModel(checks=[_BATCH_CHECK])
+
+
+# --- 006.1 §4.3 FactTypeModel + PipelineSpecModel's checks cross-validators -
+
+
+def test_fact_type_model_accepts_valid_shape() -> None:
+    ft = model.FactTypeModel(**_VALID_FACT_TYPE)
+    assert ft.fact_table == "lake.commissions__facts"
+    assert ft.schema_.domain_id_col == "domain_id"
+
+
+def test_fact_type_model_rejects_bad_table_identifier() -> None:
+    with pytest.raises(ValidationError):
+        model.FactTypeModel(**{**_VALID_FACT_TYPE, "fact_table": "bad-table"})
+
+
+def test_pipeline_spec_model_accepts_row_and_membership_checks() -> None:
+    spec = model.PipelineSpecModel(
+        **{
+            **_VALID_SPEC,
+            "co_effects": {"rate_cards": {"table": "lake.rate_cards", "columns": ["code"]}},
+            "checks": {"checks": [_ROW_CHECK, _MEMBERSHIP_CHECK]},
+        }
+    )
+    assert [c.id for c in spec.checks.checks] == [_ROW_CHECK["id"], _MEMBERSHIP_CHECK["id"]]
+
+
+def test_pipeline_spec_model_rejects_check_unknown_fact_type() -> None:
+    with pytest.raises(ValidationError, match="check-unknown-fact-type"):
+        model.PipelineSpecModel(
+            **{**_VALID_SPEC, "checks": {"checks": [{**_ROW_CHECK, "fact_type": "zzz"}]}}
+        )
+
+
+def test_pipeline_spec_model_rejects_check_column_outside_type() -> None:
+    with pytest.raises(ValidationError, match="check-column-outside-type"):
+        model.PipelineSpecModel(
+            **{**_VALID_SPEC, "checks": {"checks": [{**_ROW_CHECK, "expr": "unknown_col > 0"}]}}
+        )
+
+
+def test_pipeline_spec_model_rejects_gatekeeper_rejected_expression() -> None:
+    with pytest.raises(ValidationError, match="check-expression-rejected"):
+        model.PipelineSpecModel(
+            **{**_VALID_SPEC, "checks": {"checks": [{**_ROW_CHECK, "expr": "rand() > 0"}]}}
+        )
+
+
+def test_pipeline_spec_model_rejects_mixed_family_expression() -> None:
+    with pytest.raises(ValidationError, match="check-expression-mixed-types"):
+        model.PipelineSpecModel(
+            **{**_VALID_SPEC, "checks": {"checks": [{**_ROW_CHECK, "expr": "amount = 'x'"}]}}
+        )
+
+
+def test_pipeline_spec_model_rejects_membership_unknown_co_effect() -> None:
+    with pytest.raises(ValidationError, match="membership-unknown-co-effect"):
+        model.PipelineSpecModel(
+            **{**_VALID_SPEC, "co_effects": {}, "checks": {"checks": [_MEMBERSHIP_CHECK]}}
+        )
+
+
+def test_pipeline_spec_model_rejects_membership_ref_columns_outside_declared_co_effect() -> None:
+    with pytest.raises(ValidationError, match="membership-columns-outside-declaration"):
+        model.PipelineSpecModel(
+            **{
+                **_VALID_SPEC,
+                "co_effects": {"rate_cards": {"table": "lake.rate_cards", "columns": ["other"]}},
+                "checks": {"checks": [_MEMBERSHIP_CHECK]},
+            }
+        )
+
+
+def test_pipeline_spec_model_membership_ref_columns_unchecked_when_co_effect_undeclared() -> None:
+    # C8's bind half (ref_columns ⊆ the CATALOG schema when the co-effect
+    # declares no `columns:`) is `core/bind_checks.py`'s job, not this
+    # parse-time validator's -- an undeclared-columns co-effect is silent
+    # here by design.
+    spec = model.PipelineSpecModel(
+        **{
+            **_VALID_SPEC,
+            "co_effects": {"rate_cards": {"table": "lake.rate_cards"}},
+            "checks": {"checks": [_MEMBERSHIP_CHECK]},
+        }
+    )
+    assert spec.co_effects["rate_cards"].columns is None
+
+
+# --- 006.1 §4: the strict-YAML duplicate-key-rejecting loader ---------------
+
+
+def test_parse_pipeline_spec_yaml_accepts_clean_spec() -> None:
+    import yaml as _yaml
+
+    text = _yaml.safe_dump(_VALID_SPEC)
+    spec = model.parse_pipeline_spec_yaml(text)
+    assert spec.pipeline == "pipelines/commissions"
+
+
+def test_parse_pipeline_spec_yaml_rejects_duplicate_top_level_key() -> None:
+    text = "pipeline: pipelines/commissions\npipeline: pipelines/other\n"
+    with pytest.raises(ValueError, match="duplicate-key"):
+        model.parse_pipeline_spec_yaml(text)
+
+
+def test_parse_pipeline_spec_yaml_rejects_duplicate_nested_key() -> None:
+    text = """
+pipeline: pipelines/commissions
+transforms_module: pipelines.commissions.transforms
+raw_table: lake.commissions__raw
+quarantine_table: lake.commissions__quarantine
+fact_types:
+  detail:
+    fact_table: lake.commissions__facts
+    state_table: lake.commissions__state
+    schema:
+      columns:
+        - {name: domain_id, type: string}
+      domain_id_col: domain_id
+      domain_id_col: domain_id
+      record_key: [domain_id]
+read:
+  dialect: {format: csv}
+raw_contract:
+  columns:
+    - {name: id}
+"""
+    with pytest.raises(ValueError, match="duplicate-key"):
+        model.parse_pipeline_spec_yaml(text)
+
+
+def test_parse_pipeline_spec_yaml_still_raises_pydantic_validation_error() -> None:
+    text = "pipeline: not-a-pipeline-slug--evil\n"
+    with pytest.raises(ValidationError):
+        model.parse_pipeline_spec_yaml(text)

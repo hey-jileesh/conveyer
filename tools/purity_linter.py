@@ -32,7 +32,11 @@ itself the outermost `Call.func` of a call expression, so a bare mid-chain
 lookup like `df.sparkSession.read.parquet(path)` trips on `sparkSession` and
 `read` even though neither is ever directly called (fixed post-M5, critique
 F3: the prior outermost-call-only check was the "just one lookup" erosion
-vector — see `_attr_name_violations`); `string_sql_sinks` + the config-level
+vector — see `_attr_name_violations`), and may be licensed by name in exactly
+one file via the config-level `banned_attr_exemption` — a `(rel_path,
+attr_name)` pair set (007.1 [DC2-2], B11-local: this mechanism did not exist
+before that bead; `tools/linter_configs/spine.py` used to carry an explicit
+comment recording the gap); `string_sql_sinks` + the config-level
 `string_sql_exemption` implement the string-SQL review rule (an f-string/
 `.format()`/`%`-formatted argument flowing into a named sink call), exempted
 only by the same `(rel_path, function)` allowlist mechanism as the try/raise
@@ -93,6 +97,28 @@ class LinterConfig:
     Idiom rules (banned imports, class-shape) are engine-wide (apply to every
     walked file) rather than profile-scoped, matching the pre-promotion
     "idiom applies everywhere, purity applies to a subset" split.
+
+    `banned_attr_exemption` (007.1 [DC2-2], bead `conveyer-6pg.23`, B11-local)
+    is the per-file exemption mechanism `banned_attr_names` lacked until this
+    revision — `tools/linter_configs/spine.py` used to document the gap
+    explicitly (`_SPARK_BANNED_ATTR_NAMES`'s own comment: "`banned_attr_names`
+    has NO `(file, function)` exemption mechanism yet ... a future bead
+    needing a real `F.count` aggregate ... must add that exemption mechanism
+    to `tools/purity_linter.py` first, not silently work around this ban").
+    Same shape and granularity as `class_shape_allowlist`/`string_sql_
+    exemption` — a hardcoded `(rel_path, attr_name)` pair set — but scoped to
+    the WHOLE FILE, not a named function: `banned_attr_names`' own rule fires
+    on every `ast.Attribute` node regardless of which function (or none) it
+    sits in, so a function-scoped allowlist (walking one `FunctionDef`'s
+    subtree, `_allowlisted_control_flow_ids`'s own technique) cannot express
+    "this ONE blessed module may render the ban's construction, anywhere in
+    the file" — the licensed shape §15's own row names ("the spine linter's
+    banned-attribute profile bans `.overwrite(` outside the one blessed
+    rebuild/swap module (per-file exemption)"). `[DS2-2]`'s own governance
+    note (a config-module comment, not an engine concern): growth of a
+    profile's `banned_attr_names` OR of this exemption set carries the same
+    platform-data-architecture-owner-plus-security-gate countersign as any
+    other licensed hole in the construction.
     """
 
     name: str
@@ -102,12 +128,15 @@ class LinterConfig:
     idiom_banned_import_roots: tuple[str, ...] = ()
     idiom_banned_import_dotted: tuple[str, ...] = ()
     allowed_enum_base_names: frozenset[str] = field(
-        default_factory=lambda: frozenset({"Enum", "IntEnum", "StrEnum", "Flag", "IntFlag"})
+        default_factory=lambda: frozenset(
+            {"Enum", "IntEnum", "StrEnum", "Flag", "IntFlag"}
+        )
     )
     try_raise_allowlist: frozenset[tuple[str, str]] = frozenset()
     validator_decorator_names: frozenset[str] = frozenset()
     class_shape_allowlist: frozenset[tuple[str, str]] = frozenset()
     string_sql_exemption: frozenset[tuple[str, str]] = frozenset()
+    banned_attr_exemption: frozenset[tuple[str, str]] = frozenset()
 
 
 # --- values ------------------------------------------------------------------
@@ -159,7 +188,9 @@ def _check_dotted_import(
     for profile in profiles:
         for banned in profile.banned_import_roots:
             if _root_matches(dotted, banned):
-                out.append(Violation(rel_path, lineno, f"purity-banned-import:{banned}"))
+                out.append(
+                    Violation(rel_path, lineno, f"purity-banned-import:{banned}")
+                )
                 break
     for banned in config.idiom_banned_import_roots + config.idiom_banned_import_dotted:
         if _root_matches(dotted, banned):
@@ -169,26 +200,39 @@ def _check_dotted_import(
 
 
 def _import_violations(
-    tree: ast.Module, rel_path: str, config: LinterConfig, profiles: tuple[ScopeProfile, ...]
+    tree: ast.Module,
+    rel_path: str,
+    config: LinterConfig,
+    profiles: tuple[ScopeProfile, ...],
 ) -> list[Violation]:
     out: list[Violation] = []
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             for alias in node.names:
                 out.extend(
-                    _check_dotted_import(alias.name, node.lineno, rel_path, config, profiles)
+                    _check_dotted_import(
+                        alias.name, node.lineno, rel_path, config, profiles
+                    )
                 )
         elif isinstance(node, ast.ImportFrom):
             module = node.module
             if module is not None:
-                out.extend(_check_dotted_import(module, node.lineno, rel_path, config, profiles))
+                out.extend(
+                    _check_dotted_import(
+                        module, node.lineno, rel_path, config, profiles
+                    )
+                )
             # `from unittest import mock` — module is "unittest" alone (not
             # banned), the submodule import is named in `names` instead.
             if module == "unittest":
                 for alias in node.names:
                     if alias.name == "mock":
                         out.append(
-                            Violation(rel_path, node.lineno, "idiom-banned-import:unittest.mock")
+                            Violation(
+                                rel_path,
+                                node.lineno,
+                                "idiom-banned-import:unittest.mock",
+                            )
                         )
     return out
 
@@ -224,13 +268,17 @@ def _is_allowed_class(node: ast.ClassDef, rel_path: str, config: LinterConfig) -
 
 
 def _class_shape_violations(
-    tree: ast.Module, rel_path: str, config: LinterConfig, profiles: tuple[ScopeProfile, ...]
+    tree: ast.Module,
+    rel_path: str,
+    config: LinterConfig,
+    profiles: tuple[ScopeProfile, ...],
 ) -> list[Violation]:
     del profiles  # idiom rule applies regardless of profile
     return [
         Violation(rel_path, node.lineno, "idiom-class")
         for node in ast.walk(tree)
-        if isinstance(node, ast.ClassDef) and not _is_allowed_class(node, rel_path, config)
+        if isinstance(node, ast.ClassDef)
+        and not _is_allowed_class(node, rel_path, config)
     ]
 
 
@@ -249,7 +297,10 @@ def _call_violation_name(node: ast.Call, profile: ScopeProfile) -> str | None:
 
 
 def _banned_call_violations(
-    tree: ast.Module, rel_path: str, config: LinterConfig, profiles: tuple[ScopeProfile, ...]
+    tree: ast.Module,
+    rel_path: str,
+    config: LinterConfig,
+    profiles: tuple[ScopeProfile, ...],
 ) -> list[Violation]:
     del config
     out: list[Violation] = []
@@ -258,7 +309,9 @@ def _banned_call_violations(
             for profile in profiles:
                 name = _call_violation_name(node, profile)
                 if name is not None:
-                    out.append(Violation(rel_path, node.lineno, f"purity-banned-call:{name}"))
+                    out.append(
+                        Violation(rel_path, node.lineno, f"purity-banned-call:{name}")
+                    )
     return out
 
 
@@ -266,7 +319,10 @@ def _banned_call_violations(
 
 
 def _attr_name_violations(
-    tree: ast.Module, rel_path: str, config: LinterConfig, profiles: tuple[ScopeProfile, ...]
+    tree: ast.Module,
+    rel_path: str,
+    config: LinterConfig,
+    profiles: tuple[ScopeProfile, ...],
 ) -> list[Violation]:
     """Flags every `ast.Attribute` node whose `.attr` is in a matching
     profile's `banned_attr_names` — bare mid-chain access (`df.sparkSession`)
@@ -278,14 +334,30 @@ def _attr_name_violations(
 
     A plain `ast.Name` (e.g. a local variable literally named `read`) is
     never an `ast.Attribute` and so can never trip this rule — only actual
-    attribute access on some receiver does."""
-    del config
+    attribute access on some receiver does.
+
+    `config.banned_attr_exemption` (007.1 [DC2-2], B11-local) is the
+    per-file exemption this rule lacked at first authoring — a `(rel_path,
+    attr_name)` pair in that set silences ONLY that one name in that one
+    file, leaving every other banned name (and every other file) fully
+    enforced; see `LinterConfig`'s own docstring for the full account."""
     out: list[Violation] = []
     for node in ast.walk(tree):
         if isinstance(node, ast.Attribute):
             for profile in profiles:
-                if node.attr in profile.banned_attr_names:
-                    out.append(Violation(rel_path, node.lineno, f"purity-banned-attr:{node.attr}"))
+                if (
+                    node.attr in profile.banned_attr_names
+                    and (
+                        rel_path,
+                        node.attr,
+                    )
+                    not in config.banned_attr_exemption
+                ):
+                    out.append(
+                        Violation(
+                            rel_path, node.lineno, f"purity-banned-attr:{node.attr}"
+                        )
+                    )
     return out
 
 
@@ -305,7 +377,9 @@ def _allowlisted_control_flow_ids(
             and (rel_path, node.name) in config.try_raise_allowlist
         ):
             ids.update(
-                id(inner) for inner in ast.walk(node) if isinstance(inner, (ast.Try, ast.Raise))
+                id(inner)
+                for inner in ast.walk(node)
+                if isinstance(inner, (ast.Try, ast.Raise))
             )
     return frozenset(ids)
 
@@ -317,7 +391,9 @@ def _is_validator_decorator(dec: ast.expr, config: LinterConfig) -> bool:
     return _terminal_name(target) in config.validator_decorator_names
 
 
-def _validator_decorated_raise_ids(tree: ast.Module, config: LinterConfig) -> frozenset[int]:
+def _validator_decorated_raise_ids(
+    tree: ast.Module, config: LinterConfig
+) -> frozenset[int]:
     """ids of every `Raise` node lexically inside a function whose decorator
     list includes a validator decorator — exempt from `purity-raise` only;
     `try` is untouched by this rule."""
@@ -326,12 +402,17 @@ def _validator_decorated_raise_ids(tree: ast.Module, config: LinterConfig) -> fr
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and any(
             _is_validator_decorator(dec, config) for dec in node.decorator_list
         ):
-            ids.update(id(inner) for inner in ast.walk(node) if isinstance(inner, ast.Raise))
+            ids.update(
+                id(inner) for inner in ast.walk(node) if isinstance(inner, ast.Raise)
+            )
     return frozenset(ids)
 
 
 def _control_flow_violations(
-    tree: ast.Module, rel_path: str, config: LinterConfig, profiles: tuple[ScopeProfile, ...]
+    tree: ast.Module,
+    rel_path: str,
+    config: LinterConfig,
+    profiles: tuple[ScopeProfile, ...],
 ) -> list[Violation]:
     if not any(profile.ban_try_raise for profile in profiles):
         return []
@@ -351,7 +432,9 @@ def _control_flow_violations(
 # --- checker: string-SQL (profile-scoped sinks, engine-wide exemption) ----
 
 
-def _string_sql_exempt_ids(tree: ast.Module, rel_path: str, config: LinterConfig) -> frozenset[int]:
+def _string_sql_exempt_ids(
+    tree: ast.Module, rel_path: str, config: LinterConfig
+) -> frozenset[int]:
     """ids of every `Call` node lexically inside one of the `(file, function)`
     entries in `config.string_sql_exemption` — the single hardcoded escape
     hatch for a rendered MERGE (§12.3), same allowlist-by-function mechanism
@@ -362,7 +445,9 @@ def _string_sql_exempt_ids(tree: ast.Module, rel_path: str, config: LinterConfig
             isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
             and (rel_path, node.name) in config.string_sql_exemption
         ):
-            ids.update(id(inner) for inner in ast.walk(node) if isinstance(inner, ast.Call))
+            ids.update(
+                id(inner) for inner in ast.walk(node) if isinstance(inner, ast.Call)
+            )
     return frozenset(ids)
 
 
@@ -383,7 +468,10 @@ def _is_stringy_sql_arg(node: ast.expr) -> bool:
 
 
 def _string_sql_violations(
-    tree: ast.Module, rel_path: str, config: LinterConfig, profiles: tuple[ScopeProfile, ...]
+    tree: ast.Module,
+    rel_path: str,
+    config: LinterConfig,
+    profiles: tuple[ScopeProfile, ...],
 ) -> list[Violation]:
     sinks: frozenset[str] = frozenset()
     for profile in profiles:
@@ -400,12 +488,17 @@ def _string_sql_violations(
             and id(node) not in exempt
             and any(_is_stringy_sql_arg(arg) for arg in node.args)
         ):
-            out.append(Violation(rel_path, node.lineno, f"idiom-string-sql:{node.func.attr}"))
+            out.append(
+                Violation(rel_path, node.lineno, f"idiom-string-sql:{node.func.attr}")
+            )
     return out
 
 
 _CHECKERS: tuple[
-    Callable[[ast.Module, str, LinterConfig, tuple[ScopeProfile, ...]], list[Violation]], ...
+    Callable[
+        [ast.Module, str, LinterConfig, tuple[ScopeProfile, ...]], list[Violation]
+    ],
+    ...,
 ] = (
     _import_violations,
     _class_shape_violations,
@@ -416,7 +509,9 @@ _CHECKERS: tuple[
 )
 
 
-def lint_source(source: str, rel_path: str, config: LinterConfig) -> tuple[Violation, ...]:
+def lint_source(
+    source: str, rel_path: str, config: LinterConfig
+) -> tuple[Violation, ...]:
     """Lint one file's already-read source text.
 
     `rel_path` is a POSIX-style path relative to the repo root (e.g.
@@ -425,7 +520,9 @@ def lint_source(source: str, rel_path: str, config: LinterConfig) -> tuple[Viola
     """
     tree = ast.parse(source, filename=rel_path)
     profiles = _matching_profiles(rel_path, config)
-    violations = [v for checker in _CHECKERS for v in checker(tree, rel_path, config, profiles)]
+    violations = [
+        v for checker in _CHECKERS for v in checker(tree, rel_path, config, profiles)
+    ]
     return tuple(sorted(violations, key=lambda v: (v.rel_path, v.line, v.rule)))
 
 

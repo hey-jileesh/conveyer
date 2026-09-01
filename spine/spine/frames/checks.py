@@ -16,18 +16,30 @@ count into control flow itself.
 by bead conveyer-azr.19 (n3-admission-cut)** — `stages/pre_check.py` now
 cuts over entirely to `compile_contract`'s real grammar (005 §7.1 replaces
 I-P2's literal-reason convenience); nothing in `spine/` calls the old pair
-any more. `violation_subtraction` is I-12's all-column bag-subtraction —
-**retained permanently**, not provisional: 005.1 §6.5's "one deletion, not
-two mechanisms" sentence (discharging 004.1 errata proposal 5, §15.3(5))
-refers only to pre_check's OWN guard-skip rerun subtraction, which is
-`locator_subtraction` below — `violation_subtraction` keeps serving
-post_check's fresh-path bag subtraction (005.1 §8.2.3 [DC-5]), a use this
-LLD explicitly keeps unchanged. Do not delete it. `hash_subtraction` (this
-bead) is post_check's OWN guard-skip rerun mechanism (§8.2.4 [DC-5]) — a
-THIRD, distinct subtraction shape (hash-keyed, not bag/locator-keyed),
-needed only because a durable post_check quarantine row no longer carries
-candidate columns at all (only `row_hash`), so an all-column or
-locator-keyed anti-join is impossible on that one path.
+any more.
+
+**`violation_subtraction` is RETIRED (006.1 P-7(c)/§8.1, bead
+conveyer-6pg.13, B3) — superseding the note this docstring used to carry
+("retained permanently... do not delete it").** That note's own rationale
+(005.1 §6.5's "one deletion, not two mechanisms" sentence, discharging
+004.1 errata proposal 5 — post_check's fresh-path bag subtraction was the
+one interim use it explicitly kept alive) has ENDED: `stages/post_check.py`
+no longer calls a shared, opaque, pipeline-returned violations frame
+through an all-column anti-join — the framework's own interpreter (`frames/
+business_checks.py::evaluate`) computes `admitted_candidates`/`business_
+violations` as two COMPLEMENTARY projections of one evaluated frame,
+in-memory, per fact type; that complementary-filter split already **is**
+the bag subtraction ([DC-5]'s multiplicity-preserving semantics, for free,
+with no join at all) whenever the subtrahend is framework-computed (006.1
+§8.1's own wording). Registered as a 006 §5.4 wording erratum (006.1
+§16.5 item 2) — the LLD's "bag-subtracted via `violation_subtraction`"
+phrasing reads as [DC-5]'s *semantics*, not a mandate to keep calling this
+specific function. `hash_subtraction` (below) is UNCHANGED and remains
+post_check's OWN guard-skip rerun mechanism (§8.3 [DC-5]) — a distinct,
+hash-keyed shape (not bag/locator-keyed), needed only because a durable
+post_check quarantine row no longer carries candidate columns at all (only
+`row_hash`), so an all-column or locator-keyed anti-join is impossible on
+that one path.
 
 **005.1 §6.1-§6.6**: `compile_contract` turns a `RawContractModel` into a
 `CompiledContract` — a frozen, ordered tuple of `CheckEntry` values, one per
@@ -54,7 +66,6 @@ from typing import TYPE_CHECKING
 
 from pyspark.sql import functions as F
 from pyspark.sql.types import IntegerType, StringType, StructField, StructType
-from pyspark.sql.window import Window
 
 from spine.core.contract import ColumnType, parse_column_type
 from spine.core.merge import quote_identifier
@@ -63,8 +74,6 @@ if TYPE_CHECKING:
     from pyspark.sql import Column, DataFrame
 
     from spine.core.model import ColumnSpec, RawContractModel
-
-_BAG_RN_COL = "_conveyer_bag_rn"
 
 # 005.1 §12.1/§6.2: the three session pins §6.2's cast-semantics table is
 # normative under — load-bearing, not hygiene. The default
@@ -90,35 +99,6 @@ SESSION_PINS: Mapping[str, str] = MappingProxyType(
         "spark.sql.session.timeZone": "UTC",
     }
 )
-
-
-def violation_subtraction(candidate_df: DataFrame, violations_df: DataFrame) -> DataFrame:
-    """`candidate_df` anti-joined against `violations_df` on all shared
-    columns (I-12, provisional — 006 owns a keyed violation identity).
-
-    Multiplicity-preserving (bag subtraction, [C-8]): if a given
-    shared-column value-tuple appears `k` times in `candidate_df` and `m`
-    times in `violations_df`, exactly `min(k, m)` copies are removed,
-    leaving `max(k - m, 0)` — never the "drop every copy the instant ANY one
-    of them is a violation" a naive value-based anti-join would produce.
-    Achieved by row-numbering each side within its own shared-column
-    partition and anti-joining on `(shared columns, row number)`; the
-    row-number pairing is an implementation artifact of computing the
-    subtraction, not a published contract.
-
-    No shared columns ⇒ nothing is determinable from this identity;
-    `candidate_df` is returned unchanged.
-    """
-    shared_columns = [c for c in candidate_df.columns if c in violations_df.columns]
-    if not shared_columns:
-        return candidate_df
-    window = Window.partitionBy(*shared_columns).orderBy(F.monotonically_increasing_id())
-    candidate_ranked = candidate_df.withColumn(_BAG_RN_COL, F.row_number().over(window))
-    violations_ranked = violations_df.select(*shared_columns).withColumn(
-        _BAG_RN_COL, F.row_number().over(window)
-    )
-    join_keys = [*shared_columns, _BAG_RN_COL]
-    return candidate_ranked.join(violations_ranked, on=join_keys, how="left_anti").drop(_BAG_RN_COL)
 
 
 _HASH_COL = "row_hash"

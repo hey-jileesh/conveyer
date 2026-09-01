@@ -21,6 +21,7 @@ from pydantic import ValidationError
 from spine import config, context
 from spine.binding import Transforms
 from spine.core import run_facts
+from spine.core.checks import checks_version
 from spine.core.contract import check_version, read_spec_version
 from spine.core.model import PipelineSpecModel
 
@@ -34,8 +35,19 @@ def _make_spec() -> PipelineSpecModel:
         transforms_module="pipelines.commissions.transforms",
         raw_table="lake.commissions__raw",
         quarantine_table="lake.commissions__quarantine",
-        fact_table="lake.commissions__facts",
-        state_table="lake.commissions__state",
+        # 006.1 P-1: singular fact_table/state_table replaced by a per-type
+        # `fact_types` mapping -- this fixture just needs SOME valid spec.
+        fact_types={
+            "detail": {
+                "fact_table": "lake.commissions__facts",
+                "state_table": "lake.commissions__state",
+                "schema": {
+                    "columns": [{"name": "domain_id", "type": "string"}],
+                    "domain_id_col": "domain_id",
+                    "record_key": ["domain_id"],
+                },
+            }
+        },
         read={"dialect": {"format": "csv"}},
         raw_contract={"columns": [{"name": "id"}]},
     )
@@ -54,16 +66,13 @@ def _make_seed(**overrides: object) -> context.BatchContext:
         received_at=datetime(2026, 7, 25, 9, 0, 0, tzinfo=UTC),
         spec=spec,
         run=config.RunConfig(),
-        transforms=Transforms(
-            apply=lambda valid_df, co_effects: valid_df,
-            post_check=lambda candidate_df, co_effects: candidate_df,
-            fold=lambda state_slice, facts_df: facts_df,
-        ),
+        transforms=Transforms(apply=lambda valid_df, co_effects: {"t": valid_df}),
         attempt_id="jr_abc123",
         sfn_retry_count=0,
         sfn_redrive_count=0,
         read_spec_version=read_spec_version(spec.read),
         check_version=check_version(spec.raw_contract, spec.read),
+        checks_version=checks_version(spec.checks),
     )
     base.update(overrides)
     return context.BatchContext(**base)  # type: ignore[arg-type]
@@ -219,7 +228,7 @@ def test_pull_stage_fields() -> None:
 
 def test_apply_stage_produces_no_count_fields() -> None:
     seed = _make_seed()
-    after = dataclasses.replace(seed, candidate_facts_df=None)
+    after = dataclasses.replace(seed, candidate_facts=None)
     fact = run_facts.transition("apply", seed, after, _T0, _T1)
     assert fact.raw_count is None
     assert fact.facts_appended is None
@@ -281,38 +290,135 @@ def test_post_check_drift_set_but_failed_outcome_wins_no_drift_message() -> None
     assert "boom" not in (fact.error_message or "")
 
 
-def test_commit_stage_fields() -> None:
+def test_commit_stage_fields_derives_totals_from_the_per_table_maps() -> None:
+    """007.1 §4.2/§12 (errata item 20, B9b): the singular `facts_appended`/
+    `snapshot_id` columns are no longer read off dedicated singular ctx
+    fields -- they are DERIVED from `commit`'s own per-table maps (module
+    docstring's own documented "totals / one-snapshot symmetric rule").
+    `facts_appended` = the sum across every table; `snapshot_id` = the
+    map's one value, since exactly one table produced a snapshot here."""
     seed = _make_seed()
-    after = dataclasses.replace(seed, facts_appended=42, fact_snapshot_id=11)
+    after = dataclasses.replace(
+        seed,
+        facts_appended_by_table={"lake.orders__facts": 30, "lake.shipments__facts": 12},
+        commit_snapshot_ids={"lake.orders__facts": 11},
+        delta_predecessor_batch_ids=("b0",),
+        delta_read_snapshot_ids={"lake.orders__facts": 7},
+        delta_probe_refusal=None,
+    )
     fact = run_facts.transition("commit", seed, after, _T0, _T1)
     assert fact.facts_appended == 42
     assert fact.snapshot_id == 11
+    assert fact.facts_appended_by_table == {"lake.orders__facts": 30, "lake.shipments__facts": 12}
+    assert fact.snapshot_ids_by_table == {"lake.orders__facts": 11}
+    assert fact.delta_predecessor_batch_ids == ("b0",)
+    assert fact.delta_read_snapshot_ids == {"lake.orders__facts": 7}
+    assert fact.delta_probe_refusal is None
+
+
+def test_commit_stage_singular_snapshot_id_is_none_on_multi_table_or_all_skip() -> None:
+    """The "one-snapshot form" is deliberately `None`, never a guessed
+    value, whenever the per-table map does not carry EXACTLY one entry --
+    both a genuinely ambiguous multi-table commit and a wholly-guard-
+    skipped/zero-fact attempt (an EMPTY map, §4.2's "absent key = skip /
+    zero-fact no-op") hit this."""
+    seed = _make_seed()
+    multi = dataclasses.replace(
+        seed,
+        facts_appended_by_table={"lake.orders__facts": 5, "lake.shipments__facts": 3},
+        commit_snapshot_ids={"lake.orders__facts": 11, "lake.shipments__facts": 22},
+    )
+    fact_multi = run_facts.transition("commit", seed, multi, _T0, _T1)
+    assert fact_multi.facts_appended == 8
+    assert fact_multi.snapshot_id is None
+
+    all_skip = dataclasses.replace(
+        seed,
+        facts_appended_by_table={"lake.orders__facts": 0},
+        commit_snapshot_ids={},
+    )
+    fact_skip = run_facts.transition("commit", seed, all_skip, _T0, _T1)
+    assert fact_skip.facts_appended == 0
+    assert fact_skip.snapshot_id is None
+
+
+def test_commit_stage_delta_probe_refusal_projected_verbatim() -> None:
+    seed = _make_seed()
+    after = dataclasses.replace(
+        seed,
+        facts_appended_by_table={"lake.orders__facts": 0},
+        commit_snapshot_ids={},
+        delta_probe_refusal="none-with-key-match",
+    )
+    fact = run_facts.transition("commit", seed, after, _T0, _T1)
+    assert fact.delta_probe_refusal == "none-with-key-match"
 
 
 def test_fold_stage_fields_no_op_reports_zero_rows_merged() -> None:
+    """B10 (bead conveyer-6pg.22): fold's singular `rows_merged`/`snapshot_id`
+    are now derived purely from the per-table maps (`rows_merged_by_table`/
+    `fold_snapshot_ids`) via the same totals / one-snapshot symmetric rule
+    commit's branch already used -- the old singular `BatchContext.state_
+    snapshot_id`/`.merge_summary`/`.state_read_snapshot_id` fields this
+    branch used to read were deleted outright (critique gate
+    wf_24a3125f-ecc ruling 1, bead conveyer-6pg.29, F4) and are no longer
+    read here at all."""
     seed = _make_seed()
     after = dataclasses.replace(
-        seed, state_snapshot_id=None, merge_summary=None, state_read_snapshot_id=5
+        seed,
+        rows_merged_by_table={"lake.orders__state": 0},
+        fold_snapshot_ids={},
     )
     fact = run_facts.transition("fold", seed, after, _T0, _T1)
     assert fact.snapshot_id is None
     assert fact.rows_merged == 0
-    assert fact.state_read_snapshot_id == 5
-    assert fact.merge_summary is None
 
 
-def test_fold_stage_fields_real_merge_derives_rows_merged_from_summary() -> None:
+def test_fold_stage_fields_real_merge_derives_rows_merged_from_per_table_map() -> None:
     seed = _make_seed()
     after = dataclasses.replace(
         seed,
-        state_snapshot_id=99,
-        merge_summary={"added-records": "7"},
-        state_read_snapshot_id=5,
+        rows_merged_by_table={"lake.orders__state": 7},
+        fold_snapshot_ids={"lake.orders__state": 99},
     )
     fact = run_facts.transition("fold", seed, after, _T0, _T1)
     assert fact.snapshot_id == 99
     assert fact.rows_merged == 7
-    assert fact.merge_summary == {"added-records": "7"}
+
+
+def test_fold_stage_fields_multi_table_snapshot_id_is_none_rows_merged_is_the_sum() -> None:
+    """The one-snapshot rule: more than one entry in `fold_snapshot_ids` has
+    no unambiguous single value for the scalar `snapshot_id` ledger column
+    (module docstring's "totals / one-snapshot symmetric rule") -- `rows_
+    merged` stays a well-defined total regardless of table count."""
+    seed = _make_seed()
+    after = dataclasses.replace(
+        seed,
+        rows_merged_by_table={"lake.orders__state": 7, "lake.shipments__state": 3},
+        fold_snapshot_ids={"lake.orders__state": 99, "lake.shipments__state": 101},
+    )
+    fact = run_facts.transition("fold", seed, after, _T0, _T1)
+    assert fact.snapshot_id is None
+    assert fact.rows_merged == 10
+
+
+def test_fold_stage_projects_per_table_maps_into_the_shared_ledger_column() -> None:
+    """007.1 §4.2/§12 (B9b): `snapshot_ids_by_table` is ONE ledger column
+    shared between commit's row (sourced from `commit_snapshot_ids`) and
+    fold's row (sourced from `fold_snapshot_ids`) -- this is fold's own
+    half. `rows_merged_by_table` is fold-only."""
+    seed = _make_seed()
+    after = dataclasses.replace(
+        seed,
+        rows_merged_by_table={"lake.orders__state": 7},
+        fold_snapshot_ids={"lake.orders__state": 99},
+    )
+    fact = run_facts.transition("fold", seed, after, _T0, _T1)
+    assert fact.rows_merged_by_table == {"lake.orders__state": 7}
+    assert fact.snapshot_ids_by_table == {"lake.orders__state": 99}
+    # commit-only fields stay untouched by a fold transition.
+    assert fact.facts_appended_by_table is None
+    assert fact.delta_probe_refusal is None
 
 
 def test_publish_stage_produces_no_count_fields() -> None:
@@ -373,8 +479,17 @@ def test_failed_validation_error_strips_raw_input_value() -> None:
             transforms_module="pipelines.commissions.transforms",
             raw_table="lake.x__raw",
             quarantine_table="lake.x__quarantine",
-            fact_table="lake.x__facts",
-            state_table="lake.x__state",
+            fact_types={
+                "detail": {
+                    "fact_table": "lake.x__facts",
+                    "state_table": "lake.x__state",
+                    "schema": {
+                        "columns": [{"name": "domain_id", "type": "string"}],
+                        "domain_id_col": "domain_id",
+                        "record_key": ["domain_id"],
+                    },
+                }
+            },
             read={"dialect": {"format": "csv"}},
             raw_contract={"columns": [{"name": "id"}]},
         )

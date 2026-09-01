@@ -361,3 +361,75 @@ def test_check_object_uris_accepts_single_clean_object_name() -> None:
         object_uris=[_uri_with_suffix(fixture, "some-other-clean-name.csv")],
         landing_bucket="conveyer-dev-lake",
     )
+
+
+# --- `table_slug`/`markers_table`/`table_class_inventory_uri` (007.1 §6.3/
+# §6.5, bead conveyer-6pg.18, B7) -- identifier-grammar-safe table naming,
+# deliberately DIFFERENT from `slug()` (see `table_slug`'s own docstring for
+# why `slug()`'s "--"-joined form must never compose an actual identifier).
+
+
+def test_table_slug_takes_the_trailing_segment() -> None:
+    assert naming.table_slug("pipelines/identity") == "identity"
+
+
+def test_table_slug_is_a_noop_for_a_single_segment_pipeline() -> None:
+    assert naming.table_slug("commissions") == "commissions"
+
+
+def test_table_slug_takes_the_last_segment_of_a_deeper_path() -> None:
+    assert naming.table_slug("a/b/c") == "c"
+
+
+def test_table_slug_never_contains_a_dash_separator_for_the_multi_segment_case() -> None:
+    # The whole point: unlike `slug()`, no NEW "--" is ever introduced by
+    # the join -- `table_slug`'s output is always a legal `check_qualified_
+    # table` identifier component for a pipeline whose trailing segment
+    # itself contains no hyphen.
+    assert "--" not in naming.table_slug("pipelines/identity")
+
+
+def test_table_slug_rejects_a_malformed_pipeline() -> None:
+    with pytest.raises(ValueError):
+        naming.table_slug("Bad/Pipeline")
+
+
+def test_markers_table_derives_db_from_raw_table_and_slug_from_pipeline() -> None:
+    assert (
+        naming.markers_table("conveyer_dev_lake.identity__raw", "pipelines/identity")
+        == "conveyer_dev_lake.identity__markers"
+    )
+
+
+def test_markers_table_output_is_a_legal_qualified_table_identifier() -> None:
+    result = naming.markers_table("conveyer_dev_lake.identity__raw", "pipelines/identity")
+    assert naming.check_qualified_table(result) == result  # does not raise
+
+
+def test_markers_table_rejects_a_malformed_raw_table() -> None:
+    with pytest.raises(ValueError):
+        naming.markers_table("not-a-qualified-table", "pipelines/identity")
+
+
+def test_table_class_inventory_uri_replaces_the_spec_filename() -> None:
+    assert (
+        naming.table_class_inventory_uri(
+            "s3://some-artifacts-bucket/spine/specs/pipelines--identity/pipeline.yaml"
+        )
+        == "s3://some-artifacts-bucket/spine/specs/pipelines--identity/table-classes.json"
+    )
+
+
+def test_table_class_inventory_uri_works_for_file_scheme() -> None:
+    assert (
+        naming.table_class_inventory_uri("file:///tmp/specs/pipelines--identity/pipeline.yaml")
+        == "file:///tmp/specs/pipelines--identity/table-classes.json"
+    )
+
+
+def test_commit_completion_sentinel_is_outside_the_identifier_grammar() -> None:
+    # 007.1 §6.3 answer 1: "by grammar, not by convention" -- proven here
+    # against the SAME `check_qualified_table` a real table name must pass,
+    # not a re-derived regex.
+    with pytest.raises(ValueError):
+        naming.check_qualified_table(f"lake.{naming.COMMIT_COMPLETION_SENTINEL}")

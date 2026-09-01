@@ -32,14 +32,27 @@ import pytest
 import yaml
 from moto import mock_aws
 from pydantic import ValidationError
+from pyspark.sql.types import DecimalType, IntegerType, StringType
 from spine import config as config_module
 from spine.binding import bind_transforms
+from spine.bootstrap.create_record_tables import render_marker_create_table_sql
+from spine.core import bind_checks
 from spine.core import contract as core_contract
-from spine.core.model import ColumnSpec, PipelineSpecModel, RawContractModel
+from spine.core import naming as naming_module
+from spine.core.model import (
+    BatchCheckModel,
+    BatchControlModel,
+    ColumnSpec,
+    FactTypeModel,
+    PipelineSpecModel,
+    RawContractModel,
+)
 from spine.core.naming import slug
 from spine.entrypoints import glue_main
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from pyspark.sql import SparkSession
 
 # --- shared fixtures ----------------------------------------------------------
@@ -86,8 +99,19 @@ def _spec_yaml(**overrides: object) -> str:
         transforms_module="pipelines.identity.transforms",
         raw_table="lake.identity__raw",
         quarantine_table="lake.identity__quarantine",
-        fact_table="lake.identity__facts",
-        state_table="lake.identity__state",
+        # 006.1 P-1: singular fact_table/state_table replaced by a per-type
+        # `fact_types` mapping -- this fixture just needs SOME valid spec.
+        fact_types={
+            "detail": {
+                "fact_table": "lake.identity__facts",
+                "state_table": "lake.identity__state",
+                "schema": {
+                    "columns": [{"name": "domain_id", "type": "string"}],
+                    "domain_id_col": "domain_id",
+                    "record_key": ["domain_id"],
+                },
+            }
+        },
         read={"dialect": {"format": "csv"}},
         raw_contract={"columns": [{"name": "domain_id", "required": True, "nullable": False}]},
         sla_minutes=480,
@@ -457,6 +481,332 @@ def test_assert_temporal_bounds_bind_rejects_malformed_fmt_sequence(spark: Spark
     )
     with pytest.raises(ValueError, match="JVM formatter rejects"):
         glue_main._assert_temporal_bounds_bind(spark, contract)
+
+
+# --- K5: the engine compile gate (P-2 gate 2/P-9 rule 2, [EM-3]) -----------
+# --- bead conveyer-6pg.12 -- real JVM ---------------------------------------
+
+
+def _decimal_fact_type(**fact_type_kwargs: object) -> FactTypeModel:
+    base: dict = dict(
+        fact_table="lake.k5probe__facts",
+        state_table="lake.k5probe__state",
+        schema={
+            "columns": [
+                {"name": "domain_id", "type": "string"},
+                {"name": "amount", "type": "decimal(10,2)"},
+                {"name": "qty", "type": "int"},
+            ],
+            "domain_id_col": "domain_id",
+            "record_key": ["domain_id"],
+        },
+    )
+    base.update(fact_type_kwargs)
+    return FactTypeModel(**base)
+
+
+def test_fact_column_spark_type_maps_every_bare_kind() -> None:
+    assert glue_main._fact_column_spark_type("string") == StringType()
+    assert glue_main._fact_column_spark_type("int") == IntegerType()
+    assert glue_main._fact_column_spark_type("decimal(10,2)") == DecimalType(10, 2)
+
+
+def test_fact_type_probe_schema_matches_declared_columns() -> None:
+    schema = glue_main._fact_type_probe_schema(_decimal_fact_type())
+    assert [f.name for f in schema.fields] == ["domain_id", "amount", "qty"]
+    assert schema["amount"].dataType == DecimalType(10, 2)
+
+
+def _decimal_probe_df(spark: SparkSession):
+    return spark.createDataFrame([], schema=glue_main._fact_type_probe_schema(_decimal_fact_type()))
+
+
+def test_assert_row_expr_boolean_accepts_a_boolean_expr(spark: SparkSession) -> None:
+    probe_df = _decimal_probe_df(spark)
+    glue_main._assert_row_expr_boolean(probe_df, "chk-1", "amount > 0")  # must not raise
+
+
+def test_assert_row_expr_boolean_rejects_non_boolean_dtype(spark: SparkSession) -> None:
+    probe_df = _decimal_probe_df(spark)
+    with pytest.raises(ValueError, match=r"bind-defect/check-expression-not-boolean"):
+        glue_main._assert_row_expr_boolean(probe_df, "chk-1", "amount + 1")
+
+
+def test_compile_probe_rejects_uncompilable_expression(spark: SparkSession) -> None:
+    # K3 (spec-parse) already refuses an unknown-column reference in any
+    # REAL spec, so this is exercised directly at the gate-2 grain --
+    # exactly the "defensive net" the function's own docstring names.
+    probe_df = _decimal_probe_df(spark)
+    with pytest.raises(ValueError, match=r"bind-defect/check-expression-uncompilable"):
+        glue_main._compile_probe(probe_df, "totally_unknown_col > 0", "chk-1", "expr")
+
+
+def test_assert_aggregate_dtype_exact_accepts_integral_or_decimal(spark: SparkSession) -> None:
+    probe_df = _decimal_probe_df(spark)
+    glue_main._assert_aggregate_dtype_exact(probe_df, "chk-1", "aggregate", "sum(amount)")
+    glue_main._assert_aggregate_dtype_exact(probe_df, "chk-1", "aggregate", "count(1)")
+
+
+def test_assert_aggregate_dtype_exact_rejects_inexact_type(spark: SparkSession) -> None:
+    # `avg(int)` compiles to DOUBLE (engine-verified, P-9 rule 2's own named
+    # hole) -- `batch_check` itself is unreachable through a real spec (K7
+    # refuses it unconditionally at spec-parse, P-6's structural wait), so
+    # this is exercised directly against a hand-built `BatchCheckModel`
+    # (which carries no refusal of its own -- only `ChecksModel` does).
+    batch_check = BatchCheckModel(
+        kind="batch_check",
+        id="qty-avg",
+        fact_type="detail",
+        aggregate="avg(qty)",
+        control=BatchControlModel(member="summary", expr="amount"),
+    )
+    probe_df = _decimal_probe_df(spark)
+    with pytest.raises(ValueError, match=r"bind-defect/check-expression-inexact-type"):
+        glue_main._assert_aggregate_dtype_exact(
+            probe_df, batch_check.id, "aggregate", batch_check.aggregate
+        )
+    glue_main._assert_aggregate_dtype_exact(  # control.expr over decimal: admissible
+        probe_df, batch_check.id, "control.expr", batch_check.control.expr
+    )
+
+
+def test_assert_check_expressions_compile_accepts_a_clean_row_check_spec(
+    spark: SparkSession,
+) -> None:
+    spec = PipelineSpecModel(
+        **yaml.safe_load(
+            _spec_yaml(
+                fact_types={"detail": _decimal_fact_type().model_dump(by_alias=True)},
+                checks={
+                    "checks": [
+                        {
+                            "kind": "row",
+                            "id": "amount-positive",
+                            "fact_type": "detail",
+                            "expr": "amount > 0",
+                            "reason": "business/negative-amount",
+                        }
+                    ]
+                },
+            )
+        )
+    )
+    glue_main._assert_check_expressions_compile(spark, spec)  # must not raise
+
+
+def test_main_raises_via_k5_before_fx_factory(spark: SparkSession) -> None:
+    fetch_spec = lambda uri: _spec_yaml(  # noqa: E731
+        fact_types={"detail": _decimal_fact_type().model_dump(by_alias=True)},
+        checks={
+            "checks": [
+                {
+                    "kind": "row",
+                    "id": "amount-plus-one",
+                    "fact_type": "detail",
+                    "expr": "amount + 1",  # compiles, but not boolean
+                    "reason": "business/negative-amount",
+                }
+            ]
+        },
+    )
+    argv = _argv(catalog_kind="hadoop")
+    with pytest.raises(ValueError, match=r"bind-defect/check-expression-not-boolean"):
+        glue_main.main(argv, fetch_spec=fetch_spec, fx_factory=_never_build_fx)  # type: ignore[arg-type]
+
+
+# --- P-4's bind step: CatalogFacts acquisition + F-10/[DC-1] wiring --------
+# --- bead conveyer-6pg.12; the B2<->B7 interim stubs ------------------------
+
+
+def test_referenced_tables_gathers_co_effects_and_fact_state_tables() -> None:
+    spec = PipelineSpecModel(**yaml.safe_load(_spec_yaml(co_effects={"rc": {"table": "lake.rc"}})))
+    assert glue_main._referenced_tables(spec) == (
+        "lake.identity__facts",
+        "lake.identity__state",
+        "lake.rc",
+    )
+
+
+def test_referenced_tables_empty_co_effects() -> None:
+    spec = PipelineSpecModel(**yaml.safe_load(_spec_yaml()))
+    assert glue_main._referenced_tables(spec) == ("lake.identity__facts", "lake.identity__state")
+
+
+class _FakeDescribeTableFx:
+    """A minimal `fx`-shaped double carrying only `describe_table` -- every
+    helper this section tests needs nothing else off `fx`."""
+
+    def __init__(self, facts: dict[str, bind_checks.TableFacts | None]) -> None:
+        self._facts = facts
+
+    def describe_table(self, table: str) -> bind_checks.TableFacts | None:
+        return self._facts.get(table)
+
+
+def test_acquire_catalog_facts_calls_describe_table_per_referenced_table() -> None:
+    facts = {"lake.a": bind_checks.TableFacts(table_class="state", columns={"x": "string"})}
+    fx = _FakeDescribeTableFx(facts)
+    result = glue_main._acquire_catalog_facts(fx, ("lake.a", "lake.b"))  # type: ignore[arg-type]
+    assert result == {"lake.a": facts["lake.a"], "lake.b": None}
+
+
+def test_acquire_transforms_meta_reads_the_real_module_post_check_and_fold_export() -> None:
+    # `pipelines.identity.transforms` no longer exports `post_check` as of
+    # its own 006.1 migration (bead conveyer-6pg.13, B3 -- the stage-
+    # rewrite this test's own S4 wiring was built to anticipate, per its
+    # prior docstring), nor `fold` (007.1 B10's mechanical §8.2 reduce,
+    # confirmed dead by critique gate wf_24a3125f-ecc F2, bead
+    # conveyer-6pg.31) -- confirming this reads the RAW module attributes,
+    # independent of `bind_transforms`'s own (unrelated) contract.
+    spec = PipelineSpecModel(**yaml.safe_load(_spec_yaml()))
+    meta = glue_main._acquire_transforms_meta(spec)
+    assert meta.has_post_check_export is False
+    assert meta.has_fold_export is False
+
+
+def test_acquire_transforms_meta_flags_the_committed_stale_post_check_corpus_fixture() -> None:
+    # 006.1 §13.4 item 2's own named corpus fixture (`tests/unit/
+    # linter_fixtures/fail_transforms_stale_post_check.py`) exercised as a
+    # REAL importable `pipelines.<name>` module (the `pipelines.__path__.
+    # append(...)` technique `test_binding.py`/this file's own
+    # `test_main_raises_via_bind_checks_after_fx_factory_before_run_sequence`
+    # already established for `tmp_path`-authored throwaway modules --
+    # pointed at the committed fixture directory instead, so the corpus
+    # artifact itself is the thing under test, not an inline string).
+    import sys
+
+    import pipelines
+
+    fixtures_dir = Path(__file__).resolve().parent / "linter_fixtures"
+    pipelines.__path__.append(str(fixtures_dir))
+    try:
+        spec = PipelineSpecModel(
+            **yaml.safe_load(
+                _spec_yaml(transforms_module="pipelines.fail_transforms_stale_post_check")
+            )
+        )
+        meta = glue_main._acquire_transforms_meta(spec)
+        assert meta.has_post_check_export is True
+    finally:
+        pipelines.__path__.remove(str(fixtures_dir))
+        sys.modules.pop("pipelines.fail_transforms_stale_post_check", None)
+
+
+def test_load_table_class_inventory_fetches_the_sibling_uri_and_parses_json() -> None:
+    seen_uris: list[str] = []
+
+    def _fetch(uri: str) -> str:
+        seen_uris.append(uri)
+        return json.dumps({"lake.identity__facts": "facts", "lake.identity__state": "state"})
+
+    result = glue_main._load_table_class_inventory(_fetch, _VALID_SPEC_URI)
+    assert seen_uris == [naming_module.table_class_inventory_uri(_VALID_SPEC_URI)]
+    assert result == {"lake.identity__facts": "facts", "lake.identity__state": "state"}
+
+
+def test_committed_tables_returns_empty_when_marker_table_absent(spark: SparkSession) -> None:
+    assert glue_main._committed_tables(spark, "lake.no_such__markers", _BATCH_ID) == ()
+
+
+def test_committed_tables_distinct_guard_twin_rows_sentinel_excluded(
+    spark: SparkSession, unique_table: Callable[[str], str]
+) -> None:
+    # K-08's DDL half: guard-twin vs. commit-completion rows, discriminated
+    # by the `-completion-` sentinel alone (no `IS NULL` special case) --
+    # the real marker DDL from `bootstrap/create_record_tables.py`.
+    qt = unique_table("committed_tables_markers")
+    bare = qt.removeprefix("spine_cat.")
+    spark.sql(render_marker_create_table_sql(qt))
+    spark.sql(
+        f"""
+        INSERT INTO {qt} VALUES
+        ('{_BATCH_ID}', 'f1', 'commit', 'lake.identity__facts', NULL, 'dk', 'ch',
+         TIMESTAMP'2026-01-01 00:00:00', TIMESTAMP'2026-01-01 00:00:01'),
+        ('{_BATCH_ID}', 'f1', 'commit', 'lake.identity__state', NULL, 'dk', 'ch',
+         TIMESTAMP'2026-01-01 00:00:00', TIMESTAMP'2026-01-01 00:00:01'),
+        ('{_BATCH_ID}', 'f1', 'commit', '{naming_module.COMMIT_COMPLETION_SENTINEL}', NULL,
+         'dk', 'ch', TIMESTAMP'2026-01-01 00:00:00', TIMESTAMP'2026-01-01 00:00:02'),
+        ('other-batch', 'f1', 'commit', 'lake.identity__facts', NULL, 'dk', 'ch',
+         TIMESTAMP'2026-01-01 00:00:00', TIMESTAMP'2026-01-01 00:00:01')
+        """
+    )
+    result = glue_main._committed_tables(spark, bare, _BATCH_ID)
+    assert result == ("lake.identity__facts", "lake.identity__state")
+
+
+def test_assert_bind_checks_pass_is_silent_on_a_clean_binding() -> None:
+    spec = PipelineSpecModel(**yaml.safe_load(_spec_yaml()))
+    glue_main._assert_bind_checks_pass(
+        spec, {}, bind_checks.TransformsMeta(has_post_check_export=False), {}, ()
+    )  # must not raise
+
+
+def test_assert_bind_checks_pass_raises_joined_bind_defect_message() -> None:
+    spec = PipelineSpecModel(
+        **yaml.safe_load(_spec_yaml(co_effects={"rc": {"table": "lake.rc", "own_state": True}}))
+    )
+    with pytest.raises(ValueError) as exc_info:
+        glue_main._assert_bind_checks_pass(
+            spec,
+            {"lake.rc": None},
+            bind_checks.TransformsMeta(has_post_check_export=True),
+            {},
+            (),
+        )
+    message = str(exc_info.value)
+    # every defect is named, not just the first (the `describe_raw_diff`
+    # precedent) -- three unrelated defects fire together here.
+    assert "bind-defect/stale-post-check-export" in message
+    assert "bind-defect/own-state-refused" in message
+    assert "bind-defect/co-effect-missing-table" in message
+
+
+def test_main_raises_via_bind_checks_after_fx_factory_before_run_sequence(
+    spark: SparkSession,
+    tmp_path: Path,
+) -> None:
+    # 006.1 migration (bead conveyer-6pg.13, B3): `pipelines.identity.
+    # transforms` no longer exports `post_check` at all, so S4 needs its
+    # OWN throwaway module that still does (a real, deliberately-stale
+    # export) to fire -- the `temp_pipelines_module`-shaped technique
+    # `tests/unit/test_binding.py` already established, inlined here since
+    # this is this file's only use of it. Proves the bind step runs AFTER
+    # `fx_factory` (a working `describe_table` double is needed to get this
+    # far) and STILL strictly before `run_sequence` (no ledger row, no
+    # `batch-started`, both effects of stages this config could never
+    # actually reach if run_sequence were ever called with such a bare fake
+    # `fx`).
+    import sys
+
+    import pipelines
+
+    (tmp_path / "stale_post_check.py").write_text(
+        "def apply(valid_df, co_effects):\n"
+        "    return {'identity': valid_df}\n"
+        "def post_check(candidate_df, co_effects):\n"
+        "    return candidate_df\n"
+    )
+    pipelines.__path__.append(str(tmp_path))
+    try:
+        argv = _argv(catalog_kind="hadoop")
+
+        def _fake_fx_factory(spark: object, config: object) -> _FakeDescribeTableFx:
+            return _FakeDescribeTableFx({})
+
+        def _fetch(uri: str) -> str:
+            # F-10's table-classes.json is now a genuine second `fetch_spec`
+            # call (`_load_table_class_inventory`) -- an empty inventory is
+            # harmless here (the default identity spec declares zero
+            # co-effects, the only class-dependent checks C4 runs).
+            if uri == naming_module.table_class_inventory_uri(_VALID_SPEC_URI):
+                return "{}"
+            return _spec_yaml(transforms_module="pipelines.stale_post_check")
+
+        with pytest.raises(ValueError, match=r"bind-defect/stale-post-check-export"):
+            glue_main.main(argv, fetch_spec=_fetch, fx_factory=_fake_fx_factory)  # type: ignore[arg-type]
+    finally:
+        pipelines.__path__.remove(str(tmp_path))
+        sys.modules.pop("pipelines.stale_post_check", None)
 
 
 # --- I-5 attempt_id fallback ordering (mechanism lives in `spine.config`, --

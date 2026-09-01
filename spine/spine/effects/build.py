@@ -8,7 +8,11 @@ Assembles a real `RunnerFx` (`spine/effects/records.py`) for production: the
 `read_batch`, `table_has_batch`, `append`, `merge`,
 `resolve_batch_snapshot`) `conveyer-nvh.18` (M2) builds, via
 `effects/spark.py::build_spark_fx` (catalog wiring/append/merge/guards,
-§7.6's implementation notes).
+§7.6's implementation notes) — additively extended with the marker table's
+own five read/write closures (`marker_row_present`, `append_marker_row`,
+`read_marker_completions`, `read_marker_presence`, `read_marker_target`,
+007.1 §4.3/§6.3, bead `conveyer-6pg.21`, B9b), the SAME `build_spark_fx`
+call, no new seam.
 
 `tests/conftest.py` assembles the identical `RunnerFx` shape over local Spark
 + moto (no mocks, ever) — `local_runner_fx` calls this SAME function, not a
@@ -53,9 +57,15 @@ def make_runner_fx(spark: SparkSession, config: RunnerConfig) -> RunnerFx:
         read_table=fx.read_table,
         read_batch=fx.read_batch,
         table_has_batch=fx.table_has_batch,
+        describe_table=fx.describe_table,
         append=fx.append,
         merge=fx.merge,
         resolve_batch_snapshot=fx.resolve_batch_snapshot,
+        marker_row_present=fx.marker_row_present,
+        append_marker_row=fx.append_marker_row,
+        read_marker_completions=fx.read_marker_completions,
+        read_marker_presence=fx.read_marker_presence,
+        read_marker_target=fx.read_marker_target,
         record_run=ledger.build_record_run(catalog_factory, config),
         emit=events.build_emit(events_client, config.event_bus),
         now=_now,

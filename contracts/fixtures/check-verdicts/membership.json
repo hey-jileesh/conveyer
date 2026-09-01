@@ -1,0 +1,154 @@
+[
+  {
+    "check": {
+      "kind": "membership",
+      "id": "status-known-vec",
+      "fact_type": "vec",
+      "columns": [
+        "status"
+      ],
+      "co_effect": "status_ref",
+      "ref_columns": [
+        "valid_status"
+      ],
+      "reason": "business/unknown-status"
+    },
+    "input": {
+      "row": {
+        "domain_id": "d-m-1",
+        "status": "open"
+      },
+      "ref_rows": [
+        [
+          "open"
+        ],
+        [
+          "closed"
+        ]
+      ]
+    },
+    "verdict": "pass"
+  },
+  {
+    "check": {
+      "kind": "membership",
+      "id": "status-known-vec",
+      "fact_type": "vec",
+      "columns": [
+        "status"
+      ],
+      "co_effect": "status_ref",
+      "ref_columns": [
+        "valid_status"
+      ],
+      "reason": "business/unknown-status"
+    },
+    "input": {
+      "row": {
+        "domain_id": "d-m-2",
+        "status": "bogus"
+      },
+      "ref_rows": [
+        [
+          "open"
+        ],
+        [
+          "closed"
+        ]
+      ]
+    },
+    "verdict": "fail"
+  },
+  {
+    "check": {
+      "kind": "membership",
+      "id": "status-known-vec",
+      "fact_type": "vec",
+      "columns": [
+        "status"
+      ],
+      "co_effect": "status_ref",
+      "ref_columns": [
+        "valid_status"
+      ],
+      "reason": "business/unknown-status"
+    },
+    "input": {
+      "row": {
+        "domain_id": "d-m-3",
+        "status": null
+      },
+      "ref_rows": [
+        [
+          "open"
+        ],
+        [
+          "closed"
+        ]
+      ]
+    },
+    "verdict": "pass"
+  },
+  {
+    "check": {
+      "kind": "membership",
+      "id": "pair-known-vec",
+      "fact_type": "vec",
+      "columns": [
+        "a",
+        "b"
+      ],
+      "co_effect": "pair_ref",
+      "ref_columns": [
+        "ra",
+        "rb"
+      ],
+      "reason": "business/unknown-pair"
+    },
+    "input": {
+      "row": {
+        "domain_id": "d-m-4",
+        "a": "x",
+        "b": "1"
+      },
+      "ref_rows": [
+        [
+          "x",
+          "1"
+        ]
+      ]
+    },
+    "verdict": "pass"
+  },
+  {
+    "check": {
+      "kind": "membership",
+      "id": "pair-known-vec",
+      "fact_type": "vec",
+      "columns": [
+        "a",
+        "b"
+      ],
+      "co_effect": "pair_ref",
+      "ref_columns": [
+        "ra",
+        "rb"
+      ],
+      "reason": "business/unknown-pair"
+    },
+    "input": {
+      "row": {
+        "domain_id": "d-m-5",
+        "a": "x",
+        "b": null
+      },
+      "ref_rows": [
+        [
+          "x",
+          "1"
+        ]
+      ]
+    },
+    "verdict": "pass"
+  }
+]

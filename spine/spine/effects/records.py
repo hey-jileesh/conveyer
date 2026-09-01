@@ -38,6 +38,8 @@ if TYPE_CHECKING:
     from pyspark.sql import DataFrame
 
     from spine.config import RunnerConfig
+    from spine.core.bind_checks import TableFacts
+    from spine.core.delta import MarkerRow, MarkerRowWrite
     from spine.core.merge import MergeSpec
     from spine.core.model import RawContractModel, ReadSpecModel
     from spine.core.run_facts import RunFact
@@ -84,6 +86,10 @@ class RunnerFx:  # spine/effects/records.py — §7.6's full signature
     # column-object `batch_id` predicate (D-3 read-by-name)
     table_has_batch: Callable[[str, str, str | None], bool]  # (table, batch_id, stage_key) ->
     # present; I-3 guard -- reads data, never snapshot metadata
+    describe_table: Callable[[str], TableFacts | None]  # (table) -> TableFacts | None; P-4's
+    # additive bind-time effect (006.1 §16.4 item 3) -- `None` iff the table does not exist;
+    # otherwise its `conveyer.table-class` property (provenance, [DS-2]) + column name->type map.
+    # [DS-6]: no new IAM objects -- I-21's existing per-table `Get*` grants cover it.
     append: Callable[[str, DataFrame, str, str | None], tuple[int, Mapping[str, str]]]
     # (table, df, batch_id, stage_key) -> (rows_appended, summary); ONE commit (I-4), own
     # snapshot resolved via stamped summary (I-19). DEVIATION from §7.6's literal two-arg
@@ -107,6 +113,30 @@ class RunnerFx:  # spine/effects/records.py — §7.6's full signature
     resolve_batch_snapshot: Callable[[str, str, str | None], int | None]  # (table, batch_id,
     # stage_key) -> snapshot_id | None; stamped-summary lookup for guard-skip lineage (I-19) --
     # NEVER called by guards (I-3)
+    # --- 007.1 §4.3/§6.3 (F-9, B9b): the marker table's own read/write effects ------------------
+    marker_row_present: Callable[[str, str, str, str], bool]  # (markers_table, batch_id, stage,
+    # table_name) -> present; I-3-style guard (reads DATA, never snapshot metadata) over the
+    # marker table's own compound idempotency key (§6.3) -- `table_has_batch`'s existing shape
+    # cannot be reused as-is: that function's hardcoded `check_stage` column name is the
+    # quarantine table's own convention, and it has no `table_name` predicate at all (the marker
+    # table's guard-twin/completion discrimination, §6.3 answer 1)
+    append_marker_row: Callable[[str, MarkerRowWrite], None]  # (markers_table, write) -> None;
+    # ONE row, `snapshot_id` hardcoded NULL (§6.3's own write-order-necessity resolution) --
+    # decide-then-do orchestration (the presence probe above, then this) is the CALLING stage's
+    # (§4.3's normative order), never this effect's own concern, matching `plan_append`'s existing
+    # split of guard mechanics (effect) from the append decision (pure plan)
+    read_marker_completions: Callable[[str, str], tuple[MarkerRow, ...]]  # (markers_table,
+    # feed_id) -> every commit-completion row (table_name = the sentinel) for that feed, ANY
+    # batch_id -- §7.2 read 1's own input; NOT batch-keyed (a feed-wide scan, §6.3's "one priced
+    # read" economics extended to this read too, [AE2-9]: no shared snapshot pin needed)
+    read_marker_presence: Callable[[str, str], tuple[MarkerRow, ...]]  # (markers_table, feed_id)
+    # -> every guard-twin row (table_name != the sentinel) for that feed, ANY batch_id -- §7.2
+    # read 1's coherence clause AND read 2's field-absent key-match scan both consume this
+    read_marker_target: Callable[[str, str], tuple[MarkerRow, ...]]  # (markers_table,
+    # target_batch_id) -> every row (any table_name) for ONE batch_id -- §7.2 read 2's named-
+    # target read, single-partition under §6.4's identity(batch_id) (metadata-only-miss
+    # economics); called only when a seed's `supersedes_batch_id` names a target (`conveyer-kof`'s
+    # own field -- unreachable in Phase 1, the named wait, §16)
     record_run: Callable[[RunFact], None]  # best-effort, NEVER raises (§7.3, §11.3)
     emit: Callable[[str, BaseModel], None]  # (detail_type, model) -> None; PutEvents,
     # raises TransientError on ANY failed entry (I-7, [T-17])

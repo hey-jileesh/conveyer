@@ -1,0 +1,61 @@
+[
+  {
+    "value": {
+      "domain_id": "POL-0042",
+      "period": {
+        "$date": "2026-06-30"
+      },
+      "amount": {
+        "$decimal": "100.00"
+      }
+    },
+    "canonical": "{\"amount\":\"100.00\",\"domain_id\":\"POL-0042\",\"period\":\"2026-06-30\"}",
+    "sha256": "edd0d678fef6a60d07f5867c18ef63d562823a441ea3802a84be5d81653945e1"
+  },
+  {
+    "value": {
+      "domain_id": "POL-0042",
+      "period": {
+        "$date": "2026-06-30"
+      },
+      "amount": {
+        "$decimal": "150.00"
+      }
+    },
+    "canonical": "{\"amount\":\"150.00\",\"domain_id\":\"POL-0042\",\"period\":\"2026-06-30\"}",
+    "sha256": "e159800ba073afb1525ea3138394a52c94fee5cec9dfbf9b939a6c7fffa64fba"
+  },
+  {
+    "value": {
+      "domain_id": "POL-0042",
+      "period": {
+        "$date": "2026-07-31"
+      },
+      "amount": {
+        "$decimal": "100.00"
+      }
+    },
+    "canonical": "{\"amount\":\"100.00\",\"domain_id\":\"POL-0042\",\"period\":\"2026-07-31\"}",
+    "sha256": "f688beeb60c95ab7883ba2beb3f98804f9c7465db3128636e499c6f5dc8f0286"
+  },
+  {
+    "value": {
+      "domain_id": "POL-0099",
+      "period": {
+        "$date": "2026-06-30"
+      },
+      "amount": {
+        "$decimal": "100.00"
+      }
+    },
+    "canonical": "{\"amount\":\"100.00\",\"domain_id\":\"POL-0099\",\"period\":\"2026-06-30\"}",
+    "sha256": "bdab788e59f61e65d74a115c8b0f26375c332acc3876635c82aaf609797569b6"
+  },
+  {
+    "value": {
+      "policy_no": "POL-0042"
+    },
+    "canonical": "{\"policy_no\":\"POL-0042\"}",
+    "sha256": "f368d57407412a0b6a05c15d6140e2a6b91b0c341b283f94bdccb7a4dc7add37"
+  }
+]

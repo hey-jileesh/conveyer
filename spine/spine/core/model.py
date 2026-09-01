@@ -61,6 +61,7 @@ from datetime import datetime
 from decimal import Decimal, InvalidOperation
 from typing import Literal
 
+import yaml  # type: ignore[import-untyped]
 from pydantic import (
     AwareDatetime,
     BaseModel,
@@ -70,6 +71,7 @@ from pydantic import (
     model_validator,
 )
 
+from spine.core import check_grammar, record
 from spine.core.contract import COLUMN_TYPE_RE, parse_column_type
 from spine.core.naming import BATCH_ID_RE, _check_pipeline_slug_grammar
 from spine.core.naming import check_qualified_table as check_qualified_table
@@ -474,6 +476,265 @@ class RawContractModel(BaseModel):
         return self
 
 
+# --- 006.1 §4.1 `FactSchemaModel` and the fact-column type grammar ---------
+
+# 006.1 §4.1: the canonical value domain — NO float/double (007.1 §5.1
+# fragment 3: `canonical_json` rejects floats and D-1 hashes every declared
+# column); no fmt params — candidates are already typed, parsing was
+# admission's. A DIFFERENT, narrower grammar than `contract.py::COLUMN_TYPE_RE`
+# (005.1's raw-contract grammar, which carries `date(fmt)`/`timestamp(fmt)`).
+FACT_COLUMN_TYPE_RE = (
+    r"^(string|int|long|bool"
+    r"|decimal\([1-9][0-9]?,(0|[1-9][0-9]?)\)"
+    r"|date|timestamp)$"
+)
+
+
+def _fact_column_kind(type_str: str) -> str:
+    """The bare kind prefix of an already-`FACT_COLUMN_TYPE_RE`-shape-valid
+    fact-column type string (`"decimal(10,2)"` -> `"decimal"`; the other
+    six kinds are already bare). Total, never raises — every real caller's
+    `type_str` already passed `FactColumnSpec.type`'s `Field(pattern=...)`."""
+    return type_str.split("(", 1)[0]
+
+
+class FactColumnSpec(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    name: str = Field(pattern=COLUMN_NAME_RE, max_length=128)
+    type: str = Field(pattern=FACT_COLUMN_TYPE_RE)
+
+
+class FactSchemaModel(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    columns: list[FactColumnSpec] = Field(min_length=1, max_length=1024)
+    domain_id_col: str
+    record_key: list[str] = Field(min_length=1)  # dedup identity participants (007 D-2)
+    ordering: list[str] = []  # may be empty: order = (source_ts, content_hash)
+
+    @model_validator(mode="after")
+    def _check_columns(self) -> "FactSchemaModel":
+        # F3: column names unique, disjoint from the framework fact-stamp
+        # set (007.1 §5.1 fragment 4, `record.py::FACT_STAMP_COLUMNS` — the
+        # one normative enumeration, never re-listed here) and the
+        # `_conveyer_` prefix.
+        names = [c.name for c in self.columns]
+        seen: set[str] = set()
+        duplicated: set[str] = set()
+        for name in names:
+            if name in seen:
+                duplicated.add(name)
+            seen.add(name)
+        if duplicated:
+            raise ValueError(
+                "bind-defect/fact-column-reserved-name: duplicated column "
+                f"names: {sorted(duplicated)!r}"
+            )
+        framework_collisions = {name for name in names if name in record.FACT_STAMP_COLUMNS}
+        reserved_collisions = {name for name in names if name.startswith(_RESERVED_COLUMN_PREFIX)}
+        collisions = sorted(framework_collisions | reserved_collisions)
+        if collisions:
+            raise ValueError(
+                "bind-defect/fact-column-reserved-name: column names collide with the framework "
+                f"fact-stamp set or the reserved prefix: {collisions!r}"
+            )
+        # F2: domain_id_col/record_key/ordering ⊆ declared columns.
+        name_set = set(names)
+        if self.domain_id_col not in name_set:
+            raise ValueError(
+                f"bind-defect/fact-schema-unknown-column-ref: domain_id_col "
+                f"{self.domain_id_col!r} is not a declared column"
+            )
+        missing_key = sorted(set(self.record_key) - name_set)
+        if missing_key:
+            raise ValueError(
+                f"bind-defect/fact-schema-unknown-column-ref: record_key references "
+                f"undeclared column(s): {missing_key!r}"
+            )
+        missing_ordering = sorted(set(self.ordering) - name_set)
+        if missing_ordering:
+            raise ValueError(
+                f"bind-defect/fact-schema-unknown-column-ref: ordering references "
+                f"undeclared column(s): {missing_ordering!r}"
+            )
+        # [DC-10]: decimal precision >= scale, <= 38 — mirrors `ColumnSpec.
+        # _check_type_semantics`'s own decimal check, same bound, same
+        # citation style (no fabricated defect code — this check has no
+        # §5.3 table row of its own).
+        for column in self.columns:
+            if _fact_column_kind(column.type) != "decimal":
+                continue
+            inner = column.type[len("decimal(") : -1]
+            precision_str, scale_str = inner.split(",")
+            precision, scale = int(precision_str), int(scale_str)
+            if scale > precision:
+                raise ValueError(
+                    "decimal scale must be <= precision for column "
+                    f"{column.name!r}: {column.type!r}"
+                )
+            if precision > 38:
+                raise ValueError(
+                    "decimal precision must be <= 38 (Spark's ceiling, [DC-10]) for "
+                    f"column {column.name!r}: {column.type!r}"
+                )
+        # F5: every `ordering:` column's declared type ∈ the closed
+        # comparability set (007.1 F-6 §8.1, `record.py::
+        # ORDERING_COMPARABLE_TYPES` — the one code constant, never a
+        # second list).
+        columns_by_name = {c.name: c for c in self.columns}
+        for ordering_col in self.ordering:
+            kind = _fact_column_kind(columns_by_name[ordering_col].type)
+            if kind not in record.ORDERING_COMPARABLE_TYPES:
+                raise ValueError(
+                    f"bind-defect/ordering-type-not-comparable: ordering column {ordering_col!r} "
+                    f"has type {columns_by_name[ordering_col].type!r} (kind {kind!r}), not in the "
+                    f"comparable set {sorted(record.ORDERING_COMPARABLE_TYPES)!r}"
+                )
+        return self
+
+
+# --- 006.1 §4.2 `ChecksModel` and the per-kind check models -----------------
+
+CHECK_ID_RE = r"^[a-z0-9][a-z0-9-]*$"
+BUSINESS_REASON_RE = r"^business/[a-z0-9][a-z0-9-]*$"  # A-14(a)'s grammar, now bind-time
+RESERVED_REASONS = frozenset({"business/missing-domain-id"})  # D-6; 005 §8.2 carve-out
+RESERVED_CHECK_IDS = frozenset({"missing-domain-id"})  # [AE-6]: the implicit check's id (§7.1)
+
+
+def _check_id_not_reserved(value: str) -> str:
+    if value in RESERVED_CHECK_IDS:
+        raise ValueError(f"bind-defect/check-id-reserved: check id {value!r} is framework-reserved")
+    return value
+
+
+def _check_reason_not_reserved(value: str) -> str:
+    if value in RESERVED_REASONS:
+        raise ValueError(
+            f"bind-defect/check-reason-reserved: reason {value!r} is framework-reserved"
+        )
+    return value
+
+
+class RowCheckModel(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    kind: Literal["row"]
+    id: str = Field(pattern=CHECK_ID_RE, max_length=128)
+    fact_type: str  # P-5: required, exactly one
+    expr: str = Field(max_length=4096)  # must-HOLD condition; §7.2's 3-valued law
+    reason: str = Field(pattern=BUSINESS_REASON_RE)
+
+    @field_validator("id")
+    @classmethod
+    def _check_id(cls, value: str) -> str:
+        return _check_id_not_reserved(value)
+
+    @field_validator("reason")
+    @classmethod
+    def _check_reason(cls, value: str) -> str:
+        return _check_reason_not_reserved(value)
+
+
+class MembershipCheckModel(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    kind: Literal["membership"]
+    id: str = Field(pattern=CHECK_ID_RE, max_length=128)
+    fact_type: str
+    columns: list[str] = Field(min_length=1)  # candidate columns (tuple)
+    co_effect: str  # declared alias
+    ref_columns: list[str] = Field(min_length=1)  # same arity as columns
+    reason: str = Field(pattern=BUSINESS_REASON_RE)
+
+    @field_validator("id")
+    @classmethod
+    def _check_id(cls, value: str) -> str:
+        return _check_id_not_reserved(value)
+
+    @field_validator("reason")
+    @classmethod
+    def _check_reason(cls, value: str) -> str:
+        return _check_reason_not_reserved(value)
+
+    @model_validator(mode="after")
+    def _check_arity(self) -> "MembershipCheckModel":
+        # C8's arity half (parse): arity of `ref_columns` == arity of `columns`.
+        if len(self.columns) != len(self.ref_columns):
+            raise ValueError(
+                "bind-defect/membership-columns-outside-declaration: columns/ref_columns "
+                f"arity mismatch: {len(self.columns)} vs {len(self.ref_columns)}"
+            )
+        return self
+
+
+class BatchControlModel(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    member: str  # declared control member (005 v1.x grammar; P-6)
+    expr: str = Field(max_length=4096)  # scalar-position extraction over the member's columns
+
+
+class BatchCheckModel(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    kind: Literal["batch_check"]
+    id: str = Field(pattern=CHECK_ID_RE, max_length=128)
+    fact_type: str
+    aggregate: str = Field(max_length=4096)  # aggregate-position expr over the type's candidates
+    control: BatchControlModel  # P-6's seam
+    tolerance: str | None = None  # decimal literal string; None = exact (§7.5)
+
+    @field_validator("id")
+    @classmethod
+    def _check_id(cls, value: str) -> str:
+        return _check_id_not_reserved(value)
+
+    @field_validator("tolerance")
+    @classmethod
+    def _check_tolerance(cls, value: str | None) -> str | None:
+        # K8: a non-negative decimal literal, when present.
+        if value is None:
+            return value
+        parsed: Decimal | None = None
+        with contextlib.suppress(InvalidOperation, ValueError):
+            parsed = Decimal(value)
+        if parsed is None or not parsed.is_finite() or parsed < 0:
+            raise ValueError(f"tolerance must be a non-negative decimal literal: {value!r}")
+        return value
+
+
+class ChecksModel(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    checks: list[RowCheckModel | MembershipCheckModel | BatchCheckModel] = []
+
+    @model_validator(mode="after")
+    def _check_ids_unique(self) -> "ChecksModel":
+        # K1: check ids unique across the file (RESERVED_CHECK_IDS is
+        # already excluded per-model, since the implicit check is never
+        # authored). An empty `checks` list is valid — the implicit check
+        # still runs (D-6).
+        ids = [c.id for c in self.checks]
+        seen: set[str] = set()
+        duplicated: set[str] = set()
+        for check_id in ids:
+            if check_id in seen:
+                duplicated.add(check_id)
+            seen.add(check_id)
+        if duplicated:
+            raise ValueError(
+                f"bind-defect/check-duplicate-id: duplicated check ids: {sorted(duplicated)!r}"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _check_batch_check_awaiting_member_grammar(self) -> "ChecksModel":
+        # K7: `batch_check` is a bind defect until the 005 v1.x member
+        # grammar lands (P-6's structural wait) — the kind is fully
+        # specified (parseable, its own fields validate) but bind-dormant.
+        batch_ids = sorted(c.id for c in self.checks if isinstance(c, BatchCheckModel))
+        if batch_ids:
+            raise ValueError(
+                f"bind-defect/batch-check-awaiting-member-grammar: batch_check id(s) {batch_ids!r} "
+                "-- the 005 v1.x member grammar has not landed (006.1 P-6)"
+            )
+        return self
+
+
 # --- §6.2 `PipelineSpec` — what the runner consumes -------------------------
 
 
@@ -482,11 +743,34 @@ class CoEffectDecl(BaseModel):
     table: str  # bare "<db>.<table>"; identifier-grammar checked
     own_state: bool = False  # self-reference flag — 004 §7.3 obligation to 006;
     # Phase 1: WARNING when true and serialize is false
+    columns: list[str] | None = None  # D-2's optional column-grain declaration
 
     @field_validator("table")
     @classmethod
     def _check_table(cls, value: str) -> str:
         return check_qualified_table(value)
+
+
+class FactTypeModel(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    fact_table: str  # identifier grammar per 004.1 §6.7
+    state_table: str
+    schema_: FactSchemaModel = Field(alias="schema")
+
+    @field_validator("fact_table", "state_table")
+    @classmethod
+    def _check_tables(cls, value: str) -> str:
+        return check_qualified_table(value)
+
+
+def _fact_schema_family_map(schema: FactSchemaModel) -> dict[str, "check_grammar.Family | None"]:
+    """Reduces a bound fact type's declared columns down to the coarse
+    four-family partition `check_grammar.validate_expression` consumes --
+    the ONE place a fact-column kind is turned into a `Family` for K4/K9."""
+    return {
+        column.name: check_grammar.family_of_kind(_fact_column_kind(column.type))
+        for column in schema.columns
+    }
 
 
 class PipelineSpecModel(BaseModel):
@@ -497,8 +781,10 @@ class PipelineSpecModel(BaseModel):
     # ALSO an IaC input -- grants generated from it (I-21)
     raw_table: str
     quarantine_table: str
-    fact_table: str
-    state_table: str
+    fact_types: dict[str, FactTypeModel] = Field(min_length=1)  # P-1: per-type register, replaces
+    # the singular fact_table/state_table fields (hard cut, A-12 idiom); insertion order = the
+    # deploy-pinned type iteration order every consumer reads (the door planner, commit/fold, S-15)
+    checks: ChecksModel = ChecksModel()
     fold: Literal["default-lww", "custom"] = "default-lww"
     serialize: bool = False  # declared, not honored in Phase 1 (004 §16.2)
     domain_id_col: str = "domain_id"
@@ -516,10 +802,114 @@ class PipelineSpecModel(BaseModel):
     def _check_pipeline(cls, value: str) -> str:
         return _check_pipeline_slug_grammar(value)
 
-    @field_validator("raw_table", "quarantine_table", "fact_table", "state_table")
+    @field_validator("raw_table", "quarantine_table")
     @classmethod
     def _check_tables(cls, value: str) -> str:
         return check_qualified_table(value)
+
+    @field_validator("fold")
+    @classmethod
+    def _check_fold_not_custom(cls, value: str) -> str:
+        # S3: `spec.fold == "custom"` is refused (007 D-3(e); honoring
+        # undesigned) -- `fold` stays a representable Literal (D-3's own
+        # idiom applied identically to `own_state`/C6: a claim the type
+        # system can hold, refused by validation, not made unrepresentable).
+        if value == "custom":
+            raise ValueError(
+                "bind-defect/custom-fold-refused: custom fold is not honored (007 D-3(e))"
+            )
+        return value
+
+    @model_validator(mode="after")
+    def _check_fact_type_names(self) -> "PipelineSpecModel":
+        # S2 half 1: fact-type names match the check-id-shaped grammar
+        # (`fact_types` non-empty is `Field(min_length=1)`, pydantic-native).
+        bad = sorted(name for name in self.fact_types if not re.fullmatch(CHECK_ID_RE, name))
+        if bad:
+            raise ValueError(
+                f"bind-defect/fact-table-collision: invalid fact-type name(s): {bad!r}"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _check_fact_table_collisions(self) -> "PipelineSpecModel":
+        # S2 half 2: every fact table and state table pairwise distinct
+        # across types -- two relations may not share one table.
+        tables = [t for ft in self.fact_types.values() for t in (ft.fact_table, ft.state_table)]
+        seen: set[str] = set()
+        duplicated: set[str] = set()
+        for table in tables:
+            if table in seen:
+                duplicated.add(table)
+            seen.add(table)
+        if duplicated:
+            raise ValueError(
+                "bind-defect/fact-table-collision: table(s) shared across "
+                f"fact types: {sorted(duplicated)!r}"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _check_checks_bind_to_declared_types(self) -> "PipelineSpecModel":
+        # K2/K3/K4/K9, plus membership's C7 (parse half) and its ref_columns
+        # existence check when the co-effect declares no `columns:` of its
+        # own (that half is C8's BIND concern, `core/bind_checks.py`'s job
+        # -- this validator only checks against `columns:` when declared).
+        for check in self.checks.checks:
+            if check.fact_type not in self.fact_types:
+                raise ValueError(
+                    f"bind-defect/check-unknown-fact-type: check {check.id!r} references "
+                    f"undeclared fact_type {check.fact_type!r}"
+                )
+            schema = self.fact_types[check.fact_type].schema_
+            declared_columns = {c.name for c in schema.columns}
+            family_map = _fact_schema_family_map(schema)
+
+            if isinstance(check, MembershipCheckModel):
+                if check.co_effect not in self.co_effects:
+                    raise ValueError(
+                        f"bind-defect/membership-unknown-co-effect: check {check.id!r} references "
+                        f"undeclared co_effect {check.co_effect!r}"
+                    )
+                unknown_candidate_cols = sorted(set(check.columns) - declared_columns)
+                if unknown_candidate_cols:
+                    raise ValueError(
+                        f"bind-defect/check-column-outside-type: check {check.id!r} references "
+                        f"undeclared column(s): {unknown_candidate_cols!r}"
+                    )
+                co_effect_columns = self.co_effects[check.co_effect].columns
+                if co_effect_columns is not None:
+                    unknown_ref_cols = sorted(set(check.ref_columns) - set(co_effect_columns))
+                    if unknown_ref_cols:
+                        raise ValueError(
+                            "bind-defect/membership-columns-outside-declaration: check "
+                            f"{check.id!r} ref_columns outside the co-effect's declared "
+                            f"columns: {unknown_ref_cols!r}"
+                        )
+                continue
+
+            if isinstance(check, RowCheckModel):
+                positions: tuple[tuple[str, str, check_grammar.Position], ...] = (
+                    ("expr", check.expr, "scalar"),
+                )
+            else:  # BatchCheckModel -- dormant (K7), still bind-checked so its own fields are sound
+                positions = (
+                    ("aggregate", check.aggregate, "aggregate"),
+                    ("control.expr", check.control.expr, "scalar"),
+                )
+            for label, text, position in positions:
+                result = check_grammar.validate_expression(text, position, family_map)
+                if isinstance(result, check_grammar.GrammarDefect):
+                    raise ValueError(
+                        f"bind-defect/{result.code}: check {check.id!r} {label}: {result.detail}"
+                    )
+                unknown_expr_cols = sorted(result.referenced_columns - declared_columns)
+                if unknown_expr_cols:
+                    raise ValueError(
+                        f"bind-defect/check-column-outside-type: check {check.id!r} {label} "
+                        f"references undeclared column(s): {unknown_expr_cols!r}"
+                    )
+        return self
 
     # --- 005.1 §3.2's two cross-model rules (need BOTH `read` and
     # `raw_contract` in hand, so they land at `PipelineSpecModel` parse,
@@ -560,6 +950,54 @@ class PipelineSpecModel(BaseModel):
         return self
 
 
+# --- 006.1 §4: the strict-YAML duplicate-key-rejecting spec loader ---------
+
+
+def _find_duplicate_keys(node: yaml.Node) -> list[str]:
+    """Recursively walks a composed YAML node tree (`yaml.compose`, BEFORE
+    Python-object construction) collecting every mapping key that repeats
+    within its OWN immediately-enclosing mapping — `yaml.safe_load` alone
+    silently applies last-wins on a duplicate key, which is exactly what
+    makes D-2's "duplicate aliases rejected" (and every other authored
+    dict-keyed uniqueness claim) unenforceable: the parsed dict never sees
+    the duplicate. Duplicates nested inside sequences/sub-mappings are
+    found too (recursion into every value node, not just top-level)."""
+    duplicates: list[str] = []
+    if isinstance(node, yaml.MappingNode):
+        seen: set[str] = set()
+        for key_node, value_node in node.value:
+            key_text = str(key_node.value)
+            if key_text in seen:
+                duplicates.append(key_text)
+            seen.add(key_text)
+            duplicates.extend(_find_duplicate_keys(value_node))
+    elif isinstance(node, yaml.SequenceNode):
+        for item_node in node.value:
+            duplicates.extend(_find_duplicate_keys(item_node))
+    return duplicates
+
+
+def parse_pipeline_spec_yaml(text: str) -> "PipelineSpecModel":
+    """S1: `yaml.safe_load` (never the unsafe loader) + a strict duplicate-
+    key pre-check + the full pydantic parse -- the one entry point every
+    spec-loading call site should use in place of a bare `yaml.safe_load(
+    text)` + `PipelineSpecModel(**...)` pair, so S1 is enforced wherever a
+    spec is parsed, not just where someone remembered to call it. Raises
+    plain `ValueError` (`bind-defect/duplicate-key: ...`) on a duplicate
+    key, else lets `PipelineSpecModel`'s own `pydantic.ValidationError`
+    propagate naturally -- allowlisted in `tools/linter_configs/spine.py`
+    (`_TRY_RAISE_ALLOWLIST`), the `parse_column_type` raise-only-helper
+    shape (not a validator)."""
+    root = yaml.compose(text, Loader=yaml.SafeLoader)
+    duplicates = sorted(set(_find_duplicate_keys(root))) if root is not None else []
+    if duplicates:
+        raise ValueError(
+            f"bind-defect/duplicate-key: duplicate YAML mapping key(s): {duplicates!r}"
+        )
+    data = yaml.safe_load(text)
+    return PipelineSpecModel(**data)
+
+
 # --- §6.6 Lifecycle events (payloads = batch truth, I-19) -------------------
 
 
@@ -587,10 +1025,12 @@ class BatchCompletedV1(BaseModel):  # PROVISIONAL -- 008 owns and freezes the pa
     raw_count: int
     pre_quarantined: int
     post_quarantined: int  # read-back by (batch_id[, stage])
-    fact_count: int  # count of committed_facts_df -- batch truth [E-1].
-    # Named fact_count, NOT facts_appended: the ledger's facts_appended is an
-    # ATTEMPT delta (0 on guard-skip); one identifier must not carry two
-    # sourcings [H-1].
+    fact_count: int  # durable batch truth [E-1]: the sum, across every
+    # declared fact type, of a read-back `fx.read_batch(fact_table,
+    # batch_id).count()` (`stages/publish.py`'s own derivation; N-table,
+    # B10). Named fact_count, NOT facts_appended: the ledger's facts_appended
+    # is an ATTEMPT delta (0 on guard-skip); one identifier must not carry
+    # two sourcings [H-1].
     fact_snapshot_id: int | None
     state_snapshot_id: int | None  # None: expiry / fold no-op
     completed_at: AwareDatetime  # ATTEMPT-truth -- see BatchStartedV1.started_at.

@@ -1,0 +1,140 @@
+[
+  {
+    "check": {
+      "kind": "row",
+      "id": "event-after-start",
+      "fact_type": "vec",
+      "expr": "datediff(event_date, start_date) > 0",
+      "reason": "business/event-before-start"
+    },
+    "input": {
+      "row": {
+        "domain_id": "d-tmp-1",
+        "start_date": {
+          "$date": "2026-01-01"
+        },
+        "event_date": {
+          "$date": "2026-01-05"
+        }
+      }
+    },
+    "verdict": "pass"
+  },
+  {
+    "check": {
+      "kind": "row",
+      "id": "event-after-start",
+      "fact_type": "vec",
+      "expr": "datediff(event_date, start_date) > 0",
+      "reason": "business/event-before-start"
+    },
+    "input": {
+      "row": {
+        "domain_id": "d-tmp-2",
+        "start_date": {
+          "$date": "2026-01-05"
+        },
+        "event_date": {
+          "$date": "2026-01-01"
+        }
+      }
+    },
+    "verdict": "fail"
+  },
+  {
+    "check": {
+      "kind": "row",
+      "id": "event-in-2026",
+      "fact_type": "vec",
+      "expr": "year(event_time) = 2026",
+      "reason": "business/wrong-year"
+    },
+    "input": {
+      "row": {
+        "domain_id": "d-tmp-3",
+        "event_time": {
+          "$timestamp": "2026-06-15T10:00:00+00:00"
+        }
+      }
+    },
+    "verdict": "pass"
+  },
+  {
+    "check": {
+      "kind": "row",
+      "id": "event-in-2026",
+      "fact_type": "vec",
+      "expr": "year(event_time) = 2026",
+      "reason": "business/wrong-year"
+    },
+    "input": {
+      "row": {
+        "domain_id": "d-tmp-4",
+        "event_time": {
+          "$timestamp": "2025-06-15T10:00:00+00:00"
+        }
+      }
+    },
+    "verdict": "fail"
+  },
+  {
+    "check": {
+      "kind": "row",
+      "id": "within-grace-period",
+      "fact_type": "vec",
+      "expr": "event_date <= date_add(due_date, 3)",
+      "reason": "business/past-grace-period"
+    },
+    "input": {
+      "row": {
+        "domain_id": "d-tmp-5",
+        "due_date": {
+          "$date": "2026-01-01"
+        },
+        "event_date": {
+          "$date": "2026-01-03"
+        }
+      }
+    },
+    "verdict": "pass"
+  },
+  {
+    "check": {
+      "kind": "row",
+      "id": "within-grace-period",
+      "fact_type": "vec",
+      "expr": "event_date <= date_add(due_date, 3)",
+      "reason": "business/past-grace-period"
+    },
+    "input": {
+      "row": {
+        "domain_id": "d-tmp-6",
+        "due_date": {
+          "$date": "2026-01-01"
+        },
+        "event_date": {
+          "$date": "2026-01-10"
+        }
+      }
+    },
+    "verdict": "fail"
+  },
+  {
+    "check": {
+      "kind": "row",
+      "id": "event-in-2026",
+      "fact_type": "vec",
+      "expr": "year(event_time) = 2026",
+      "reason": "business/wrong-year"
+    },
+    "input": {
+      "row": {
+        "domain_id": "d-tmp-7",
+        "event_time": {
+          "$timestamp": null
+        }
+      }
+    },
+    "verdict": "pass"
+  }
+]

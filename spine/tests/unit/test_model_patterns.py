@@ -176,8 +176,22 @@ _BASE_SPEC: dict[str, Any] = {
     "transforms_module": "pipelines.commissions.transforms",
     "raw_table": "lake.commissions__raw",
     "quarantine_table": "lake.commissions__quarantine",
-    "fact_table": "lake.commissions__facts",
-    "state_table": "lake.commissions__state",
+    # 006.1 P-1: singular fact_table/state_table replaced by a per-type
+    # `fact_types` mapping -- the four-table-fields corpus below now
+    # exercises `_check_tables` via `raw_table` alone (still shared by
+    # `quarantine_table`); `fact_table`/`state_table`'s own identifier
+    # grammar is `FactTypeModel`'s own field_validator, unit-tested there.
+    "fact_types": {
+        "detail": {
+            "fact_table": "lake.commissions__facts",
+            "state_table": "lake.commissions__state",
+            "schema": {
+                "columns": [{"name": "domain_id", "type": "string"}],
+                "domain_id_col": "domain_id",
+                "record_key": ["domain_id"],
+            },
+        }
+    },
     "read": {"dialect": {"format": "csv"}},
     "raw_contract": {"columns": [{"name": "id"}]},
 }
@@ -220,9 +234,11 @@ def test_transforms_module_rejects_out_of_namespace(transforms_module: str) -> N
 
 
 # --- check_qualified_table: "<db>.<table>" identifier grammar (§6.2, §6.7) --
-# Shared by `CoEffectDecl.table` and `PipelineSpecModel`'s four table fields
-# (`raw_table`/`quarantine_table`/`fact_table`/`state_table`); exercised here
-# through `CoEffectDecl` as the narrowest model that carries it.
+# Shared by `CoEffectDecl.table`, `PipelineSpecModel`'s two remaining table
+# fields (`raw_table`/`quarantine_table` -- `fact_table`/`state_table` moved
+# to `FactTypeModel`'s own `_check_tables` field_validator, 006.1 P-1), and
+# `FactTypeModel`'s two; exercised here through `CoEffectDecl` as the
+# narrowest model that carries it.
 
 
 @pytest.mark.parametrize(
@@ -260,8 +276,17 @@ def test_qualified_table_rejects(table: str) -> None:
     ["lake.rate_cards\n", "lake.commissions\n__raw"],
 )
 def test_pipeline_spec_model_table_fields_reject_newline(table: str) -> None:
-    """Same corpus, via `PipelineSpecModel`'s four table fields (all four
-    share `_check_tables`'s single `field_validator` -- `raw_table` stands
-    in for all of them)."""
+    """Same corpus, via `PipelineSpecModel`'s two remaining table fields
+    (`raw_table`/`quarantine_table` share `_check_tables`'s single
+    `field_validator` -- `raw_table` stands in for both)."""
     with pytest.raises(ValidationError):
         _build_spec(raw_table=table)
+
+
+@pytest.mark.parametrize("table", ["lake.rate_cards\n", "lake.commissions\n__facts"])
+def test_fact_type_model_table_fields_reject_newline(table: str) -> None:
+    """006.1 P-1: `FactTypeModel.fact_table`/`.state_table` carry their own
+    `_check_tables` field_validator (the same grammar, a separate model) --
+    `fact_table` stands in for both."""
+    with pytest.raises(ValidationError):
+        model.FactTypeModel(**{**_BASE_SPEC["fact_types"]["detail"], "fact_table": table})
