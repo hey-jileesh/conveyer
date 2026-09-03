@@ -704,15 +704,20 @@ def test_k11_zero_fact_batch_writes_completion_but_no_twin_or_facts(
     assert dict(out3.facts_appended_by_table) == {_bare(fact_qt): 1}  # vacuous compare -- kept
 
 
-# --- K-12/K-13: the I-24 backstop at commit's own boundary ------------------
+# --- K-12: the I-24 backstop at commit's own boundary ------------------
 #
 # The DOOR-side construction (a durable-authority door under drift/moved-pin
 # admitting an unevaluated NULL-domain_id candidate set, 006.1's G-06 twin;
-# the [AE-3] guard-present variant reaching commit through DURABLE_SUBTRACT)
-# is 006.1/B3's own upstream territory (`post_check.py`'s doors) -- these two
-# tests exercise commit's OWN half directly: however a NULL-domain_id or
-# schema-drifted candidate set reaches commit, the I-24 backstop converts it
-# into a named, deterministic defect, never a silent fold-breaking append.
+# the [AE-3] guard-present variant reaching commit through DURABLE_SUBTRACT,
+# K-13's own sole anchor) is 006.1/B3's own upstream territory (`post_check.
+# py`'s doors; `test_multi_type_scenarios.py`'s own K-12/K-13 composed
+# scenarios) -- these two tests exercise commit's OWN half directly: however
+# a NULL-domain_id or schema-drifted candidate set reaches commit, the I-24
+# backstop converts it into a named, deterministic defect, never a silent
+# fold-breaking append. Both are K-12 anchors (A007-6): a NULL-domain_id
+# candidate and a missing-declared-column candidate are two distinct ways to
+# reach the SAME backstop family, neither is the [AE-3] guard-present
+# variant K-13 names.
 
 
 def test_k12_null_domain_id_candidate_is_a_named_defect_never_silent(
@@ -733,13 +738,16 @@ def test_k12_null_domain_id_candidate_is_a_named_defect_never_silent(
     assert spark.table(markers_qt).isEmpty()  # no marker row either -- fails BEFORE any write
 
 
-def test_k13_schema_drift_candidate_is_a_named_defect(
+def test_k12b_missing_declared_column_is_a_named_defect_before_backstop(
     spark: SparkSession, local_runner_fx: RunnerFx, unique_table: Callable[[str], str]
 ) -> None:
-    """The [AE-3]-adjacent half of the SAME backstop: a candidate frame
-    whose column set has drifted from the target fact table's (a distinct
-    I-24 condition from the domain_id-null one, §7.3(b))."""
-    spec, pipeline, _fact_qt, _markers_qt = _provision(spark, unique_table, "k13")
+    """A007-6: this is a schema-drift case (`frames/facts.py`'s own missing-
+    declared-column guard), NOT the [AE-3] guard-present variant -- K-13's
+    own sole anchor is `test_multi_type_scenarios.py::
+    test_g06_guard_present_drift_born_null_variant_ae3`. Registered under
+    K-12 (the SAME I-24 backstop family, a distinct reaching condition --
+    §7.3(b)) rather than double-anchoring K-13."""
+    spec, pipeline, _fact_qt, _markers_qt = _provision(spark, unique_table, "k12b")
     # A candidate frame missing the declared `payload` column entirely --
     # commit's own structural check must catch this, never silently commit
     # a partial row.

@@ -12,13 +12,13 @@ real `TimestampType` column.
 from __future__ import annotations
 
 import json
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
 import pytest
-from hypothesis import given, settings
+from hypothesis import HealthCheck, given, settings
 from hypothesis import strategies as st
 from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
@@ -558,56 +558,6 @@ def test_shape_post_quarantine_reason_code_passes_through_unchanged_no_grammar_c
     assert row["reason_code"] == reason_value
 
 
-@pytest.mark.parametrize(
-    "reason_value",
-    [
-        "not-a-valid-reason",
-        "Business/x",  # uppercase leading segment
-        "business/-abc",  # dash cannot be the first char after the slash
-        "business/",  # empty after slash
-        "business/foo\n",  # trailing newline -- the \z discriminator [DC-4]-style
-        "business/UPPER",
-        "biz/foo",  # wrong namespace
-        None,
-    ],
-    ids=[
-        "no-namespace",
-        "uppercase-namespace",
-        "leading-dash",
-        "empty-suffix",
-        "trailing-newline",
-        "uppercase-suffix",
-        "wrong-namespace",
-        "null",
-    ],
-)
-def test_nonconforming_reasons_flags_grammar_violations(
-    spark: SparkSession, reason_value: str | None
-) -> None:
-    """§8.2(1)/A-14's PURE half (critique F1, bead conveyer-azr.30) --
-    unchanged by 006.1's rewrite: `nonconforming_reasons` is a standalone
-    utility, no longer wired to `shape_post_quarantine` (which no longer
-    performs any reason-grammar check of its own, see the test above), kept
-    for its own sake. A plain filter, no `.count()`/action/raise of its own."""
-    schema = StructType([StructField("x", IntegerType()), StructField("reason", StringType())])
-    df = spark.createDataFrame([(1, reason_value)], schema)
-
-    assert quarantine.nonconforming_reasons(df).count() == 1
-
-
-@pytest.mark.parametrize(
-    "reason_value",
-    ["business/a", "business/0", "business/ab--cd", "business/negative-amount"],
-)
-def test_nonconforming_reasons_empty_for_conforming_grammar(
-    spark: SparkSession, reason_value: str
-) -> None:
-    schema = StructType([StructField("x", IntegerType()), StructField("reason", StringType())])
-    df = spark.createDataFrame([(1, reason_value)], schema)
-
-    assert quarantine.nonconforming_reasons(df).count() == 0
-
-
 def test_shape_post_quarantine_row_hash_stable_across_repeated_runs(
     spark: SparkSession, _utc_session_tz: None
 ) -> None:
@@ -646,6 +596,71 @@ def test_shape_post_quarantine_every_declared_timestamp_column_is_rendered_em7(
     assert row["row_snapshot"] == canonical.canonical_json(expected_value)
     # the rendered field is the canonical STRING form, present verbatim:
     assert canonical.canonical_json(event_time)[1:-1] in row["row_snapshot"]
+
+
+# A006-7/§13.1 G-11: the SAME bounded-aware-datetime strategy `tests/
+# integration/test_engine_semantics.py::_BOUNDED_AWARE_DATETIMES` uses for
+# the primitive `date_format` vs `canonical_json` property -- reproduced
+# here rather than cross-imported (this package's own convention, `frames/
+# quarantine.py`'s "every consumer writes its own, never shares code" note
+# just above applies equally to test-side utilities; `tests/` has no
+# `__init__.py` anywhere, so a `from tests.integration.test_engine_
+# semantics import ...` would need a package shape this repo deliberately
+# doesn't have). A day off each end (no `OverflowError`-triggering boundary
+# values, conveyer-azr.24); offsets bounded to +-14h (the real IANA range).
+_BOUNDED_AWARE_DATETIMES = st.datetimes(
+    min_value=datetime.min + timedelta(days=1),
+    max_value=datetime.max - timedelta(days=1),
+    timezones=st.sampled_from(
+        [UTC] + [timezone(timedelta(hours=h)) for h in (-12, -8, -5, 0, 1, 5, 8, 12, 14)]
+    ),
+)
+
+
+@given(instant=_BOUNDED_AWARE_DATETIMES)
+@settings(
+    max_examples=25, deadline=None, suppress_health_check=[HealthCheck.function_scoped_fixture]
+)
+def test_property_shape_post_quarantine_renders_generated_instants_like_canonical_json(
+    spark: SparkSession, _utc_session_tz: None, instant: datetime
+) -> None:
+    """A006-7/G-11's own PROPERTY half: the EXAMPLE test just above
+    (`..._em7`) pins ONE committed vector's `event_time` instant; this
+    generalizes the SAME tying claim -- plan-side rendering, THROUGH THE
+    REAL SHAPER (`shape_post_quarantine`, not just the primitive `date_
+    format` vs `canonical_json` comparison `test_engine_semantics.py`
+    already covers) -- over generated instants. `event_time` stays a
+    non-key column (`_ORDERS_SCHEMA.record_key == ["domain_id"]`), the
+    same fixture obligation [EM-7] pins.
+
+    `suppress_health_check=[HealthCheck.function_scoped_fixture]`: `_utc_
+    session_tz` pins `spark.sql.session.timeZone` ONCE for this whole test
+    function's duration (before hypothesis begins generating examples,
+    restored once after) -- it is not per-example state, so hypothesis's
+    default warning about a function-scoped fixture not resetting between
+    generated inputs does not apply here; the same posture `test_engine_
+    semantics.py`'s own property test takes with its (session-scoped)
+    `spark` fixture."""
+    vec_value = _post_vectors()[0]["value"]
+    typed_value = {**_post_viol_typed_value(vec_value), "event_time": instant}
+    row_tuple = (
+        typed_value["domain_id"],
+        typed_value["amount"],
+        typed_value["event_time"],
+        typed_value["quantity"],
+        typed_value["is_active"],
+        typed_value["note"],
+        "business/negative-amount",
+        None,
+    )
+    df = _post_viol_df(spark, [row_tuple])
+
+    row = quarantine.shape_post_quarantine(
+        df, _STAMP, "cv-hash", _QAT, _ORDERS_FACT_TYPE, _ORDERS_SCHEMA
+    ).collect()[0]
+
+    expected_value = {**typed_value, "_conveyer_fact_type": _ORDERS_FACT_TYPE}
+    assert row["row_snapshot"] == canonical.canonical_json(expected_value)
 
 
 def test_shape_post_quarantine_snapshot_excludes_reason_columns(spark: SparkSession) -> None:

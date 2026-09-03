@@ -63,7 +63,7 @@ import itertools
 import random
 import uuid
 from dataclasses import replace
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from decimal import Decimal
 from typing import TYPE_CHECKING
 
@@ -75,8 +75,10 @@ from ordering_reference import compare_ordering_struct, strictly_greater
 from pyspark.sql import Row, SparkSession
 from pyspark.sql import functions as F
 from pyspark.sql.types import (
+    DateType,
     DecimalType,
     IntegerType,
+    LongType,
     StringType,
     StructField,
     StructType,
@@ -99,6 +101,7 @@ if TYPE_CHECKING:
     from collections.abc import Callable
 
     from pyspark.sql import DataFrame
+    from spine.core.run_facts import RunFact
     from spine.effects.records import RunnerFx
 
 
@@ -344,7 +347,7 @@ def test_k15_cardinality_defect_names_the_target_state_table(spark: SparkSession
         schema=dup_schema,
     )
 
-    merge_fn = spark_fx._build_merge(spark)
+    merge_fn = spark_fx.build_merge(spark)
     with pytest.raises(ValueError, match="fold cardinality defect") as exc_info:
         merge_fn(merge_spec, dup_rows)
 
@@ -368,11 +371,20 @@ _K16_SCHEMA = FactSchemaModel(
     columns=[
         FactColumnSpec(name="domain_id", type="string"),
         FactColumnSpec(name="event_time", type="timestamp"),
+        # A007-5: one ordering column per §8.1 type beyond `event_time`'s own
+        # timestamp -- `int`/`long`/`decimal`/`date`/`string` -- so the core
+        # property (§10: "declared ordering columns drawn from EVERY §8.1
+        # type") exercises the full comparability set, not `timestamp` alone.
+        FactColumnSpec(name="ord_int", type="int"),
+        FactColumnSpec(name="ord_long", type="long"),
+        FactColumnSpec(name="ord_decimal", type="decimal(10,2)"),
+        FactColumnSpec(name="ord_date", type="date"),
+        FactColumnSpec(name="ord_string", type="string"),
         FactColumnSpec(name="payload", type="string"),
     ],
     domain_id_col="domain_id",
     record_key=["domain_id"],
-    ordering=["event_time"],
+    ordering=["event_time", "ord_int", "ord_long", "ord_decimal", "ord_date", "ord_string"],
 )
 _K16_DF_SCHEMA = StructType(
     [
@@ -381,6 +393,11 @@ _K16_DF_SCHEMA = StructType(
         StructField("feed_id", StringType(), False),
         StructField("received_at", TimestampType(), False),
         StructField("event_time", TimestampType(), True),
+        StructField("ord_int", IntegerType(), True),
+        StructField("ord_long", LongType(), True),
+        StructField("ord_decimal", DecimalType(10, 2), True),
+        StructField("ord_date", DateType(), True),
+        StructField("ord_string", StringType(), True),
         StructField("source_ts", TimestampType(), True),
         StructField("content_hash", StringType(), False),
         StructField("record_key", StringType(), False),
@@ -392,6 +409,33 @@ _K16_RECEIVED_AT = datetime(2026, 1, 1, tzinfo=UTC)
 _K16_TS_POOL = [None, datetime(2026, 1, 1, tzinfo=UTC), datetime(2026, 1, 2, tzinfo=UTC)]
 _K16_DOMAIN_POOL = ["d1", "d2", "d3"]
 
+# A007-5's own per-type null-bearing pools for the FIVE extra ordering
+# columns -- small, index-derived (`idx % len(pool)`), deterministic pools
+# rather than independent hypothesis draws: `_k16_to_row`'s existing callers
+# (the late-file/concurrent-sibling/rebuild-equivalence variants below) pass
+# `idx` values of 0/1 only, so widening stays backward-compatible bit-for-
+# bit for them (event_time, the FIRST declared ordering element, already
+# decides those scenarios outright regardless of what these extra columns
+# hold -- scratch-validated, this bead).
+_K16_INT_POOL = [None, -1, 0, 1]
+_K16_LONG_POOL = [None, -1, 0, 1]
+_K16_DECIMAL_POOL = [None, Decimal("1.20"), Decimal("2.00")]
+_K16_DATE_POOL = [None, date(2026, 1, 1), date(2026, 1, 2)]
+# `"9"`/`"10"` deliberately reprises §8.1's own named lexical-order trap
+# (variable-width numeric strings order lexically) -- harmless here (K-16
+# proves fold(all) == incremental, never a cross-evaluator semantics claim,
+# that's K-14's own ground) but costs nothing to include.
+_K16_STRING_POOL = [None, "9", "10"]
+# A007-5: content_hash drawn from a SMALL pool (index-derived, `idx %
+# _K16_HASH_POOL_SIZE`) rather than always-unique-per-fact -- unlike the
+# prior index-derived-uniqueness choice (deliberately absorbing D-2(b)'s
+# divergent duplicates OUT of this property, per the retired comment this
+# replaces), declared-column ties (including a full struct tie, an exact
+# duplicate) can now occur, letting content_hash -- the struct's guaranteed-
+# non-null final element -- actually decide some cases, never just backstop
+# ones that never arise.
+_K16_HASH_POOL_SIZE = 3
+
 
 def _k16_to_row(fact: tuple[str, object, int]) -> Row:
     domain_id, event_time, idx = fact
@@ -401,8 +445,13 @@ def _k16_to_row(fact: tuple[str, object, int]) -> Row:
         feed_id="f",
         received_at=_K16_RECEIVED_AT,
         event_time=event_time,
+        ord_int=_K16_INT_POOL[idx % len(_K16_INT_POOL)],
+        ord_long=_K16_LONG_POOL[idx % len(_K16_LONG_POOL)],
+        ord_decimal=_K16_DECIMAL_POOL[idx % len(_K16_DECIMAL_POOL)],
+        ord_date=_K16_DATE_POOL[idx % len(_K16_DATE_POOL)],
+        ord_string=_K16_STRING_POOL[idx % len(_K16_STRING_POOL)],
         source_ts=None,
-        content_hash=_h(idx),
+        content_hash=_h(idx % _K16_HASH_POOL_SIZE),
         record_key=domain_id,
         domain_id=domain_id,
         payload=f"p{idx}",
@@ -427,7 +476,7 @@ def _k16_run(
     spec_inc = core_merge.merge_spec(
         FactTypeModel(fact_table="db.unused", state_table=inc_bare, schema=_K16_SCHEMA)
     )
-    merge_fn = spark_fx._build_merge(spark)
+    merge_fn = spark_fx.build_merge(spark)
 
     all_df = spark.createDataFrame([_k16_to_row(f) for f in facts], schema=_K16_DF_SCHEMA)
     merge_fn(spec_all, reduce_batch_winners(all_df, spec_all))
@@ -467,10 +516,13 @@ def test_k16_fold_all_equals_incremental_fold_shuffled_arrival_nulls_included(
     batch_group_seed: int,
     shuffle_seed: int,
 ) -> None:
-    # unique content_hash per generated fact (index-derived) -- a real
-    # committed batch never carries within-batch (record_key, content_hash)
-    # duplicates past commit's own collapse (§7.2(a)); index-uniqueness here
-    # keeps the property's OWN focus on ordering, not on D-2(b)'s tiebreak.
+    # `idx` (index-derived) feeds `_k16_to_row`'s own small per-type pools,
+    # INCLUDING content_hash's (A007-5) -- declared-column ties, and
+    # occasionally a full struct tie (an exact duplicate), can now occur
+    # within one generated set; harmless to this property (fold(all) ==
+    # incremental holds regardless of hash-collision rate, scratch-validated
+    # this bead) and it is what lets content_hash -- the struct's guaranteed
+    # -non-null final element -- actually decide some generated cases.
     facts = [(domain, ts, idx) for idx, (domain, ts, _junk) in enumerate(raw_facts)]
     rnd = random.Random(batch_group_seed)
     batch_groups = [rnd.randint(0, 2) for _ in facts]
@@ -478,6 +530,61 @@ def test_k16_fold_all_equals_incremental_fold_shuffled_arrival_nulls_included(
     result_all, result_inc = _k16_run(spark, facts, batch_groups, shuffle_seed)
 
     assert result_all == result_inc
+
+
+def test_k16_divergent_duplicates_hash_tiebreak_is_order_insensitive(spark: SparkSession) -> None:
+    """A007-5's own named variant: D-2(b) divergent duplicates -- two
+    same-domain facts whose ENTIRE declared ordering struct ties -- so
+    content_hash, the struct's guaranteed-non-null final element, is what
+    decides the winner (§8.1's own total-order closure). Proves the
+    decision is genuinely order-insensitive (the SAME winner regardless of
+    which physical row order the source frame carries), not merely that
+    SOME winner is picked deterministically by accident of row order."""
+
+    def _tied_row(content_hash: str) -> Row:
+        return Row(
+            batch_id="b",
+            delivery_id="d",
+            feed_id="f",
+            received_at=_K16_RECEIVED_AT,
+            event_time=_K16_RECEIVED_AT,
+            ord_int=1,
+            ord_long=1,
+            ord_decimal=Decimal("1.20"),
+            ord_date=date(2026, 1, 1),
+            ord_string="a",
+            source_ts=None,
+            content_hash=content_hash,
+            record_key="d1",
+            domain_id="d1",
+            payload=content_hash,
+        )
+
+    higher, lower = _h(2), _h(1)
+    assert higher > lower  # the tiebreak's own precondition
+
+    all_qt_a, all_bare_a = _bootstrap_state(spark, _K16_SCHEMA)
+    spec_a = core_merge.merge_spec(
+        FactTypeModel(fact_table="db.unused", state_table=all_bare_a, schema=_K16_SCHEMA)
+    )
+    merge_fn = spark_fx.build_merge(spark)
+    df_higher_first = spark.createDataFrame(
+        [_tied_row(higher), _tied_row(lower)], schema=_K16_DF_SCHEMA
+    )
+    merge_fn(spec_a, reduce_batch_winners(df_higher_first, spec_a))
+    result_a = sorted((r["domain_id"], r["content_hash"]) for r in spark.table(all_qt_a).collect())
+
+    all_qt_b, all_bare_b = _bootstrap_state(spark, _K16_SCHEMA)
+    spec_b = core_merge.merge_spec(
+        FactTypeModel(fact_table="db.unused", state_table=all_bare_b, schema=_K16_SCHEMA)
+    )
+    df_lower_first = spark.createDataFrame(
+        [_tied_row(lower), _tied_row(higher)], schema=_K16_DF_SCHEMA
+    )
+    merge_fn(spec_b, reduce_batch_winners(df_lower_first, spec_b))
+    result_b = sorted((r["domain_id"], r["content_hash"]) for r in spark.table(all_qt_b).collect())
+
+    assert result_a == result_b == [("d1", higher)]
 
 
 def test_k16_late_file_older_received_at_batch_folding_after_a_newer_one_converges(
@@ -517,7 +624,7 @@ def test_k16_concurrent_sibling_merges_converge_via_i11_retry(spark: SparkSessio
     spec = core_merge.merge_spec(
         FactTypeModel(fact_table="db.unused", state_table=bare, schema=schema)
     )
-    merge_fn = spark_fx._build_merge(spark)
+    merge_fn = spark_fx.build_merge(spark)
 
     # Sibling A: a disjoint-domain winner for "d1".
     a_df = spark.createDataFrame(
@@ -549,7 +656,7 @@ def test_k16_concurrent_sibling_merges_converge_via_i11_retry(spark: SparkSessio
             merge_fn(spec, winners_b)  # the sibling's own real commit, mid-A's-attempt
         finally:
             spark_fx._merge_race_probe = sibling_commit_before_a
-            # `_build_merge`'s own closure re-registers A's source under the
+            # `build_merge`'s own closure re-registers A's source under the
             # SAME shared temp-view name (`_conveyer_merge_src`) before ever
             # calling this probe -- B's OWN nested `merge_fn` call just
             # overwrote it with B's data (one Spark session standing in for
@@ -585,43 +692,53 @@ def test_k16_rebuild_equivalence_fold_all_equals_rebuild_swap(
     SAME generator as the core shuffled-arrival property above (nulls in
     the one nullable ordering element included).
 
-    `result_all` is the ordinary one-shot MERGE-all-at-once leg `_k16_run`
-    already proves against the incremental sequence; `result_rebuild` folds
-    the IDENTICAL fact set through `effects.rebuild.swap_with_retry`
-    instead of an ordinary MERGE -- a fresh state table, genesis-seeded
-    with a ZERO-ROW MERGE (establishes a real first snapshot, `before_id`
-    is never `None`, and contributes no content of its own -- §9.2
-    presumes an existing state-table lineage) before the ONE real rebuild
-    swap commits `reduce_batch_winners(all_df, spec)`."""
+    **Re-pointed at the production closure (A007-1, bead conveyer-swb.13):**
+    `result_rebuild` now folds the IDENTICAL fact set through `effects.
+    rebuild.rebuild_state_table` -- the production recompute builder that
+    pins the FACT TABLE'S OWN current snapshot inside its closure (§9.5),
+    never a hand-rolled `recompute` closing over an in-memory `all_df`
+    (the prior shape `swap_with_retry` alone could not distinguish from a
+    real pinned read). `result_all` is the ordinary one-shot MERGE-all-at-
+    once leg `_k16_run` already proves against the incremental sequence;
+    Path B appends the SAME generated rows to a REAL fact table first, then
+    genesis-seeds the rebuild state table with a ZERO-ROW MERGE (establishes
+    a real first snapshot, `before_id` is never `None`, and contributes no
+    content of its own -- §9.2 presumes an existing state-table lineage)
+    before the ONE real `rebuild_state_table` call reads the fact table's
+    own pinned snapshot and swaps in `reduce_batch_winners(_, spec)`."""
     facts = [(domain, ts, idx) for idx, (domain, ts, _junk) in enumerate(raw_facts)]
 
     all_qt, all_bare = _bootstrap_state(spark, _K16_SCHEMA)
     rebuild_qt, rebuild_bare = _bootstrap_state(spark, _K16_SCHEMA)
+    fact_qt = f"spine_cat.spine_test_tables.k16fact_{uuid.uuid4().hex[:8]}"
+    bootstrap_fact_table(spark, fact_qt, _K16_SCHEMA)
+    fact_bare = fact_qt.removeprefix("spine_cat.")
     spec_all = core_merge.merge_spec(
         FactTypeModel(fact_table="db.unused", state_table=all_bare, schema=_K16_SCHEMA)
     )
-    spec_rebuild = core_merge.merge_spec(
-        FactTypeModel(fact_table="db.unused", state_table=rebuild_bare, schema=_K16_SCHEMA)
+    fact_type_rebuild = FactTypeModel(
+        fact_table=fact_bare, state_table=rebuild_bare, schema=_K16_SCHEMA
     )
-    merge_fn = spark_fx._build_merge(spark)
+    spec_rebuild = core_merge.merge_spec(fact_type_rebuild)
+    merge_fn = spark_fx.build_merge(spark)
     all_df = spark.createDataFrame([_k16_to_row(f) for f in facts], schema=_K16_DF_SCHEMA)
 
     # Path A: the ordinary one-shot fold-all, via MERGE.
     merge_fn(spec_all, reduce_batch_winners(all_df, spec_all))
     result_all = sorted((r["domain_id"], r["content_hash"]) for r in spark.table(all_qt).collect())
 
-    # Path B: the rebuild swap. Genesis-seed with a zero-row MERGE (a real
-    # first snapshot, zero content), then swap in the SAME reduce over the
-    # IDENTICAL fact set.
+    # Path B: the rebuild swap, through `rebuild_state_table` -- append the
+    # IDENTICAL rows to a real fact table, genesis-seed the rebuild state
+    # table with a zero-row MERGE (a real first snapshot, zero content),
+    # then let the production closure pin the fact table's own snapshot and
+    # reduce it.
+    all_df.writeTo(fact_qt).option("check-nullability", "false").append()
     empty_df = spark.createDataFrame([], schema=_K16_DF_SCHEMA)
     merge_fn(spec_rebuild, reduce_batch_winners(empty_df, spec_rebuild))
 
-    def recompute() -> DataFrame:
-        return reduce_batch_winners(all_df, spec_rebuild)
-
-    ledger_rows: list[object] = []
-    rebuild_fx.swap_with_retry(
-        spark, "pipelines/k16-rebuild-equiv", rebuild_bare, recompute, ledger_rows.append
+    ledger_rows: list[RunFact] = []
+    rebuild_fx.rebuild_state_table(
+        spark, "pipelines/k16-rebuild-equiv", fact_type_rebuild, record_run=ledger_rows.append
     )
     result_rebuild = sorted(
         (r["domain_id"], r["content_hash"]) for r in spark.table(rebuild_qt).collect()
@@ -629,6 +746,7 @@ def test_k16_rebuild_equivalence_fold_all_equals_rebuild_swap(
 
     assert result_all == result_rebuild
     assert len(ledger_rows) == 1  # the genesis seed leaves before_id valid -> one attempt
+    assert ledger_rows[0].state_read_snapshot_id is not None  # the fact table's own pinned snapshot
 
 
 # --- K-22..K-25: the kill-matrix rows, per-type register (§11/§13.2) --------
@@ -744,6 +862,90 @@ def test_k22_kill_between_fold_merges_then_rerun_converges(
     assert b_rows == [("dB", "pB")]
 
 
+def test_k22_zero_merged_completed_but_unfolded_successor_drops_and_perception_holds_pre_predecessor(  # noqa: E501
+    spark: SparkSession,
+    local_runner_fx: RunnerFx,
+    unique_table: Callable[[str], str],
+    moto_events_bus,
+) -> None:
+    """A007-3: [AE2-2]'s zero-merged trace variant (§11's row, widest form)
+    -- completion present, NO MERGE ran at all for EITHER type (killed
+    after the completion row, before the first MERGE) -- plus the standing
+    cross-batch consequence: a successor lawfully drops against the
+    completed-but-unfolded predecessor, completes, and emits its own
+    `batch-completed`; perception holds the PRE-predecessor value through
+    that fired event, until the predecessor's own fold reruns.
+
+    Three batches, one domain (`dA`), real `commit_admitted`/`fold_stage.
+    run`/`publish_stage.run` calls throughout (never a raw-SQL seed):
+    B0 commits+folds `dA/p0` (a genuine prior predecessor, establishing the
+    "pre-predecessor" value in state). B1 commits `dA/pA` (novel against
+    B0) -- completion written, its OWN fold never runs ("killed" here,
+    simply by not calling `fold_stage.run` yet -- the widest zero-merged
+    form needs no MERGE mechanics at all, unlike the sibling test above's
+    half-merged variant). B2 commits an IDENTICAL `dA/pA` candidate: B1 is
+    now the feed's latest completed batch, so B2 drops it as unchanged
+    (`delta_predecessor_batch_ids == (B1,)`, zero novel facts) -- B2 still
+    gets its own completion row (commit's unconditional last act) and folds
+    to a no-op (nothing of its own to merge). `publish_stage.run(B2)` emits
+    `batch-completed` for B2. State must still read `dA/p0` (B1's fold
+    never ran, B2 contributed nothing) -- the standing, pre-rerun truth,
+    asserted BEFORE B1's own fold closes the window. Only then does
+    `fold_stage.run(B1)` finally advance state to `dA/pA`."""
+    fixture = _TwoTypeFixture(spark, unique_table)
+    b0 = sh.batch_id(2210)
+    b1 = sh.batch_id(2211)
+    b2 = sh.batch_id(2212)
+
+    committed_b0 = fixture.commit_admitted(
+        b0, a_rows=[("dA", "2026-01-01T00:00:00Z", "p0")], b_rows=[], fx=local_runner_fx
+    )
+    fold_stage.run(committed_b0, local_runner_fx)
+    a_state_pre = sorted(
+        (r["domain_id"], r["payload"]) for r in spark.table(fixture.a_state_qt).collect()
+    )
+    assert a_state_pre == [("dA", "p0")]  # the pre-predecessor value, established for real
+
+    committed_b1 = fixture.commit_admitted(
+        b1, a_rows=[("dA", "2026-01-02T00:00:00Z", "pA")], b_rows=[], fx=local_runner_fx
+    )
+    assert committed_b1.delta_predecessor_batch_ids == (b0,)
+    a_bare = fixture.a_fact_qt.removeprefix("spine_cat.")
+    assert dict(committed_b1.facts_appended_by_table)[a_bare] == 1
+    # "killed" here -- commit's completion row is written (commit's own
+    # unconditional last act); B1's own `fold_stage.run` never happens yet.
+
+    committed_b2 = fixture.commit_admitted(
+        b2, a_rows=[("dA", "2026-01-02T00:00:00Z", "pA")], b_rows=[], fx=local_runner_fx
+    )
+    assert committed_b2.delta_predecessor_batch_ids == (b1,)  # B1 is the latest completed batch
+    facts_appended_b2 = dict(committed_b2.facts_appended_by_table)
+    assert facts_appended_b2[a_bare] == 0  # identical to B1 -> dropped, unchanged
+
+    folded_b2 = fold_stage.run(committed_b2, local_runner_fx)
+    assert dict(folded_b2.fold_snapshot_ids) == {}  # B2 contributed nothing of its own -- no-op
+
+    after_publish_b2 = publish_stage.run(folded_b2, local_runner_fx)
+    assert after_publish_b2.published is True
+    envelopes = [e for e in moto_events_bus.read_events() if e["detail"].get("batch_id") == b2]
+    assert len(envelopes) == 1
+    assert envelopes[0]["detail-type"] == "batch-completed"
+
+    # The standing, PRE-rerun truth: perception still holds the
+    # PRE-predecessor value -- B1's fold never ran, B2's fold was a no-op.
+    a_state_standing = sorted(
+        (r["domain_id"], r["payload"]) for r in spark.table(fixture.a_state_qt).collect()
+    )
+    assert a_state_standing == [("dA", "p0")]
+
+    # Only now: B1's own fold reruns and closes the window.
+    fold_stage.run(committed_b1, local_runner_fx)
+    a_state_after_b1_fold = sorted(
+        (r["domain_id"], r["payload"]) for r in spark.table(fixture.a_state_qt).collect()
+    )
+    assert a_state_after_b1_fold == [("dA", "pA")]
+
+
 def test_k23_kill_after_fold_before_publish_then_rerun_emits(
     spark: SparkSession,
     local_runner_fx: RunnerFx,
@@ -848,6 +1050,98 @@ def test_k24_stale_extra_attempt_of_old_batch_after_newer_batch_folded_never_reg
         (r["domain_id"], r["payload"]) for r in spark.table(fixture.a_state_qt).collect()
     )
     assert rows_final == [("d1", "B-newer")]  # state STILL never regressed
+
+
+def test_k24_arrival_order_tiebreak_source_ts_decides_over_a_smaller_content_hash(
+    spark: SparkSession, local_runner_fx: RunnerFx, unique_table: Callable[[str], str]
+) -> None:
+    """U-1's own K-24-family variant (bead conveyer-swb.11): two batches TIE
+    on the declared `event_time` ordering column -- `source_ts` (HLD 007
+    D-3(b): `= ` each batch's own `received_at`, `stages/commit.py::
+    _stamp_candidates`'s F-1 stamp) must decide the fold in favor of the
+    LATER-arriving batch even though its `content_hash` sorts
+    lexicographically SMALLER than the earlier batch's own. Before U-1's
+    fix, `source_ts` was a literal `NULL` on every fact, so this exact tie
+    fell through to `content_hash` alone and the LATER batch's smaller hash
+    LOST -- confirmed by this bead's own kernel probe against `ordering_
+    reference.strictly_greater` over these two rows' `(event_time, source_ts,
+    content_hash)` tuples: `True` with a real `source_ts`, `False` with the
+    pre-fix literal `None` in its place. A stale extra attempt of batch 1
+    (a genuine rerun, AFTER batch 2 already folded) stays a pure no-op --
+    idempotency preserved, K-24's own standing shape (`test_k24_stale_
+    extra_attempt_of_old_batch_after_newer_batch_folded_never_regresses`
+    above)."""
+    fixture = _TwoTypeFixture(spark, unique_table)
+    batch_1 = sh.batch_id(2420)
+    batch_2 = sh.batch_id(2421)
+    tied_event_time = "2026-01-01T00:00:00Z"  # identical on BOTH batches -- ties the declared col
+
+    # `core.canonical.row_hash({"domain_id": "d1", "event_time":
+    # tied_event_time, "payload": <payload>})` over these two literal
+    # payloads (this bead's own kernel probe) -- `payload_smaller_hash`
+    # hashes lexicographically SMALLER than `payload_larger_hash`,
+    # deterministic; pinned here rather than recomputed live, since a live
+    # recompute would just restate the same fact this comment already pins.
+    payload_smaller_hash = "k24-tiebreak-payload-x"  # hash d5636a68...
+    payload_larger_hash = "k24-tiebreak-payload-y"  # hash d582da71...
+
+    ctx1 = replace(
+        fixture.seed(batch_1),
+        received_at=datetime(2026, 6, 1, tzinfo=UTC),  # earlier arrival
+        admitted_facts={
+            "type-a": fixture._rows_df([("d1", tied_event_time, payload_larger_hash)]),
+            "type-b": fixture._rows_df([]),
+        },
+    )
+    committed_1 = commit_stage.run(ctx1, local_runner_fx)
+    fold_stage.run(committed_1, local_runner_fx)
+
+    rows_after_1 = sorted(
+        (r["domain_id"], r["payload"]) for r in spark.table(fixture.a_state_qt).collect()
+    )
+    assert rows_after_1 == [("d1", payload_larger_hash)]  # first-ever fact: plain insert
+
+    ctx2 = replace(
+        fixture.seed(batch_2),
+        received_at=datetime(2026, 6, 2, tzinfo=UTC),  # LATER arrival than batch 1
+        admitted_facts={
+            "type-a": fixture._rows_df([("d1", tied_event_time, payload_smaller_hash)]),
+            "type-b": fixture._rows_df([]),
+        },
+    )
+    committed_2 = commit_stage.run(ctx2, local_runner_fx)
+    folded_2 = fold_stage.run(committed_2, local_runner_fx)
+
+    assert sh.bare(fixture.a_state_qt) in folded_2.fold_snapshot_ids  # a REAL update, not a tie
+    rows_after_2 = sorted(
+        (r["domain_id"], r["payload"]) for r in spark.table(fixture.a_state_qt).collect()
+    )
+    # The later-arriving batch wins DESPITE its smaller content_hash -- the
+    # exact behavior U-1's fix restores; pre-fix this would still read
+    # `payload_larger_hash` (batch 1 never displaced, the reported defect).
+    assert rows_after_2 == [("d1", payload_smaller_hash)]
+
+    # A stale extra attempt of batch 1 (a genuine rerun of its OWN batch_id,
+    # AFTER batch 2 already folded) must stay a pure no-op -- commit fully
+    # guard-skips, fold ties out again (source_ts still loses), state never
+    # regresses back to batch 1's payload.
+    ctx1_again = replace(
+        fixture.seed(batch_1),
+        received_at=datetime(2026, 6, 1, tzinfo=UTC),
+        admitted_facts={
+            "type-a": fixture._rows_df([("d1", tied_event_time, payload_larger_hash)]),
+            "type-b": fixture._rows_df([]),
+        },
+    )
+    committed_1_again = commit_stage.run(ctx1_again, local_runner_fx)
+    assert committed_1_again.commit_snapshot_ids == {}  # commit: fully guard-skipped
+    folded_1_again = fold_stage.run(committed_1_again, local_runner_fx)
+    assert folded_1_again.fold_snapshot_ids == {}  # fold: source_ts loses again -- logical no-op
+
+    rows_final = sorted(
+        (r["domain_id"], r["payload"]) for r in spark.table(fixture.a_state_qt).collect()
+    )
+    assert rows_final == [("d1", payload_smaller_hash)]  # state never regressed
 
 
 # --- K-25: residual sweep (module docstring has items (i)/(iii)'s citations) -

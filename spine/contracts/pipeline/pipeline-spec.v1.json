@@ -363,6 +363,7 @@
           "type": "string"
         },
         "reason": {
+          "maxLength": 128,
           "pattern": "^business/[a-z0-9][a-z0-9-]*$",
           "title": "Reason",
           "type": "string"
@@ -472,6 +473,7 @@
           "type": "string"
         },
         "reason": {
+          "maxLength": 128,
           "pattern": "^business/[a-z0-9][a-z0-9-]*$",
           "title": "Reason",
           "type": "string"

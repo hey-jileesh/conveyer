@@ -178,11 +178,16 @@ import purity_linter
 # on a genuine duplicate YAML mapping key (§4's strict-loader obligation,
 # S1) -- no `try` involved, just a bare `raise`, exempt for the same
 # raise-only-helper reason as this list's other `model.py` entries.
-# `_check_id_not_reserved`/`_check_reason_not_reserved` are the SAME shape
-# again: plain validator-SUPPORT helpers (K1/[AE-6], K6) shared across
-# `RowCheckModel`/`MembershipCheckModel`/`BatchCheckModel`'s own
-# `@field_validator`s, not themselves decorated -- `_check_pipeline_slug_
-# grammar`'s own precedent, restated once more for the check-kind models.
+# `_check_id_not_reserved`/`_check_reason` are the SAME shape again: plain
+# validator-SUPPORT helpers (K1/[AE-6], K6 -- BOTH of K6's halves, grammar
+# then framework-reserved, folded into the one `_check_reason` function
+# [M7 critique fix]: a separate `_check_reason_grammar` raise-only helper
+# beside `_check_reason` was a needless `_TRY_RAISE_ALLOWLIST` growth,
+# [DS2-2]'s own gate, when one function raising both named codes in
+# sequence needs only the one entry below) shared across `RowCheckModel`/
+# `MembershipCheckModel`/`BatchCheckModel`'s own `@field_validator`s, not
+# themselves decorated -- `_check_pipeline_slug_grammar`'s own precedent,
+# restated once more for the check-kind models.
 #
 # 006.1 B0 (bead conveyer-6pg.10, n-check-grammar) addition -- absorbs
 # `conveyer-azr.25`: `naming.py::_format_received_at` gains the SAME
@@ -199,7 +204,7 @@ _TRY_RAISE_ALLOWLIST: frozenset[tuple[str, str]] = frozenset(
         ("spine/core/model.py", "_check_single_ascii_printable"),
         ("spine/core/model.py", "parse_pipeline_spec_yaml"),
         ("spine/core/model.py", "_check_id_not_reserved"),
-        ("spine/core/model.py", "_check_reason_not_reserved"),
+        ("spine/core/model.py", "_check_reason"),
         ("spine/core/naming.py", "_check_pipeline_slug_grammar"),
         ("spine/core/naming.py", "_format_received_at"),
         ("spine/core/naming.py", "execution_name"),
@@ -498,9 +503,22 @@ _VALIDATOR_DECORATOR_NAMES: frozenset[str] = frozenset(
 )
 
 # TransientError exempted by config as in ingestion (§12.3 last bullet).
+#
+# `LedgerConfig`/`SessionConfig` (bead conveyer-swb.25, M3/F2) — narrow
+# structural-typing `Protocol`s, not dataclasses/pydantic models/enums:
+# `effects/ledger.py::build_catalog`/`build_record_run` and `entrypoints/
+# session.py::catalog_conf`/`build_session` are typed against exactly the
+# few fields they read, so `spine.config.RunnerConfig` AND `entrypoints/
+# rebuild_main.py::RebuildConfig` (two DIFFERENT concrete dataclasses)
+# satisfy them BOTH without either inheriting from the other or from a
+# shared base — the whole point of a `Protocol` over a dataclass here, and
+# the `_is_allowed_class` rule has no other shape for it (a `Protocol` is
+# neither a frozen dataclass, a pydantic `BaseModel`, nor an enum base).
 _CLASS_SHAPE_ALLOWLIST: frozenset[tuple[str, str]] = frozenset(
     {
         ("spine/effects/records.py", "TransientError"),
+        ("spine/effects/ledger.py", "LedgerConfig"),
+        ("spine/entrypoints/session.py", "SessionConfig"),
     }
 )
 

@@ -86,8 +86,10 @@ if TYPE_CHECKING:
 # engine's own default; `timeZone=UTC` keeps a naive-cell interpretation
 # environment-independent (matches `core/canonical.py`'s own UTC-only
 # domain, [DC-3]). ONE authored constant, wired into BOTH
-# `tests/conftest.py::_BASE_CONF` and `entrypoints/glue_main.py::
-# _catalog_conf`'s session builds (§12.1) so they cannot drift apart — a
+# `tests/conftest.py::_BASE_CONF` and `entrypoints/session.py::
+# catalog_conf`'s session builds (§12.1, F2 bead conveyer-swb.25 -- the ONE
+# shared source both `glue_main.py`/`rebuild_main.py` import) so they
+# cannot drift apart — a
 # plain `Mapping[str, str]`, not a `SparkSession` call of any kind, so this
 # module's own `frames-transforms` purity profile (which bans
 # `SparkSession`/`getOrCreate`/etc. by attribute name) is untouched by its
@@ -544,6 +546,16 @@ def compile_contract(contract: RawContractModel) -> CompiledContract:
     (which bans the Spark-session/action attribute-name surface file-wide)
     and with E-5 (a compiled predicate is a pure function of `(durable raw
     schema, contract@v)`).
+
+    Despite building no DataFrame, this still needs an ACTIVE SparkContext
+    (a session already up) — `F.col(...)` construction (via `_typed_expr`)
+    asserts `SparkContext._active_spark_context is not None` internally
+    (conveyer-swb.22 F-1): a caller (test or otherwise) that has never
+    touched Spark before calling this function will raise from inside
+    `F.col`, not from any action here. Callers already holding a live
+    session are unaffected; a test file that calls `compile_contract` first
+    must request the `spark` fixture itself rather than rely on collection
+    order handing it a live session.
     """
     typed_exprs: dict[str, Column] = {
         column.name: _typed_expr(column.name, parse_column_type(column.type))

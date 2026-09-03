@@ -19,6 +19,7 @@ _FULL_ARGV = [
     "--conveyer-run-ledger-table", "run_ledger",
     "--conveyer-event-bus", "conveyer-dev-bus",
     "--conveyer-landing-bucket", "conveyer-dev-landing",
+    "--conveyer-artifacts-bucket", "artifacts",
     "--conveyer-pipeline-spec-uri", "s3://artifacts/spine/specs/commissions/pipeline.yaml",
     "--conveyer-delivery", "{}",
     "--conveyer-sfn-retry-count", "0",

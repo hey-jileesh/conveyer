@@ -255,40 +255,6 @@ def shape_pre_quarantine(
     return shaped.select(*_QUARANTINE_COLUMNS)
 
 
-# A-14/§8.2.1: the reason grammar at the seam. Normative grammar
-# `^business/[a-z0-9][a-z0-9-]*$`, fullmatch-anchored `\A(?:…)\z` the same
-# way §6.1 check 6 anchors an authored `pattern` (lowercase `\z`, not Java's
-# `\Z` — the latter permits a trailing line terminator, [DC-4]'s
-# discriminator). ASCII-only grammar: no Python-regex/Java-regex divergence
-# risk to hedge against here (unlike an authored contract `pattern`, [DC-4]
-# does not apply).
-_BUSINESS_REASON_FULLMATCH = r"\A(?:business/[a-z0-9][a-z0-9-]*)\z"
-
-
-def nonconforming_reasons(viol_df: DataFrame) -> DataFrame:
-    """§8.2(1)/A-14's PURE half (critique F1, bead conveyer-azr.30):
-    `viol_df` filtered to rows whose `reason` value does NOT fullmatch
-    `^business/[a-z0-9][a-z0-9-]*$` (a NULL `reason` counts as
-    nonconforming too). A plain DataFrame-in/DataFrame-out plan — no
-    `.count()`, no action, no control flow — matching this module's own
-    `frames-transforms` purity profile (`tools/linter_configs/spine.py`)
-    exactly the way `frames/checks.py`'s own predicates do.
-
-    Previously this module itself materialized the count and raised the
-    A-14 named `ValueError` (`_assert_business_reason_grammar`, now
-    deleted) — an eager Spark action turned into control flow INSIDE
-    `frames/`, the one purity-profile hole `.count()` sat in (it was, until
-    this fix, the sole attribute absent from `_SPARK_BANNED_ATTR_NAMES`,
-    routed through deliberately because `.take()`/`.collect()` are banned).
-    The caller (`stages/post_check.py`, which already counts on every path)
-    now materializes THIS function's output and raises the same named
-    `ValueError` itself — `shape_post_quarantine` below stays a pure plan
-    builder throughout, never executing a job or raising mid-composition.
-    """
-    conforms = F.col("reason").isNotNull() & F.col("reason").rlike(_BUSINESS_REASON_FULLMATCH)
-    return viol_df.filter(~conforms)
-
-
 # --- 006.1 §10's post_check writer rewrite -----------------------------------
 
 # The struct field this UDF factory's closure produces, per call (a FRESH

@@ -237,6 +237,7 @@ def _test_runner_config(*, warehouse_uri: str, ledger_sql_uri: str, event_bus: s
         run_ledger_table="run_ledger",
         event_bus=event_bus,
         landing_bucket="conveyer-test-landing",
+        artifacts_bucket="conveyer-test-artifacts",
         pipeline_spec_uri="s3://conveyer-test-specs/identity/pipeline.yaml",
         delivery_json="{}",
         attempt_id="attempt-1",

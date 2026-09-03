@@ -8,11 +8,11 @@
 #
 # Every `--conveyer-*` argument below is one of `spine/config.py::
 # _ARGV_KEYS` this pipeline's job needs (verified against that file's
-# literal key table): env, aws-region, catalog-kind, spine-db,
-# run-ledger-table, event-bus, landing-bucket, pipeline-spec-uri,
-# run-config, sla-minutes. NOT set here (deliberately): `--conveyer-
-# warehouse-uri` / `--conveyer-ledger-sql-uri` (test-only, `RunnerConfig`
-# marks both optional and this job runs `catalog_kind="glue"` /
+# literal key table): env, aws-region, catalog-kind, ledger-catalog-kind,
+# spine-db, run-ledger-table, event-bus, landing-bucket, artifacts-bucket,
+# pipeline-spec-uri, run-config, sla-minutes. NOT set here (deliberately):
+# `--conveyer-warehouse-uri` / `--conveyer-ledger-sql-uri` (test-only,
+# `RunnerConfig` marks both optional and this job runs `catalog_kind="glue"` /
 # `ledger_catalog_kind="glue"`, neither of which reaches those branches);
 # `--conveyer-delivery` / `--conveyer-sfn-retry-count` / `--conveyer-sfn-
 # redrive-count` (SFN-injected PER EXECUTION via the state machine's Task
@@ -70,6 +70,7 @@ resource "aws_glue_job" "this" {
     "--conveyer-run-ledger-table"    = var.run_ledger_table_name
     "--conveyer-event-bus"           = var.event_bus_name
     "--conveyer-landing-bucket"      = var.landing_bucket_name
+    "--conveyer-artifacts-bucket"    = var.artifacts_bucket_name
     "--conveyer-pipeline-spec-uri"   = var.pipeline_spec_uri
     "--conveyer-run-config"          = var.run_config
     "--conveyer-sla-minutes"         = tostring(var.sla_minutes)

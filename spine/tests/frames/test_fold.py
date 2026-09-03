@@ -132,6 +132,32 @@ def test_reduce_batch_winners_is_idempotent_on_rerun_over_the_same_facts(
     assert to_key(first) == to_key(second)
 
 
+def test_reduce_batch_winners_source_ts_breaks_a_tie_on_declared_columns_before_content_hash(
+    spark: SparkSession,
+) -> None:
+    """U-1's own reduce-side pin (bead conveyer-swb.11): once the declared
+    `event_time` ordering column TIES, `source_ts` (§4.1's ordering suffix,
+    the second element -- HLD 007 D-3(b): the delivery's own `received_at`)
+    must decide BEFORE `content_hash`, the third and final element. The
+    LATER `source_ts` here carries the LEXICALLY SMALLER `content_hash` --
+    the exact shape U-1's defect got backwards (a dead, always-`NULL`
+    `source_ts` would fall straight through to `content_hash` and pick
+    `"h-lower"` instead)."""
+    ts = datetime(2026, 1, 1, tzinfo=UTC)
+    facts = spark.createDataFrame(
+        [
+            _row("d1", ts, datetime(2026, 1, 2, tzinfo=UTC), "h-lower", "later-source-ts"),
+            _row("d1", ts, datetime(2026, 1, 1, tzinfo=UTC), "h-upper", "earlier-source-ts"),
+        ],
+        schema=_SCHEMA,
+    )
+
+    winners = reduce_batch_winners(facts, _SPEC).collect()
+
+    assert len(winners) == 1
+    assert winners[0]["payload"] == "later-source-ts"  # source_ts decided it, not content_hash
+
+
 def test_reduce_batch_winners_respects_declared_ordering_cols_order_not_alphabetical(
     spark: SparkSession,
 ) -> None:

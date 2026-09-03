@@ -51,6 +51,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from uuid import UUID, uuid4
 
+import killfx
 import pytest
 from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql import functions as F
@@ -573,6 +574,157 @@ def test_g04c_pre_check_any_door_fires_when_only_the_second_declared_type_has_fa
     assert pre_check_rows == []  # zero new pre_check rows on this door
 
 
+def test_g04a_kill_between_type_appends_rerun_authority_and_completion(
+    spark: SparkSession,
+    local_runner_fx: RunnerFx,
+    make_wrapped_fx: Callable[..., RunnerFx],
+    unique_table: Callable[[str], str],
+    tmp_path: Path,
+) -> None:
+    """A006-11: G-04(a) composed as ONE real kill-between-type-appends ->
+    rerun scenario (§13.1 G-04(a); §11's 'Kill between type appends
+    (commit), rerun' row) -- not `test_g04a_durable_authority_when_any_
+    declared_fact_table_has_the_batch`'s own direct-INSERT stand-in (module
+    docstring's own "simulate ... commit's own territory, out of this
+    bead's scope" carve-out, now closed at THIS grain).
+
+    A real partial commit: attempt 1 admits BOTH types cleanly (zero
+    violations -- the quarantine guard stays ABSENT), then `commit.run`
+    itself is killed (`killfx.kill_after(1)` on `fx.append`, K-20's own
+    mechanics) right after the FIRST declared type's (orders) own append --
+    orders durable, shipments untouched, no completion row. The rerun
+    re-enters through `land`(guard-skip)/`pre_check`/`pull`/`apply`/
+    `post_check` under a TIGHTENED `ChecksModel` (test_g04b's own drift
+    mechanism: a new row check orders' already-admitted candidate would now
+    fail) -- post_check's own quarantine guard is still absent, but
+    orders' own durable presence opens the ANY-table door ->
+    DURABLE_AUTHORITY: both types admitted UNCONDITIONALLY (no check ever
+    gates admission), drift recorded (never raised), zero new quarantine
+    rows. `commit.run` on the rerun then completes shipments per-table
+    (orders guard-skipped, untouched; shipments appended for the first
+    time) -- the five points the bead names, all asserted below.
+
+    Dedicated local setup (real bootstrap-DDL fact/state/markers tables),
+    not the shared `_Fixture` (module docstring: its own minimal `(domain_
+    id, batch_id)` stub predates commit/fold, too narrow for `commit.run`'s
+    OWN structural check -- `test_g06_guard_present_drift_born_null_
+    variant_ae3`'s own precedent, reused here without AE3's co-effect-drift
+    machinery, which this scenario does not need (checks tighten between
+    attempts; no domain_id resolution ever changes)."""
+    raw_qt = unique_table("g04a_raw")
+    qtn_qt = unique_table("g04a_qtn")
+    orders_fact_qt = unique_table("g04a_orders_fact")
+    orders_state_qt = unique_table("g04a_orders_state")
+    shipments_fact_qt = unique_table("g04a_shipments_fact")
+    shipments_state_qt = unique_table("g04a_shipments_state")
+    ref_qt = unique_table("g04a_ref")
+    _create_raw_table(spark, raw_qt)
+    _create_quarantine_table(spark, qtn_qt)
+    bootstrap_fact_table(spark, orders_fact_qt, _CANDIDATE_SCHEMA)
+    bootstrap_state_table(spark, orders_state_qt, _CANDIDATE_SCHEMA)
+    bootstrap_fact_table(spark, shipments_fact_qt, _CANDIDATE_SCHEMA)
+    bootstrap_state_table(spark, shipments_state_qt, _CANDIDATE_SCHEMA)
+    _create_ref_table(spark, ref_qt, ("id-1",))
+
+    pipeline = f"pipelines/g04a{uuid4().hex[:8]}"
+    spec = _make_spec(
+        raw_table=_bare(raw_qt),
+        quarantine_table=_bare(qtn_qt),
+        orders_fact_table=_bare(orders_fact_qt),
+        orders_state_table=_bare(orders_state_qt),
+        shipments_fact_table=_bare(shipments_fact_qt),
+        shipments_state_table=_bare(shipments_state_qt),
+        co_effects={"allow_ref": CoEffectDecl(table=_bare(ref_qt))},
+    ).model_copy(update={"pipeline": pipeline})
+    markers_qt = naming.qualified(naming.markers_table(spec.raw_table, spec.pipeline))
+    bootstrap_markers_table(spark, markers_qt)
+
+    object_uris = _write_csv(
+        tmp_path / "batch.csv", "domain_id,amount,kind\nid-1,10.00,orders\nid-2,1.00,shipments\n"
+    )
+    batch_id = _batch_id(200)
+
+    # Attempt 1: BOTH types resolve cleanly (id-1 known, positive; id-2 --
+    # shipments binds no checks at all) -- zero violations, quarantine
+    # guard ABSENT.
+    after1 = _run_through_post_check(
+        _make_seed(spec=spec, batch_id=batch_id, object_uris=object_uris), local_runner_fx
+    )
+    assert after1.post_quarantined_count == 0
+    assert after1.admitted_facts[_ORDERS].count() == 1
+    assert after1.admitted_facts[_SHIPMENTS].count() == 1
+
+    # Commit, killed after the FIRST declared type's own append (orders) --
+    # before shipments' own processing and before the unconditional
+    # completion row (K-20's own mechanics, one call site over).
+    killed_fx = make_wrapped_fx(local_runner_fx, {"append": killfx.kill_after(1)})
+    with pytest.raises(killfx.SimulatedKill):
+        commit_stage.run(after1, killed_fx)
+
+    assert local_runner_fx.read_batch(_bare(orders_fact_qt), batch_id).count() == 1
+    assert local_runner_fx.read_batch(_bare(shipments_fact_qt), batch_id).count() == 0
+    assert (
+        spark.table(markers_qt)
+        .where(f"batch_id = '{batch_id}' AND table_name = '{naming.COMMIT_COMPLETION_SENTINEL}'")
+        .isEmpty()
+    )
+
+    # Rerun: tighten checks.yaml between attempts (a real rule change) --
+    # orders' already-admitted id-1 (amount=10) would now fail a NEW row
+    # check under fresh evaluation.
+    tightened_checks = ChecksModel(
+        checks=[
+            *_CHECKS.checks,
+            RowCheckModel(
+                kind="row",
+                id="amount-under-5",
+                fact_type=_ORDERS,
+                expr="amount < 5",
+                reason="business/amount-too-high",
+            ),
+        ]
+    )
+    tightened_spec = spec.model_copy(update={"checks": tightened_checks})
+    after2 = _run_through_post_check(
+        _make_seed(spec=tightened_spec, batch_id=batch_id, object_uris=object_uris),
+        local_runner_fx,
+    )
+
+    # 1. DURABLE_AUTHORITY chosen -- unconditional admission despite the
+    #    tightened check, the quarantine guard never accretes.
+    assert "post_check" not in after2.guard_skips
+    assert after2.admitted_facts[_ORDERS].count() == 1
+    # 2. post_check_drift recorded (the tightened rule), never raised.
+    assert after2.post_check_drift is not None
+    assert after2.post_check_drift.startswith("post_check drift: durable=0 recomputed=1")
+    # 3. no new quarantine rows.
+    assert after2.post_quarantined_count == 0
+    post_check_qtn_rows = spark.table(qtn_qt).where(
+        f"batch_id = '{batch_id}' AND check_stage = 'post_check'"
+    )
+    assert post_check_qtn_rows.isEmpty()
+
+    after_commit2 = commit_stage.run(after2, local_runner_fx)
+    assert dict(after_commit2.facts_appended_by_table) == {
+        _bare(orders_fact_qt): 0,
+        _bare(shipments_fact_qt): 1,
+    }
+    assert "commit" in after_commit2.guard_skips
+
+    orders_final = sorted(
+        r["domain_id"]
+        for r in local_runner_fx.read_batch(_bare(orders_fact_qt), batch_id).collect()
+    )
+    shipments_final = sorted(
+        r["domain_id"]
+        for r in local_runner_fx.read_batch(_bare(shipments_fact_qt), batch_id).collect()
+    )
+    # 4. B's facts appended.
+    assert shipments_final == ["id-2"]
+    # 5. A's untouched -- no duplicate append.
+    assert orders_final == ["id-1"]
+
+
 # ============================================================================
 # G-06: NULL-domain_id end-to-end
 # ============================================================================
@@ -794,6 +946,164 @@ def test_g06_guard_present_drift_born_null_variant_ae3(
     # read-back (fx.read_batch), not a stale ctx field.
     orders_committed = local_runner_fx.read_batch(_bare(orders_fact_qt), batch_id)
     assert orders_committed.count() == 0
+
+
+# ============================================================================
+# K-12: the durable-authority door -> unevaluated set -> I-24 backstop
+# (007.1 §7.3 path 3, §13.1 K-12 -- the 006.1 G-06 twin's FIRST variant)
+# ============================================================================
+
+
+def test_k12_durable_authority_door_admits_drift_born_null_backstop_names_defect(
+    spark: SparkSession,
+    local_runner_fx: RunnerFx,
+    make_wrapped_fx: Callable[..., RunnerFx],
+    unique_table: Callable[[str], str],
+    tmp_path: Path,
+) -> None:
+    """A007-2: K-12 -- distinct from `test_g06_guard_present_drift_born_
+    null_variant_ae3` (K-13's own DURABLE_SUBTRACT anchor, quarantine guard
+    PRESENT). Here the quarantine guard is ABSENT and the ANY-table door
+    (DURABLE_AUTHORITY) admits the whole candidate set UNEVALUATED, per
+    §7.3 path 3: 'N-type batch killed between type appends (A has facts, B
+    not), rerun under drift, ANY-table door admits an unevaluated set, B's
+    append proceeds, a drift-born NULL-domain_id row reaches the backstop.'
+
+    Clones `test_g06_guard_present_drift_born_null_variant_ae3`'s own
+    fixture shape (real bootstrap-DDL tables, `allow_ref` co-effect,
+    LEFT-JOIN `apply` resolving `domain_id` via lookup) -- `_Fixture`'s own
+    minimal `(domain_id, batch_id)` stub is too narrow for `commit.run`'s
+    OWN structural check (AE3's own reasoning, restated). Attempt 1 admits
+    BOTH types cleanly (id-1/id-2 both resolve via `allow_ref`) -- zero
+    violations, quarantine guard ABSENT (K-12's own precondition, the
+    opposite of AE3's guard-PRESENT one). `commit.run` is killed
+    (`killfx.kill_after(1)` on `fx.append`) right after orders' own append:
+    orders durable, shipments untouched, no completion row. Between
+    attempts, `allow_ref` drops "id-2" (shipments' own row) -- orders'
+    "id-1" stays resolved (already durable, never re-evaluated on this
+    door). Attempt 2 recomputes fresh (`pull` always re-reads co-effects):
+    shipments' "id-2" now resolves to a NULL `domain_id`. post_check's own
+    quarantine guard is STILL absent, but orders' durable presence opens
+    the ANY-table door -> DURABLE_AUTHORITY: BOTH types admitted
+    unconditionally, unevaluated -- shipments' drift-born NULL row survives
+    with no check ever gating it. `commit.run` hits I-24's per-table
+    backstop for shipments (facts-absent) while orders (facts-present) is
+    guard-skipped -- the named defect, never a silent fold break, never a
+    quarantine row."""
+    raw_qt = unique_table("k12_raw")
+    qtn_qt = unique_table("k12_qtn")
+    orders_fact_qt = unique_table("k12_orders_fact")
+    orders_state_qt = unique_table("k12_orders_state")
+    shipments_fact_qt = unique_table("k12_shipments_fact")
+    shipments_state_qt = unique_table("k12_shipments_state")
+    ref_qt = unique_table("k12_ref")
+    _create_raw_table(spark, raw_qt)
+    _create_quarantine_table(spark, qtn_qt)
+    bootstrap_fact_table(spark, orders_fact_qt, _CANDIDATE_SCHEMA)
+    bootstrap_state_table(spark, orders_state_qt, _CANDIDATE_SCHEMA)
+    bootstrap_fact_table(spark, shipments_fact_qt, _CANDIDATE_SCHEMA)
+    bootstrap_state_table(spark, shipments_state_qt, _CANDIDATE_SCHEMA)
+    spark.sql(f"CREATE TABLE {ref_qt} (id STRING) USING iceberg")
+    spark.sql(f"INSERT INTO {ref_qt} VALUES ('id-1'), ('id-2')")
+
+    pipeline = f"pipelines/k12{uuid4().hex[:8]}"
+    spec = _make_spec(
+        raw_table=_bare(raw_qt),
+        quarantine_table=_bare(qtn_qt),
+        orders_fact_table=_bare(orders_fact_qt),
+        orders_state_table=_bare(orders_state_qt),
+        shipments_fact_table=_bare(shipments_fact_qt),
+        shipments_state_table=_bare(shipments_state_qt),
+        co_effects={"allow_ref": CoEffectDecl(table=_bare(ref_qt))},
+    ).model_copy(update={"pipeline": pipeline})
+    markers_qt = naming.qualified(naming.markers_table(spec.raw_table, spec.pipeline))
+    bootstrap_markers_table(spark, markers_qt)
+
+    def _apply_with_ref_resolution(
+        valid_df: DataFrame, co_effects: Mapping[str, DataFrame]
+    ) -> Mapping[str, DataFrame]:
+        ref = co_effects["allow_ref"].select(F.col("id").alias("_ref_id"))
+        resolved = valid_df.join(ref, valid_df["domain_id"] == ref["_ref_id"], "left")
+        resolved = resolved.withColumn("domain_id", F.col("_ref_id")).drop("_ref_id")
+        casted = resolved.withColumn("amount", F.col("amount").cast("decimal(10,2)"))
+        orders = casted.filter(F.col("kind") == _ORDERS).select("domain_id", "amount")
+        shipments = casted.filter(F.col("kind") == _SHIPMENTS).select("domain_id", "amount")
+        return {_ORDERS: orders, _SHIPMENTS: shipments}
+
+    def _seed(batch_id: str, object_uris: tuple[str, ...]) -> BatchContext:
+        transforms = Transforms(apply=_apply_with_ref_resolution)
+        return BatchContext(
+            pipeline=pipeline,
+            feed_id="feed/k12",
+            delivery_id=str(UUID(int=1, version=4)),
+            batch_id=batch_id,
+            delivery_key="statement.csv",
+            content_hash="sha256:" + "a" * 64,
+            object_uris=object_uris,
+            received_at=datetime(2026, 1, 1, tzinfo=UTC),
+            spec=spec,
+            run=RunConfig(),
+            transforms=transforms,
+            attempt_id="attempt-1",
+            sfn_retry_count=0,
+            sfn_redrive_count=0,
+            read_spec_version=read_spec_version(spec.read),
+            check_version=check_version(spec.raw_contract, spec.read),
+            checks_version=checks_version(spec.checks),
+        )
+
+    object_uris = _write_csv(
+        tmp_path / "batch.csv", "domain_id,amount,kind\nid-1,10.00,orders\nid-2,1.00,shipments\n"
+    )
+    batch_id = _batch_id(102)
+
+    # Attempt 1: both types resolve cleanly via `allow_ref` -- zero
+    # violations, quarantine guard ABSENT.
+    after1 = _run_through_post_check(_seed(batch_id, object_uris), local_runner_fx)
+    assert after1.post_quarantined_count == 0
+    assert after1.admitted_facts[_ORDERS].count() == 1
+    assert after1.admitted_facts[_SHIPMENTS].count() == 1
+
+    # Commit, killed after the FIRST declared type's own append (orders) --
+    # shipments never processed, no completion row (K-20's own mechanics).
+    killed_fx = make_wrapped_fx(local_runner_fx, {"append": killfx.kill_after(1)})
+    with pytest.raises(killfx.SimulatedKill):
+        commit_stage.run(after1, killed_fx)
+
+    assert local_runner_fx.read_batch(_bare(orders_fact_qt), batch_id).count() == 1
+    assert local_runner_fx.read_batch(_bare(shipments_fact_qt), batch_id).count() == 0
+    assert (
+        spark.table(markers_qt)
+        .where(f"batch_id = '{batch_id}' AND table_name = '{naming.COMMIT_COMPLETION_SENTINEL}'")
+        .isEmpty()
+    )
+
+    # Drift the co-effect between attempts: "id-2" (shipments' own row) is
+    # no longer a known ref -- orders' own "id-1" stays resolved.
+    spark.sql(f"DELETE FROM {ref_qt} WHERE id = 'id-2'")
+
+    # Attempt 2: post_check's own quarantine guard is STILL absent, but
+    # orders' durable presence opens the ANY-table door -> DURABLE_AUTHORITY.
+    after2 = _run_through_post_check(_seed(batch_id, object_uris), local_runner_fx)
+    assert after2.post_quarantined_count == 0
+    assert "post_check" not in after2.guard_skips  # the quarantine guard was never present
+    admitted2_shipments = after2.admitted_facts[_SHIPMENTS].collect()
+    assert len(admitted2_shipments) == 1
+    assert admitted2_shipments[0]["domain_id"] is None  # the drift-born candidate, unevaluated
+
+    # The backstop converts it into the named, per-table defect at commit --
+    # orders (facts-present) is guard-skipped; shipments (facts-absent)
+    # wedges. Never a silent fold break, never a quarantine row (§7.3).
+    with pytest.raises(ValueError, match="I-24"):
+        commit_stage.run(after2, local_runner_fx)
+
+    shipments_committed = local_runner_fx.read_batch(_bare(shipments_fact_qt), batch_id)
+    assert shipments_committed.count() == 0
+    assert (
+        spark.table(markers_qt)
+        .where(f"batch_id = '{batch_id}' AND table_name = '{naming.COMMIT_COMPLETION_SENTINEL}'")
+        .isEmpty()
+    )
 
 
 # ============================================================================

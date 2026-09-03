@@ -115,6 +115,7 @@ def _argv(
         "--conveyer-run-ledger-table", ledger_catalog.config.run_ledger_table,
         "--conveyer-event-bus", event_bus,
         "--conveyer-landing-bucket", _LANDING_BUCKET,
+        "--conveyer-artifacts-bucket", "some-artifacts-bucket",
         "--conveyer-pipeline-spec-uri", pipeline_spec_uri,
         "--conveyer-delivery", delivery_json,
         "--conveyer-sfn-retry-count", "0",

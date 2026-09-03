@@ -31,7 +31,7 @@ insertion-ordered = deploy-pinned), §8.2's normative plan:**
    over 9219 generated cases incl. 7922 null-bearing — see `frames/fold.py`'s
    own docstring).
 4. **The conditional MERGE**: `fx.merge(spec_m, winners)` renders and
-   executes exactly one `MERGE INTO` (`effects/spark.py::_build_merge`/
+   executes exactly one `MERGE INTO` (`effects/spark.py::build_merge`/
    `render_merge`, consuming `core.merge.ordering_predicate`'s explicit
    field-wise boolean — §8.2's rendering decision, never native struct
    comparison). **No presence guard** — fold has no guard by design (§11's

@@ -518,7 +518,7 @@ def test_r13_one_commit_invariant_per_effectful_stage_then_rerun_advances_zero(
     assert_stamped_batch(fact_summary, batch_id)
 
     # fold -> state (MERGE): exactly one new snapshot -- but `effects/
-    # spark.py::_build_merge` never stamps snapshot-property options at all
+    # spark.py::build_merge` never stamps snapshot-property options at all
     # (only `append`'s writer chain does), so a MERGE commit carries NEITHER
     # conveyer.batch-id NOR conveyer.stage -- a documented deviation from
     # R-13's general framing, not asserted as stamped here

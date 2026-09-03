@@ -513,10 +513,12 @@ class FactSchemaModel(BaseModel):
 
     @model_validator(mode="after")
     def _check_columns(self) -> "FactSchemaModel":
-        # F3: column names unique, disjoint from the framework fact-stamp
-        # set (007.1 §5.1 fragment 4, `record.py::FACT_STAMP_COLUMNS` — the
-        # one normative enumeration, never re-listed here) and the
-        # `_conveyer_` prefix.
+        # A006-9: uniqueness is its own distinct rule/code -- NOT F3 (which
+        # is only "disjoint from the framework fact-stamp set and the
+        # `_conveyer_` prefix", §5.3's own row). A duplicated declared name
+        # is a different remediation path from a reserved-name collision, so
+        # it gets its own `fact-column-duplicate-name` code rather than
+        # overloading `fact-column-reserved-name` for both.
         names = [c.name for c in self.columns]
         seen: set[str] = set()
         duplicated: set[str] = set()
@@ -526,9 +528,13 @@ class FactSchemaModel(BaseModel):
             seen.add(name)
         if duplicated:
             raise ValueError(
-                "bind-defect/fact-column-reserved-name: duplicated column "
+                "bind-defect/fact-column-duplicate-name: duplicated column "
                 f"names: {sorted(duplicated)!r}"
             )
+        # F3: column names disjoint from the framework fact-stamp set
+        # (007.1 §5.1 fragment 4, `record.py::FACT_STAMP_COLUMNS` — the one
+        # normative enumeration, never re-listed here) and the `_conveyer_`
+        # prefix.
         framework_collisions = {name for name in names if name in record.FACT_STAMP_COLUMNS}
         reserved_collisions = {name for name in names if name.startswith(_RESERVED_COLUMN_PREFIX)}
         collisions = sorted(framework_collisions | reserved_collisions)
@@ -606,7 +612,31 @@ def _check_id_not_reserved(value: str) -> str:
     return value
 
 
-def _check_reason_not_reserved(value: str) -> str:
+def _check_reason(value: str) -> str:
+    # K6, both halves, ONE validator-support helper (M7 critique fix: a
+    # separate `_check_reason_grammar` raise-only helper beside this
+    # function was a needless `_TRY_RAISE_ALLOWLIST` growth -- [DS2-2] gates
+    # profile growth, and the same named codes ship equally well from one
+    # function as two). FIRST half (A006-9): a NAMED code, not the bare
+    # pydantic `Field(pattern=...)` violation this used to be -- `reason`'s
+    # field declaration below carries no `pattern=` for exactly this reason
+    # (a `Field(pattern=...)` constraint is checked BEFORE any
+    # `field_validator` runs, pre-empting a custom message for this half
+    # entirely). SECOND half: framework-reserved, checked only once the
+    # grammar half has already passed. THIRD half (F-6, security gate
+    # `wf_c9aadeb2-8eb`, LOW): same length cap `ColumnSpec`/`FactColumnSpec`/
+    # check-id already carry as a `Field(max_length=128)` -- a bare `Field`
+    # constraint can't be used here either, for the SAME reason the grammar
+    # half's own comment gives (checked before `field_validator` runs, so it
+    # would pre-empt this function's named code).
+    if len(value) > 128:
+        raise ValueError(
+            f"bind-defect/check-reason-too-long: reason must be <=128 chars: {value!r}"
+        )
+    if not re.fullmatch(BUSINESS_REASON_RE, value):
+        raise ValueError(
+            f"bind-defect/check-reason-grammar: reason must match {BUSINESS_REASON_RE!r}: {value!r}"
+        )
     if value in RESERVED_REASONS:
         raise ValueError(
             f"bind-defect/check-reason-reserved: reason {value!r} is framework-reserved"
@@ -620,7 +650,19 @@ class RowCheckModel(BaseModel):
     id: str = Field(pattern=CHECK_ID_RE, max_length=128)
     fact_type: str  # P-5: required, exactly one
     expr: str = Field(max_length=4096)  # must-HOLD condition; §7.2's 3-valued law
-    reason: str = Field(pattern=BUSINESS_REASON_RE)
+    # A006-9: no bare `pattern=`/`max_length=` here -- `Field(pattern=...)`/
+    # `Field(max_length=...)` are enforced by pydantic itself BEFORE any
+    # `field_validator` runs, which would pre-empt `_check_reason`'s named
+    # `check-reason-grammar`/`check-reason-too-long` codes with a bare
+    # pydantic violation. INT-1 (bead conveyer-swb.33): the published JSON
+    # Schema sidecar still needs to state both constraints for readers who
+    # never load this module, so they ride along as `json_schema_extra`
+    # instead -- pydantic v2 does NOT enforce `json_schema_extra` at
+    # runtime (confirmed in-kernel), so `_check_reason_field` below keeps
+    # firing first and the named codes are unaffected. Derived from the
+    # SAME `BUSINESS_REASON_RE`/128 cap `_check_reason` itself checks --
+    # never a second literal.
+    reason: str = Field(json_schema_extra={"pattern": BUSINESS_REASON_RE, "maxLength": 128})
 
     @field_validator("id")
     @classmethod
@@ -629,8 +671,8 @@ class RowCheckModel(BaseModel):
 
     @field_validator("reason")
     @classmethod
-    def _check_reason(cls, value: str) -> str:
-        return _check_reason_not_reserved(value)
+    def _check_reason_field(cls, value: str) -> str:
+        return _check_reason(value)
 
 
 class MembershipCheckModel(BaseModel):
@@ -641,7 +683,8 @@ class MembershipCheckModel(BaseModel):
     columns: list[str] = Field(min_length=1)  # candidate columns (tuple)
     co_effect: str  # declared alias
     ref_columns: list[str] = Field(min_length=1)  # same arity as columns
-    reason: str = Field(pattern=BUSINESS_REASON_RE)
+    # A006-9/INT-1: see `RowCheckModel.reason`'s own note.
+    reason: str = Field(json_schema_extra={"pattern": BUSINESS_REASON_RE, "maxLength": 128})
 
     @field_validator("id")
     @classmethod
@@ -650,8 +693,8 @@ class MembershipCheckModel(BaseModel):
 
     @field_validator("reason")
     @classmethod
-    def _check_reason(cls, value: str) -> str:
-        return _check_reason_not_reserved(value)
+    def _check_reason_field(cls, value: str) -> str:
+        return _check_reason(value)
 
     @model_validator(mode="after")
     def _check_arity(self) -> "MembershipCheckModel":
@@ -750,6 +793,31 @@ class CoEffectDecl(BaseModel):
     def _check_table(cls, value: str) -> str:
         return check_qualified_table(value)
 
+    @field_validator("columns")
+    @classmethod
+    def _check_columns(cls, value: list[str] | None) -> list[str] | None:
+        # A006-8/§4.3: "columns … identifier grammar per name" -- each
+        # declared column-grain name must itself be a legal identifier
+        # (`COLUMN_NAME_RE`, the same grammar `ColumnSpec.name`/
+        # `FactColumnSpec.name` already carry as a `Field(pattern=...)`; a
+        # bare pydantic pattern isn't usable here since this is a LIST
+        # field, not a single string). No distinct `bind-defect/<code>` --
+        # same (pydantic) posture as C2's own table-identifier check. F-6
+        # (security gate `wf_c9aadeb2-8eb`, LOW): same 128-char cap
+        # `ColumnSpec.name`/`FactColumnSpec.name` carry via `max_length=128`
+        # -- validator-level here too, for the SAME "list field" reason.
+        if value is None:
+            return value
+        bad = sorted(
+            name for name in value if not re.fullmatch(COLUMN_NAME_RE, name) or len(name) > 128
+        )
+        if bad:
+            raise ValueError(
+                f"co-effect column name(s) must match {COLUMN_NAME_RE!r} and be "
+                f"<=128 chars: {bad!r}"
+            )
+        return value
+
 
 class FactTypeModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -846,6 +914,34 @@ class PipelineSpecModel(BaseModel):
             raise ValueError(
                 "bind-defect/fact-table-collision: table(s) shared across "
                 f"fact types: {sorted(duplicated)!r}"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _check_co_effect_alias_grammar(self) -> "PipelineSpecModel":
+        # A006-8/C1: "Alias grammar" -- every declared `co_effects` alias
+        # must itself be a legal identifier. `COLUMN_NAME_RE` (not
+        # `CHECK_ID_RE`): aliases are referenced as plain identifiers
+        # throughout this package (`co_effects: {rate_cards: …}`,
+        # `MembershipCheckModel.co_effect`), including underscore-bearing
+        # names already in wide use across the test corpus and production
+        # pipelines -- `CHECK_ID_RE` (hyphen-only, no underscore, §4.2's
+        # check-id/fact-type-name grammar) would refuse every one of them.
+        # Distinct from `duplicate-alias` (a repeated key, S1's own
+        # dict-key mechanism, `parse_pipeline_spec_yaml`) -- this is a
+        # single alias's own SHAPE. F-6 (security gate `wf_c9aadeb2-8eb`,
+        # LOW): same 128-char cap `ColumnSpec.name`/`FactColumnSpec.name`
+        # carry via `max_length=128` -- validator-level here too, since a
+        # dict key (like the `columns` list above) has no `Field(...)` seam.
+        bad = sorted(
+            alias
+            for alias in self.co_effects
+            if not re.fullmatch(COLUMN_NAME_RE, alias) or len(alias) > 128
+        )
+        if bad:
+            raise ValueError(
+                f"bind-defect/co-effect-alias-grammar: invalid co_effect alias name(s) "
+                f"(must match {COLUMN_NAME_RE!r} and be <=128 chars): {bad!r}"
             )
         return self
 
@@ -977,6 +1073,32 @@ def _find_duplicate_keys(node: yaml.Node) -> list[str]:
     return duplicates
 
 
+def _find_duplicate_co_effect_aliases(root: yaml.Node) -> list[str]:
+    """A006-9(b): a cheap, single-level scan distinguishing a duplicate key
+    at exactly the `co_effects:` alias position from every other duplicate
+    key `_find_duplicate_keys` (above) already finds -- so THAT specific
+    position can be named `duplicate-alias` (006.1 §5.1 C1's own code)
+    rather than the generic `duplicate-key` every other position keeps.
+    Does not recurse past `co_effects:`'s own immediate children (a
+    duplicate key nested one level deeper, inside one alias's own
+    attribute block, is a plain `duplicate-key`, not an alias collision) —
+    deliberately narrow, not a generalized path-tracking rewrite of
+    `_find_duplicate_keys` itself."""
+    if not isinstance(root, yaml.MappingNode):
+        return []
+    for key_node, value_node in root.value:
+        if str(key_node.value) == "co_effects" and isinstance(value_node, yaml.MappingNode):
+            seen: set[str] = set()
+            duplicates: list[str] = []
+            for alias_key_node, _ in value_node.value:
+                alias = str(alias_key_node.value)
+                if alias in seen:
+                    duplicates.append(alias)
+                seen.add(alias)
+            return duplicates
+    return []
+
+
 def parse_pipeline_spec_yaml(text: str) -> "PipelineSpecModel":
     """S1: `yaml.safe_load` (never the unsafe loader) + a strict duplicate-
     key pre-check + the full pydantic parse -- the one entry point every
@@ -987,8 +1109,20 @@ def parse_pipeline_spec_yaml(text: str) -> "PipelineSpecModel":
     key, else lets `PipelineSpecModel`'s own `pydantic.ValidationError`
     propagate naturally -- allowlisted in `tools/linter_configs/spine.py`
     (`_TRY_RAISE_ALLOWLIST`), the `parse_column_type` raise-only-helper
-    shape (not a validator)."""
+    shape (not a validator).
+
+    A006-9(b): a duplicate specifically at the `co_effects:` alias position
+    is named `bind-defect/duplicate-alias:` (006.1 §5.1 C1's own code, the
+    coordinator-approved cheap-distinguish path) -- checked BEFORE the
+    generic scan below, so it wins when both would otherwise fire on the
+    same text."""
     root = yaml.compose(text, Loader=yaml.SafeLoader)
+    if root is not None:
+        alias_duplicates = sorted(set(_find_duplicate_co_effect_aliases(root)))
+        if alias_duplicates:
+            raise ValueError(
+                f"bind-defect/duplicate-alias: duplicate co_effects alias(es): {alias_duplicates!r}"
+            )
     duplicates = sorted(set(_find_duplicate_keys(root))) if root is not None else []
     if duplicates:
         raise ValueError(

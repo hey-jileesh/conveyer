@@ -2,10 +2,11 @@
 scenario: (a) is live and asserted at the full `checks.yaml`/
 `PipelineSpecModel` grain (the closest thing to "any `batch_check` in
 checks.yaml" a unit test can exercise); (b)–(h) are **authored but
-skipped-with-reason** — they name the SAME 005 v1.x member-grammar wait
-`stages/post_check.py`'s own module docstring already records: "G-05(a)'s
-bind-defect coverage is the whole story here; G-05(b-h) are 005 v1.x's
-named wait, 006.1 §14's B4 row."
+skipped-with-reason** — they name the member-grammar wait §9 itself names
+("the member-scoped admitted-rows accessor, the parsed member
+declarations, the `required:`-coherence check replacing K7's blanket
+refusal") — 006.1 §14's B4 row, narrowed by conveyer-swb.15/D006-1's "build
+now, dormant" ruling (below).
 
 **(a)'s coverage is not new mechanism** — K7
 (`core/model.py::ChecksModel._check_batch_check_awaiting_member_grammar`)
@@ -20,14 +21,26 @@ own words) that neither of those two already covers, so this file's own
 `test_g05a_...` plus those two existing tests are ALL registered as G-05(a)'s
 standing tests in the acceptance-coverage audit.
 
-**(b)–(h) cannot be built without inventing `compile_aggregate`** — no
-aggregate-position compiler exists anywhere in `frames/business_checks.py`
-(P-6's dormancy: `BatchCheckModel` never reaches a validly-bound spec, K7),
-so there is no production code path any of these eight scenarios could
-exercise. Each stub below is `pytest.mark.skip`-marked citing the wait,
-matching the precedent `tests/frames/test_business_checks.py`'s own four
-G-08 aggregate-position skips already set (bead conveyer-6pg.11, B1) —
-never silently omitted from the G-suite's own enumeration.
+**(b)–(h)'s wait NARROWED, not closed (conveyer-swb.15/D006-1's coordinator
+ruling: "build now, dormant behind K7").** `compile_aggregate` (`core/
+check_grammar.py`), its Column-builder (`frames/business_checks.py::
+aggregate_column`), the [DC-2] bind assertion, the §7.5 verdict/comparison/
+message channel, and the §8.4 demotion door ALL now exist and are tested
+DIRECTLY (`tests/unit/test_check_grammar.py`'s `compile_aggregate` units,
+`tests/frames/test_business_checks.py`'s verdict/message/door/[DC-2]-
+property tests) — "no aggregate-position compiler exists anywhere" (this
+docstring's own prior claim) is no longer true. What STILL waits, exactly
+as §9 names it: the member-scoped admitted-rows ACCESSOR (which frame is
+"the control member's admitted rows" for a given `checks.yaml`), the
+parsed member DECLARATIONS themselves, and the `required:`-coherence
+check — none of which exist, so a `checks.yaml`-grain END-TO-END scenario
+(an authored `member: summary` control resolving to a REAL co-effect
+frame, run through `stages/post_check.py::run()`) still cannot be built.
+Each stub below is `pytest.mark.skip`-marked citing this narrower wait,
+matching the precedent `tests/frames/test_business_checks.py`'s own
+(now-resolved) G-08 aggregate-position skips originally set (bead
+conveyer-6pg.11, B1) — never silently omitted from the G-suite's own
+enumeration.
 """
 
 from __future__ import annotations
@@ -103,15 +116,21 @@ def test_g05a_batch_check_alongside_a_valid_row_check_still_refuses() -> None:
 # --- G-05(b-h): named wait, skipped-with-reason -----------------------------
 
 _WAIT_REASON = (
-    "sec7.5/§8.4 batch_check reconciliation semantics: structurally dormant "
-    "until the 005 v1.x member grammar lands (P-6; K7 refuses every "
-    "batch_check at bind, core/model.py::ChecksModel). No aggregate-position "
-    "compiler (`compile_aggregate`) exists anywhere in `frames/"
-    "business_checks.py` to exercise -- matching `stages/post_check.py`'s own "
-    "module docstring: 'G-05(a)'s bind-defect coverage is the whole story "
-    "here; G-05(b-h) are 005 v1.x's named wait, 006.1 §14's B4 row.' Named "
-    "wait, matching test_business_checks.py's own four G-08 aggregate-"
-    "position skips (bead conveyer-6pg.11, B1); B4's scope (conveyer-6pg.14)."
+    "sec7.5/sec8.4 batch_check reconciliation semantics: `batch_check` itself is "
+    "structurally dormant until the 005 v1.x member grammar lands (P-6; K7 refuses "
+    "every batch_check at bind, core/model.py::ChecksModel). conveyer-swb.15/D006-1 "
+    "(coordinator ruling: 'build now, dormant behind K7') built and directly unit-"
+    "tested compile_aggregate (core/check_grammar.py), its Column-builder "
+    "(frames/business_checks.py::aggregate_column), the [DC-2] bind assertion, the "
+    "sec7.5 verdict/comparison/message channel, and the sec8.4 demotion door -- "
+    "see test_check_grammar.py's compile_aggregate units and "
+    "test_business_checks.py's verdict/message/door/[DC-2]-property tests. What "
+    "STILL waits, exactly as sec9 names it: the member-scoped admitted-rows "
+    "ACCESSOR, the parsed member DECLARATIONS, and the `required:`-coherence "
+    "check -- none of which exist, so a checks.yaml-grain END-TO-END scenario "
+    "(an authored `member: summary` control resolved against a real co-effect "
+    "frame, run through stages/post_check.py::run()) still cannot be built. "
+    "006.1 §14's B4 row, narrowed by this ruling."
 )
 
 

@@ -10,7 +10,11 @@ NOT imported from `spine.core.canonical`'s test suite or anywhere else
 (007.1 §5.3: "every consumer... writes its own untagging parser against
 these committed files -- shared vectors, never shared code", 004 D-13;
 `test_canonical.py::_parse_fixture_value` is the reference implementation
-to READ, per this bead's brief, never to import)."""
+to READ, per this bead's brief, never to import). See `contracts/fixtures/
+README.md` for the full fixture-review checklist (synthetic-only [DS-5],
+resident-serializer regeneration, the untagging-parser rule above, NFC/NFD
+authoring discipline) shared by every committed vector family in that
+directory."""
 
 from __future__ import annotations
 

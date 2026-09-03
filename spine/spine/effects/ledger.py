@@ -142,7 +142,7 @@ import random
 import time
 from collections.abc import Callable, Mapping
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, Literal, Protocol
 
 import pyarrow as pa  # type: ignore[import-untyped]
 from pyiceberg.catalog import Catalog
@@ -164,7 +164,6 @@ from pyiceberg.types import (
 )
 
 from spine import observability
-from spine.config import RunnerConfig
 from spine.core.run_facts import RunFact
 
 _LOGGER_NAME = "spine.ledger"
@@ -191,6 +190,13 @@ RUN_LEDGER_SCHEMA = Schema(
     NestedField(15, "facts_appended", LongType(), required=False),
     NestedField(16, "rows_merged", LongType(), required=False),
     NestedField(17, "snapshot_id", LongType(), required=False),
+    # M2 (bead conveyer-swb.25): one column, two meanings keyed by `stage` --
+    # `stage="rebuild"` rows carry the pinned FACT-table snapshot id for that
+    # attempt (`effects/rebuild.py::_rebuild_attempt_fact`); `stage="fold"`
+    # rows carry permanently `None` (`core/run_facts.py::_stage_fields`'s own
+    # `fold` branch). Interim shape, owed a purpose-built vocabulary row in
+    # 004.1's own rebuild stage-vocabulary accretion (007.1 §16) -- see
+    # `core/run_facts.py::RunFact.state_read_snapshot_id`'s own matching note.
     NestedField(18, "state_read_snapshot_id", LongType(), required=False),
     NestedField(
         19,
@@ -274,7 +280,41 @@ _MAX_ATTEMPTS = 2  # [C-6]
 _MAX_BACKOFF_S = 2.0  # [C-6]: TOTAL backoff budget across all gaps (one gap, here)
 
 
-def build_catalog(config: RunnerConfig) -> Catalog:
+class LedgerConfig(Protocol):
+    """The SIX fields `build_catalog`/`_identifier`/`build_record_run`
+    genuinely read (M3, bead conveyer-swb.25) -- narrowed from `spine.
+    config.RunnerConfig`'s full 18-field shape, which this module's own
+    functions used to be typed against even though most of it (seed/SFN/
+    SLA/event-bus/landing-bucket fields) is never touched here. `RunnerConfig`
+    satisfies this Protocol structurally, unchanged -- every existing
+    production/test call site keeps passing a `RunnerConfig` with zero
+    changes. `entrypoints/rebuild_main.py::RebuildConfig` (its OWN minimal
+    argv contract, with no seed/SFN/SLA fields to fabricate) ALSO satisfies
+    it structurally, with no adapter -- this is what lets `rebuild_main.
+    main` delete its own `_as_runner_config` fabrication entirely and pass
+    its `RebuildConfig` straight through.
+
+    Declared as read-only `@property` members (not plain annotations):
+    both concrete configs are FROZEN dataclasses, whose fields mypy treats
+    as read-only -- a plain-annotation `Protocol` member defaults to
+    read-WRITE, which a frozen dataclass structurally fails (`expected
+    settable variable, got read-only attribute`)."""
+
+    @property
+    def aws_region(self) -> str: ...
+    @property
+    def ledger_catalog_kind(self) -> Literal["glue", "sql"]: ...
+    @property
+    def ledger_sql_uri(self) -> str | None: ...  # SqlCatalog, tests only
+    @property
+    def warehouse_uri(self) -> str | None: ...  # SqlCatalog's own warehouse, tests only
+    @property
+    def spine_db(self) -> str: ...
+    @property
+    def run_ledger_table(self) -> str: ...
+
+
+def build_catalog(config: LedgerConfig) -> Catalog:
     """Build the pyiceberg `Catalog` named by `config.ledger_catalog_kind`
     (I-2's driver-side pyiceberg substrate) -- shared between
     `build_record_run` and `bootstrap/create_run_ledger.py`'s CLI entrypoint
@@ -285,9 +325,10 @@ def build_catalog(config: RunnerConfig) -> Catalog:
 
     `glue` (prod): constructed with an explicit region (`config.aws_region`)
     and deliberately **no** `warehouse` property -- recorded assumption:
-    `RunnerConfig.warehouse_uri` is documented (`config.py`) as "hadoop only
-    (tests)" for the *Spark* data-path catalog (I-2), so this module does not
-    reuse it for the ledger's own Glue catalog; new tables under
+    `RunnerConfig.warehouse_uri` (`LedgerConfig`'s own field, below) is
+    documented (`config.py`) as "hadoop only (tests)" for the *Spark*
+    data-path catalog (I-2), so this module does not reuse it for the
+    ledger's own Glue catalog; new tables under
     `config.spine_db` take their location from that Glue database's own
     `LocationUri` (Terraform-managed, `${p}-lake/spine/`), standard AWS Glue
     Catalog behavior. Unlike ingestion's `effects/ledger.py::build_catalog`,
@@ -304,7 +345,7 @@ def build_catalog(config: RunnerConfig) -> Catalog:
     return GlueCatalog(_CATALOG_NAME, **{AWS_REGION: config.aws_region})
 
 
-def _identifier(config: RunnerConfig) -> str:
+def _identifier(config: LedgerConfig) -> str:
     return f"{config.spine_db}.{config.run_ledger_table}"
 
 
@@ -585,7 +626,7 @@ def _try_append(
 
 
 def build_record_run(
-    catalog_factory_or_catalog: Catalog | Callable[[], Catalog], config: RunnerConfig
+    catalog_factory_or_catalog: Catalog | Callable[[], Catalog], config: LedgerConfig
 ) -> Callable[[RunFact], None]:
     identifier = _identifier(config)
 

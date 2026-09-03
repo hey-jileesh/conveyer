@@ -84,15 +84,27 @@ already documents).
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from decimal import Decimal
+from typing import TYPE_CHECKING, Literal
 
 from pyspark.sql import functions as F
 from pyspark.sql.types import IntegerType, StringType, StructField, StructType
 
-from spine.core import canonical
-from spine.core.check_grammar import Family, GrammarDefect, family_of_kind, validate_expression
+from spine.core.check_grammar import (
+    AggBinOp,
+    AggCall,
+    AggColumnRef,
+    AggLiteral,
+    AggNeg,
+    AggNode,
+    Family,
+    GrammarDefect,
+    family_of_kind,
+    validate_expression,
+)
+from spine.core.checks import check_content_hash
 from spine.core.model import (
     RESERVED_CHECK_IDS,
     RESERVED_REASONS,
@@ -225,12 +237,14 @@ def compile_business_checks(
             continue  # BatchCheckModel: dormant (P-6), never reaches a bound spec (K7)
         if check.fact_type != fact_type:
             continue
-        # §7.4: per-check content hash -- `canonical.row_hash` over the
-        # parsed check's own `model_dump(mode="json")`, the SAME sha256(
-        # canonical_json(...)) idiom `core/contract.py::check_version`/
-        # `read_spec_version` already establish (A-11's class), reused
-        # rather than a second hand-rolled hashlib call.
-        version = canonical.row_hash(check.model_dump(mode="json"))
+        # §7.4/A006-6: per-check content hash -- `core/checks.py::
+        # check_content_hash`, the ONE normative home for this hash (single-
+        # homed per A006-6: this module used to hand-roll the identical
+        # `canonical.row_hash(check.model_dump(mode="json"))` computation a
+        # second time; `check_content_hash` already IS exactly that, so this
+        # call site now defers to it rather than re-deriving the same value
+        # via a parallel expression that could silently drift).
+        version = check_content_hash(check)
         if isinstance(check, RowCheckModel):
             holds = _compiled_expr(check.expr, family_map)
             # §7.2's three-valued law, realized for free by `F.when`'s own
@@ -402,3 +416,201 @@ def business_violations(evaluated_df: DataFrame) -> DataFrame:
         .withColumn("reason_detail", F.to_json(detail_array))
     )
     return shaped.drop(_FAILURES_COL)
+
+
+# =============================================================================
+# §7.5 `batch_check` mechanics — dormant behind P-6/K7 (conveyer-swb.15,
+# D006-1's "build now, dormant" ruling). `BatchCheckModel` never reaches a
+# validly-bound spec (K7, `core/model.py`), so nothing below has a live call
+# site through `stages/post_check.py::run()` today — each function is
+# exercised directly by its own unit tests, matching the SAME precedent
+# `entrypoints/glue_main.py::_assert_check_expressions_compile`'s own module
+# docstring already established for its (also-dormant) `BatchCheckModel`
+# branch: "Implemented anyway, never guarded behind 'if batch checks were
+# ever reachable'... Tested at [its] own grain... since a real spec cannot
+# exercise it."
+# =============================================================================
+
+_AGG_BIN_OPS: Mapping[str, Callable[[Column, Column], Column]] = {
+    "+": lambda left, right: left + right,
+    "-": lambda left, right: left - right,
+    "*": lambda left, right: left * right,
+    "/": lambda left, right: left / right,
+    "%": lambda left, right: left % right,
+}
+_AGG_FUNCS: Mapping[str, Callable[[Column], Column]] = {
+    "sum": F.sum,
+    "min": F.min,
+    "max": F.max,
+    "avg": F.avg,
+}
+
+
+def _agg_literal_column(text: str) -> Column:
+    """`check_grammar.AggLiteral.text` -- sqlglot's own raw-text literal
+    shape (§6.1) -- rendered as a decimal literal when the text carries a
+    `.` (preserving exactness, never a Python `float`) or a plain int
+    literal otherwise; Spark's own arithmetic type-coercion (verified in
+    this bead's kernel session) promotes either correctly against a
+    sibling decimal column, matching `F.expr`'s own reading of the same
+    literal text."""
+    return F.lit(Decimal(text)) if "." in text else F.lit(int(text))
+
+
+def aggregate_column(node: AggNode, df: DataFrame) -> Column:
+    """§7.5/[EM-4]: turns a PURE `check_grammar.AggNode` value tree (from
+    `check_grammar.compile_aggregate`) into a real `Column` -- framework
+    composition, never a regenerated-SQL string (§6.4's executed-text rule,
+    restated at this call site: `F.expr` is never invoked here for
+    anything the aggregate position executes). `df` is the frame the
+    aggregate ultimately evaluates against -- needed ONLY to engine-probe
+    the compiled dtype of an individual `sum` node for its own coalesce
+    cast (never a hand-rolled promotion-rule calculation -- §7.5 [DC-2]'s
+    "no second type calculus" law, honored by asking the SAME engine `df`
+    belongs to)."""
+    if isinstance(node, AggColumnRef):
+        return F.col(node.name)
+    if isinstance(node, AggLiteral):
+        return _agg_literal_column(node.text)
+    if isinstance(node, AggNeg):
+        return -aggregate_column(node.operand, df)
+    if isinstance(node, AggBinOp):
+        left = aggregate_column(node.left, df)
+        right = aggregate_column(node.right, df)
+        op = _AGG_BIN_OPS[node.op]
+        return op(left, right)
+    return _aggregate_call_column(node, df)
+
+
+def _aggregate_call_column(node: AggCall, df: DataFrame) -> Column:
+    """One of the five §6.3 aggregate functions. `count` is built via
+    `F.sum` over a 0/1 NULL-skip indicator, NEVER `F.count` -- `frames/**`'s
+    own `banned_attr_names` rule flags the bare attribute name `count`
+    regardless of receiver (`tools/linter_configs/spine.py`'s own comment
+    names this exact day: "a real `F.count` aggregate under `frames/**`
+    could use the [exemption] mechanism the day one is genuinely needed") --
+    and this construction is not a workaround: `count` is ALREADY zero-safe
+    by SQL definition (count over zero rows, or an all-NULL column, is
+    always 0, never NULL), so it is unconditionally coalesced, needing no
+    row-present gate at all (kernel-verified: matches `F.count`'s own value
+    and `LongType` dtype in every case, incl. the empty frame). `sum`'s own
+    [EM-4] law is the row-present-gated `F.when(...)`: `F.sum(F.lit(1))`
+    (never `F.count`, same reason) is NULL over a genuinely empty frame and
+    a positive count otherwise -- so `F.sum(F.lit(1)).isNotNull()` is TRUE
+    iff the candidate set is non-empty, the exact condition [EM-4]'s per-
+    node coalesce gates on (kernel-verified: a NON-empty frame whose `sum`
+    is NULL for another reason -- an all-NULL column, or decimal overflow
+    under the ANSI-off pin -- correctly stays NULL, never masked to 0,
+    §7.5's `aggregate-unavailable` precondition). `min`/`max`/`avg` take no
+    zero (`coalesce_zero=False`) and pass through unchanged."""
+    if node.kind == "count":
+        arg_col = aggregate_column(node.argument, df)
+        indicator = F.when(arg_col.isNotNull(), F.lit(1)).otherwise(F.lit(0))
+        raw = F.sum(indicator)
+        dtype = df.agg(raw.alias("_v")).schema.fields[0].dataType
+        return F.coalesce(raw, F.lit(0).cast(dtype))
+    arg_col = aggregate_column(node.argument, df)
+    agg_func = _AGG_FUNCS[node.kind]
+    raw = agg_func(arg_col)
+    if not node.coalesce_zero:
+        return raw
+    dtype = df.agg(raw.alias("_v")).schema.fields[0].dataType
+    row_present = F.sum(F.lit(1)).isNotNull()
+    return F.when(row_present, raw).otherwise(F.lit(0).cast(dtype))
+
+
+# --- §7.5's verdict vocabulary, comparison, and message channel ------------
+
+BatchCheckVerdict = Literal[
+    "match", "mismatch", "control-unavailable", "control-ambiguous", "aggregate-unavailable"
+]
+
+
+@dataclass(frozen=True)
+class AggregateOutcome:
+    """§7.5 [EM-5]: "the verdict is a function of `(candidate_count,
+    aggregate)`, both already at hand in one aggregation pass" --
+    `aggregate_value` already carries [EM-4]'s per-node coalesce-to-zero
+    (`aggregate_column`'s own construction), so a NULL here at
+    `candidate_count > 0` is a genuine, never-masked `aggregate-unavailable`
+    precondition (an all-NULL aggregated column, or decimal overflow)."""
+
+    candidate_count: int
+    aggregate_value: Decimal | int | None
+
+
+@dataclass(frozen=True)
+class ControlOutcome:
+    """§9's extraction plan, restated at ITS OWN post-extraction boundary
+    (the member-scoped accessor that RESOLVES which frame to extract from
+    is 005 v1.x's named wait, §9 -- this dataclass's fields are what that
+    accessor's caller already has in hand once it exists). `admitted_row_
+    count` is the control member's own admitted-row count (§9's `count == 1`
+    assertion subject); `value` is the extracted scalar when exactly one
+    row was admitted -- itself possibly NULL (a nullable control column,
+    [AE-4]) -- `None` otherwise (nothing to extract)."""
+
+    admitted_row_count: int
+    value: Decimal | int | None = None
+
+
+def render_batch_check_verdict(
+    aggregate: AggregateOutcome, control: ControlOutcome, tolerance: Decimal | None
+) -> BatchCheckVerdict:
+    """§7.5's comparison and verdict channel (P-9: integral/decimal by
+    construction; P-6/§9: "the comparison and verdict channel per §7.5"
+    lands now). Control-side outcomes checked first (G-05(d)/(e)/(f)/(g)'s
+    own enumeration order): zero admitted rows -> `control-unavailable`
+    [AE-5]; more than one -> `control-ambiguous` (incl. the value-identical-
+    duplicate pair [AE-11] -- this function only ever sees the COUNT, so a
+    duplicate pair is indistinguishable from any other ambiguous pair, by
+    construction); a NULL extracted value -> `control-unavailable` [AE-4].
+    Aggregate-side NULLs decompose by provenance (§7.5 [EM-5], verbatim):
+    an empty candidate set (`candidate_count == 0`) with a NULL aggregate
+    (only reachable for `min`/`max`/`avg`, which take no zero) is the
+    `control-unavailable` class per §7.5's own literal text ("the minimum
+    of nothing... is an authoring error surfaced as data"); a NON-empty
+    candidate set with a NULL aggregate is the distinctly-named `aggregate-
+    unavailable` (G-05(h)). Otherwise: `tolerance` absent -> exact equality;
+    present -> `abs(aggregate - control) <= tolerance` -- both all-decimal/
+    integral (P-9 rule 2, [EM-3]), never floating point."""
+    if control.admitted_row_count == 0:
+        return "control-unavailable"
+    if control.admitted_row_count > 1:
+        return "control-ambiguous"
+    if control.value is None:
+        return "control-unavailable"
+    if aggregate.aggregate_value is None:
+        if aggregate.candidate_count == 0:
+            return "control-unavailable"
+        return "aggregate-unavailable"
+    if tolerance is None:
+        return "match" if aggregate.aggregate_value == control.value else "mismatch"
+    # `Decimal(...)` normalizes an `int` operand (e.g. a bare `count`
+    # aggregate) onto the same numeric tower as its sibling `Decimal`
+    # before the subtraction -- both sides are already integral/decimal by
+    # construction (P-9 rule 2, [EM-3]), never floating point.
+    diff = abs(Decimal(aggregate.aggregate_value) - Decimal(control.value))
+    return "match" if diff <= tolerance else "mismatch"
+
+
+def batch_check_failed_message(
+    check_id: str, verdict: BatchCheckVerdict, checks_version: str
+) -> str:
+    """§7.5's verdict channel, fresh path (facts absent): the value-free
+    message a `ValueError` carries when `batch_check` fails the batch
+    loudly after the quarantine append (§7.6) -- [S-7]/[S-9]: no aggregate
+    or control VALUE ever rides this string, id/verdict/version only."""
+    return (
+        f"batch-check-failed: id={check_id} verdict={verdict} check_version={checks_version[:16]}"
+    )
+
+
+def batch_check_drift_segment(
+    check_id: str, verdict: BatchCheckVerdict, checks_version: str
+) -> str:
+    """§12: the value-free segment appended to `post_check_drift` on a
+    demoted `batch_check` (§8.4) -- deliberately includes `match` in its
+    own vocabulary (§12's own text): a demoted recompute that agrees with
+    the durable state is still recorded, not just a demoted failure."""
+    return f"batch_check drift: id={check_id} verdict={verdict} check_version={checks_version[:16]}"

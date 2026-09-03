@@ -61,16 +61,28 @@ completion marker row (decide-then-do; rerun-idempotent) -- §6.3 answer 2's
 was zero-fact.
 
 **`source_ts` (§5.1 fragment 4/§6.1's framework stamp, hash-excluded,
-NULLABLE): Phase 1 has no data source for a genuine per-row business
-timestamp** -- `pipelines/identity/transforms.py`'s own module docstring
-names this exactly as "007.1's own commit-side stamping (`frames/facts.py`,
-B9a/B9b's territory)" and `frames/lineage.py::stamp_fact_lineage` does not
-stamp it (that function's own enumerated set is `batch_id`/`delivery_id`/
-`feed_id`/`received_at`/`source_uri` only). This stage stamps it as a
-literal `NULL` (`§8.1`'s own words: "null ranks lowest in the order") --
-framework-owned, never derived from candidate data, bounded to Phase 1
-(a future revision wiring a genuine source timestamp would source it from
-the seed or the raw contract, neither of which carries one today).
+NULLABLE) := the delivery's `received_at` -- HLD 007 D-3(b), verbatim:
+"Source timestamp := delivery received_at -- framework-stamped at
+registration, always present; it orders corrections correctly (a
+superseding delivery arrived later, by definition); partner timestamps
+REJECTED."** This is PERCEPTION time (when the framework registered the
+delivery), never business/event time and never read from candidate data --
+`frames/lineage.py::stamp_fact_lineage` already stamps this exact same
+`LineageStamp.received_at` value onto every candidate's `received_at`
+column (that function's own enumerated set is `batch_id`/`delivery_id`/
+`feed_id`/`received_at`/`source_uri` only, unchanged -- `stamp_fact_lineage`
+is not extended, §5.1 fragment 4 enumerates exactly its own five columns);
+`_stamp_candidates` below stamps `source_ts` from the SAME `LineageStamp`
+value, one clock reading shared by both columns. The DDL column stays
+NULLABLE (§6.1 -- a type declaration, not a stamping instruction: a batch
+carries exactly one `received_at`, so `source_ts` is non-null for every
+fact this stage ever commits, but the column's own nullability is
+unaffected by that fact) -- [T-11]'s null-ranks-lowest law (§8.1: "null
+ranks lowest in the order") remains the fold's ordering semantics for any
+future null this column might carry, framework-owned either way. (Bug
+history: a prior revision of this function misread §6.1's NULLABLE
+declaration as "no data source" and stamped a literal `NULL` on every fact,
+silently deadening the ordering struct's second element -- fixed, U-1.)
 
 **Iceberg write-time nullability quirk, empirically verified this bead
 (recorded on `effects/spark.py::_build_append`'s own option, not here):**
@@ -137,11 +149,15 @@ def _ensure_marker_row(fx: RunnerFx, markers_table: str, write: MarkerRowWrite) 
 def _stamp_candidates(
     candidate_df: DataFrame, lineage_stamp: LineageStamp, schema: FactSchemaModel
 ) -> DataFrame:
-    """Lineage stamp, then the framework `source_ts` NULL stamp (module
-    docstring), then F-1's identity stamp -- §4.3's normative order: BOTH
-    complete before the structural check ever runs."""
+    """Lineage stamp, then the framework `source_ts` stamp (module
+    docstring: HLD 007 D-3(b), `= lineage_stamp.received_at`), then F-1's
+    identity stamp -- §4.3's normative order: BOTH complete before the
+    structural check ever runs. `source_ts` is stamped from the SAME
+    `LineageStamp.received_at` value `frames/lineage.py::stamp_fact_lineage`
+    already stamps as the `received_at` column -- one clock reading, shared
+    by both columns, NEVER derived from candidate data (I-9)."""
     stamped_lineage = lineage.stamp_fact_lineage(candidate_df, lineage_stamp).withColumn(
-        "source_ts", F.lit(None).cast(TimestampType())
+        "source_ts", F.lit(lineage_stamp.received_at).cast(TimestampType())
     )
     declared_cols = tuple(column.name for column in schema.columns)
     key_cols = tuple(schema.record_key)

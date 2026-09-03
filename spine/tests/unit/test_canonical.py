@@ -12,6 +12,10 @@ before calling `canonical_json`/`row_hash`; this parser is test-local (not
 imported from `spine.core.canonical` itself) -- 007's own fact-hash suite
 reads the same committed files and writes its OWN copy of this same small
 parser, per A-6's "shared vectors, never shared code" (004 D-13's idiom).
+See `contracts/fixtures/README.md` for the full fixture-review checklist
+(synthetic-only [DS-5], resident-serializer regeneration, the untagging-
+parser rule above, NFC/NFD authoring discipline) shared by every committed
+vector family in that directory.
 
 **006.1 §16.3 item 2's post-structure addendum (bead conveyer-6pg.14, B4):**
 `post-check-snapshot.json`'s one committed vector predates the

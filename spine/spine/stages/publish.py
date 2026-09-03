@@ -41,7 +41,7 @@ unconditionally, no early exit):
   entry" logic).
 - `state_snapshot_id` = `core.run_facts.one_snapshot(ctx.fold_snapshot_ids)`
   — THIS ATTEMPT's own per-table fold map, not a durable resolution: unlike
-  `append`, `effects/spark.py::_build_merge`'s own commit is never stamped
+  `append`, `effects/spark.py::build_merge`'s own commit is never stamped
   with `conveyer.batch-id`/`conveyer.stage` (no `snapshot-property` option
   on the MERGE path), so there is no stamped-summary lookup that could ever
   recover a PRIOR attempt's fold snapshot the way `resolve_batch_snapshot`

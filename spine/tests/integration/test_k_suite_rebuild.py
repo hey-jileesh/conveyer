@@ -13,7 +13,7 @@ pairs, exactly like the sibling K-suite fold file's own K-22..K-25 rows.
 probe-verified claim (`spine/tests/probes/probe_oq7_swap.py`, bead
 `conveyer-hpp.13.10`, Sheet A) through the REAL production path** —
 `core.merge.merge_spec`/`ordering_predicate`, `frames.fold.
-reduce_batch_winners`, `effects.spark._build_merge`/`render_merge`, and
+reduce_batch_winners`, `effects.spark.build_merge`/`render_merge`, and
 `effects.rebuild.attempt_state_swap`/`swap_with_retry` — never the probe's
 own simplified hand-rolled SQL. The probe *establishes* the engine
 behavior once; this file *defends* it from then on (§10/§13.3's own rule).
@@ -29,7 +29,7 @@ snapshot BEFORE the swap lands, but whose own commit executes AFTER —
 reproduced via the SAME `time.sleep`-delayed-UDF technique the probe's own
 A2 case uses (a genuine single-JVM interleaving, not a mock of one; see
 the probe's own module docstring for the caveat this construction
-carries). `effects.spark._build_merge` already maps the resulting Iceberg
+carries). `effects.spark.build_merge` already maps the resulting Iceberg
 conflict to `TransientError` (I-11's existing channel, `is_transient_
 iceberg_failure`) — no new mapping needed on the MERGE side (§9.2's own
 words: "no per-statement option needed on the MERGE side"). A subsequent
@@ -174,7 +174,7 @@ def test_k17_mid_rebuild_fold_swap_refuses_then_repin_recompute_converges(
     spark: SparkSession,
 ) -> None:
     fact_qt, state_qt, spec = _make_tables(spark, "k17")
-    merge_fn = spark_fx._build_merge(spark)
+    merge_fn = spark_fx.build_merge(spark)
     ledger_rows: list[RunFact] = []
 
     _append_facts(spark, fact_qt, [_row("b1", "d1", datetime(2026, 1, 1, tzinfo=UTC), _h(0), "p0")])
@@ -189,7 +189,7 @@ def test_k17_mid_rebuild_fold_swap_refuses_then_repin_recompute_converges(
 
     # Rebuild's own pin + recompute (attempt 1's inputs), captured manually
     # so a live fold can be injected strictly BETWEEN pin and swap.
-    before_id_1 = rebuild_fx._current_state_snapshot_id(spark, state_qt)
+    before_id_1 = spark_fx.current_snapshot_id(spark, state_qt)
     assert before_id_1 is not None
     rebuilt_df_1 = recompute()
 
@@ -219,7 +219,7 @@ def test_k17_mid_rebuild_fold_swap_refuses_then_repin_recompute_converges(
 
 def test_k18_straddling_merge_conflicts_and_retry_converges(spark: SparkSession) -> None:
     fact_qt, state_qt, spec = _make_tables(spark, "k18")
-    merge_fn = spark_fx._build_merge(spark)
+    merge_fn = spark_fx.build_merge(spark)
     ledger_rows: list[RunFact] = []
 
     _append_facts(spark, fact_qt, [_row("b1", "d1", datetime(2026, 1, 1, tzinfo=UTC), _h(0), "p0")])
@@ -267,17 +267,17 @@ def test_k18_straddling_merge_conflicts_and_retry_converges(spark: SparkSession)
         f"K18: expected the straddling MERGE to raise, got {merge_result}"
     )
     assert merge_result["exc_type"] == "TransientError", (
-        "K18: effects.spark._build_merge already maps the Iceberg conflict -- I-11's "
+        "K18: effects.spark.build_merge already maps the Iceberg conflict -- I-11's "
         "existing channel, no new mapping needed on the MERGE side"
     )
 
     # The SFN-style retry: fold the now-committed straddling batch's facts
     # against the rebuilt state -- must converge.
-    before_retry = rebuild_fx._current_state_snapshot_id(spark, state_qt)
+    before_retry = spark_fx.current_snapshot_id(spark, state_qt)
     merge_fn(
         spec, reduce_batch_winners(spark.table(fact_qt).where(F.col("batch_id") == "b2"), spec)
     )
-    after_retry = rebuild_fx._current_state_snapshot_id(spark, state_qt)
+    after_retry = spark_fx.current_snapshot_id(spark, state_qt)
     assert after_retry != before_retry
     row = spark.table(state_qt).where("domain_id = 'd1'").collect()[0]
     assert row["payload"] == "p1", "K18: retry must converge, applying the straddling batch"
@@ -291,7 +291,7 @@ def test_k19_batch_committed_before_pin_folded_after_swap_is_a_logical_noop(
     spark: SparkSession,
 ) -> None:
     fact_qt, state_qt, spec = _make_tables(spark, "k19")
-    merge_fn = spark_fx._build_merge(spark)
+    merge_fn = spark_fx.build_merge(spark)
     ledger_rows: list[RunFact] = []
 
     # Seed: an earlier batch, folded already, so the state table carries
@@ -316,13 +316,13 @@ def test_k19_batch_committed_before_pin_folded_after_swap_is_a_logical_noop(
     result = rebuild_fx.swap_with_retry(
         spark, "pipelines/k19-probe", spec.target_table, recompute, ledger_rows.append
     )
-    before_id = rebuild_fx._current_state_snapshot_id(spark, state_qt)
+    before_id = spark_fx.current_snapshot_id(spark, state_qt)
 
     # B's OWN live fold runs AFTER the swap, over the IDENTICAL facts -- a
     # full ordering tie against what the swap already wrote.
     b_winners = reduce_batch_winners(spark.table(fact_qt).where(F.col("batch_id") == "bB"), spec)
     merge_result = merge_fn(spec, b_winners)
-    after_id = rebuild_fx._current_state_snapshot_id(spark, state_qt)
+    after_id = spark_fx.current_snapshot_id(spark, state_qt)
 
     assert after_id != before_id, "errata #9: MERGE always physically snapshots, even a no-op"
     summary = None
@@ -342,14 +342,60 @@ def test_k19_batch_committed_before_pin_folded_after_swap_is_a_logical_noop(
     assert result.state_snapshot_id is not None
 
 
-# --- K-26: rebuild killed before its swap ------------------------------------
+# --- A007-1: rebuild_state_table's own pin-order guarantee ------------------
 
 
-def test_k26_rebuild_killed_before_its_swap_leaves_state_untouched(spark: SparkSession) -> None:
-    """Pins are reads; the computed frame is ephemeral -- disposability
-    (D-5's promise), no cleanup duty beyond ordinary temp hygiene."""
-    fact_qt, state_qt, spec = _make_tables(spark, "k26")
-    merge_fn = spark_fx._build_merge(spark)
+def test_pin_order_before_id_precedes_fact_snapshot_pin_by_construction(
+    spark: SparkSession,
+) -> None:
+    """A007-1's own by-construction claim, proven directly against the
+    PRODUCTION closure (`effects.rebuild.rebuild_state_table`), not the
+    manual `attempt_state_swap`/hand-rolled `recompute` calls K-17/K-18/
+    K-19 exercise: `before_id` (state) is captured strictly BEFORE the fact
+    table's own snapshot pin (`rebuild_state_table`'s closure, §9.2's load-
+    bearing order) -- verified here by recording every call's own `qt`
+    argument, in order, off the ONE shared public helper (`effects/spark.
+    py::current_snapshot_id`, bead conveyer-swb.25's M1 fix -- re-pointed
+    here from the pre-fix private `rebuild_fx._current_state_snapshot_id`)
+    `rebuild_state_table`'s own M4 genesis pre-check, `swap_with_retry`'s
+    `before_id` capture, and the fact pin all go through, so the claim is
+    checked at the actual call-order grain, not inferred from outcomes
+    alone.
+
+    Several calls reach `current_snapshot_id` for THIS table's own qt/
+    fact_qt before attempt 1's swap even fires: `rebuild_state_table`'s own
+    M4 genesis pre-check (state qt -- a no-op read here, this table is
+    already seeded via `bSeed` above, never `None`); `swap_with_retry`'s
+    own `before_id` capture (state qt again -- THIS is the SECOND state-qt
+    call, the one the live-batch injection below targets, not the first);
+    the injected live batch's own nested `merge_fn` housekeeping reads
+    (state qt, twice more -- an injection-mechanism artifact, not itself
+    part of the claim under test); and finally the fact snapshot pin (fact
+    qt, inside `recompute`). The assertion below is robust to exactly how
+    many state-qt reads precede the fact pin (a private implementation
+    detail of the injection technique, not load-bearing) while still
+    proving the actual claim: EVERY state-qt read precedes the fact qt's
+    first appearance, never the reverse.
+
+    A live batch (fact append + fold into state) is injected to land in the
+    WINDOW strictly between those two captures. Because the fact pin
+    happens strictly AFTER the append (this is what "before_id first"
+    buys), that live batch's own fact is naturally INCLUDED in THIS
+    attempt's own fresh recompute -- never silently dropped -- but the
+    swap still REFUSES this attempt, because the live fold moved STATE
+    past the already-captured `before_id` (over-refusal, the permitted
+    direction, §9.2's own account). `rebuild_state_table`'s internal re-
+    pin/recompute/retry then converges on attempt 2 to the SAME content a
+    plain fold-all of every committed fact would produce -- proving the
+    refuse -> re-pin -> recompute -> retry loop holds through the
+    production closure, not just through the hand-built OQ-7 goldens."""
+    fact_qt, state_qt, spec = _make_tables(spark, "pinorder")
+    fact_type = FactTypeModel(
+        fact_table=fact_qt.removeprefix("spine_cat."),
+        state_table=state_qt.removeprefix("spine_cat."),
+        schema=_SCHEMA,
+    )
+    merge_fn = spark_fx.build_merge(spark)
 
     _append_facts(
         spark, fact_qt, [_row("bSeed", "d1", datetime(2026, 1, 1, tzinfo=UTC), _h(0), "vSeed")]
@@ -358,7 +404,283 @@ def test_k26_rebuild_killed_before_its_swap_leaves_state_untouched(spark: SparkS
         spec, reduce_batch_winners(spark.table(fact_qt).where(F.col("batch_id") == "bSeed"), spec)
     )
 
-    before_id = rebuild_fx._current_state_snapshot_id(spark, state_qt)
+    call_order: list[str] = []
+    state_qt_calls = {"n": 0}
+    original = spark_fx.current_snapshot_id
+
+    def instrumented(spark_: SparkSession, qt: str) -> int | None:
+        call_order.append(qt)
+        if qt == state_qt:
+            state_qt_calls["n"] += 1
+            if state_qt_calls["n"] == 2:
+                # The SECOND state-qt call is `swap_with_retry`'s own
+                # `before_id` capture -- the FIRST is `rebuild_state_table`'s
+                # own M4 genesis pre-check (a no-op read here; this table is
+                # already seeded, never `None`). Capture the STALE `before_
+                # id` first, THEN land the live batch -- state's real
+                # current snapshot moves past this returned value only
+                # AFTER this call returns, exactly matching a live fold
+                # racing in the window between `before_id`'s capture and
+                # `swap_with_retry`'s own next step (`recompute()`).
+                value = original(spark_, qt)
+                _append_facts(
+                    spark_,
+                    fact_qt,
+                    [_row("bLive", "d2", datetime(2026, 1, 1, tzinfo=UTC), _h(1), "vLive")],
+                )
+                merge_fn(
+                    spec,
+                    reduce_batch_winners(
+                        spark_.table(fact_qt).where(F.col("batch_id") == "bLive"), spec
+                    ),
+                )
+                return value
+        return original(spark_, qt)
+
+    spark_fx.current_snapshot_id = instrumented
+    try:
+        ledger_rows: list[RunFact] = []
+        rebuild_fx.rebuild_state_table(
+            spark, "pipelines/pin-order-probe", fact_type, record_run=ledger_rows.append
+        )
+    finally:
+        spark_fx.current_snapshot_id = original
+
+    # The pin-order claim, at the actual call-order grain: EVERY state-table
+    # read (`rebuild_state_table`'s own M4 genesis pre-check, `swap_with_
+    # retry`'s own `before_id` capture, and the injected live-batch's own
+    # nested `merge_fn` housekeeping reads -- all of them state-qt) precedes
+    # the fact table's own FIRST snapshot pin -- proven by the fact qt's
+    # first appearance in `call_order`, never earlier. This is robust to
+    # exactly how many state-qt reads the injection's own nested merge
+    # issues internally (not itself part of the claim under test) while
+    # still proving the load-bearing order: state pin(s) strictly before
+    # the fact pin, never the reverse.
+    fact_qt_index = call_order.index(fact_qt)
+    assert fact_qt_index > 0, "at least one state-qt read (before_id) must precede the fact pin"
+    assert all(qt == state_qt for qt in call_order[:fact_qt_index]), (
+        "every call before the fact snapshot pin's first appearance must be a state-qt read"
+    )
+
+    assert len(ledger_rows) == 2
+    assert ledger_rows[0].outcome == "failed"
+    assert ledger_rows[0].error_type == "org.apache.iceberg.exceptions.ValidationException"
+    assert ledger_rows[1].outcome == "ok"
+
+    rows_final = sorted((r["domain_id"], r["payload"]) for r in spark.table(state_qt).collect())
+    expected = sorted(
+        (r["domain_id"], r["payload"])
+        for r in reduce_batch_winners(spark.table(fact_qt), spec).collect()
+    )
+    assert rows_final == expected == [("d1", "vSeed"), ("d2", "vLive")], (
+        "the live batch's own fact was naturally INCLUDED in attempt 1's own fresh pin "
+        "(never excluded) -- retry converges to the same content a plain fold-all would"
+    )
+
+
+def test_rebuild_pipeline_loops_declared_fact_types_in_order(spark: SparkSession) -> None:
+    """A007-1's per-pipeline orchestration: one swap per declared fact
+    type's own state table, keyed by state table, one `RunFact` per
+    attempt threaded through the SAME `record_run` for every type -- IN
+    DECLARED (insertion) order (F-4's own per-table iteration convention),
+    proven by the test's own NAME claim (M8, bead conveyer-swb.25): the
+    original assertion here only checked SET equality of `feed_id`s, which
+    is blind to order entirely -- a `rebuild_pipeline` that iterated `b`
+    before `a` would have passed it just the same."""
+    fact_qt_a, state_qt_a, spec_a = _make_tables(spark, "rpA")
+    fact_qt_b, state_qt_b, spec_b = _make_tables(spark, "rpB")
+    fact_type_a = FactTypeModel(
+        fact_table=fact_qt_a.removeprefix("spine_cat."),
+        state_table=state_qt_a.removeprefix("spine_cat."),
+        schema=_SCHEMA,
+    )
+    fact_type_b = FactTypeModel(
+        fact_table=fact_qt_b.removeprefix("spine_cat."),
+        state_table=state_qt_b.removeprefix("spine_cat."),
+        schema=_SCHEMA,
+    )
+    merge_fn = spark_fx.build_merge(spark)
+
+    a_rows = [_row("bA", "d1", datetime(2026, 1, 1, tzinfo=UTC), _h(0), "pA")]
+    _append_facts(spark, fact_qt_a, a_rows)
+    a_winners = reduce_batch_winners(
+        spark.table(fact_qt_a).where(F.col("batch_id") == "bA"), spec_a
+    )
+    merge_fn(spec_a, a_winners)
+
+    b_rows = [_row("bB", "d2", datetime(2026, 1, 1, tzinfo=UTC), _h(1), "pB")]
+    _append_facts(spark, fact_qt_b, b_rows)
+    b_winners = reduce_batch_winners(
+        spark.table(fact_qt_b).where(F.col("batch_id") == "bB"), spec_b
+    )
+    merge_fn(spec_b, b_winners)
+
+    class _FakeSpec:
+        def __init__(self, pipeline: str, fact_types: dict[str, FactTypeModel]) -> None:
+            self.pipeline = pipeline
+            self.fact_types = fact_types
+
+    fake_spec = _FakeSpec("pipelines/rp-probe", {"a": fact_type_a, "b": fact_type_b})
+    ledger_rows: list[RunFact] = []
+    results = rebuild_fx.rebuild_pipeline(
+        spark,
+        fake_spec,  # type: ignore[arg-type]
+        record_run=ledger_rows.append,
+    )
+
+    expected_state_tables = {fact_type_a.state_table, fact_type_b.state_table}
+    assert set(results) == expected_state_tables
+    assert all(result.attempts == 1 for result in results.values())
+    assert len(ledger_rows) == 2
+    assert {row.pipeline for row in ledger_rows} == {"pipelines/rp-probe"}
+    # M8: ORDER, not just set membership -- `spec.fact_types`' own declared
+    # (insertion) order is "a" then "b"; a `rebuild_pipeline` that visited
+    # them in the opposite order would fail this, unlike the prior set-only
+    # assertion it replaces.
+    assert [row.feed_id for row in ledger_rows] == [
+        fact_type_a.state_table,
+        fact_type_b.state_table,
+    ]
+    assert sorted((r["domain_id"], r["payload"]) for r in spark.table(state_qt_a).collect()) == [
+        ("d1", "pA")
+    ]
+    assert sorted((r["domain_id"], r["payload"]) for r in spark.table(state_qt_b).collect()) == [
+        ("d2", "pB")
+    ]
+
+
+# --- M4: genesis-seed a never-folded state table -----------------------------
+
+
+def test_rebuild_state_table_genesis_seeds_a_never_folded_state_table_and_converges(
+    spark: SparkSession,
+) -> None:
+    """M4 (bead conveyer-swb.25, critique gate wf_78ea4599-a5b): a
+    bootstrapped-but-never-folded state table (`_make_tables`'s own
+    `bootstrap_state_table` -- DDL creation only, zero snapshots, zero rows,
+    NO manual genesis-seed step anywhere in this test) converges through
+    `rebuild_state_table` directly, in ONE attempt -- replacing the prior
+    behavior of an unconditional `TransientError` (a retry-class error
+    wrongly applied to what is a PERMANENT condition until the first fold
+    or rebuild runs)."""
+    fact_qt, state_qt, spec = _make_tables(spark, "m4genesis")
+    fact_type = FactTypeModel(
+        fact_table=fact_qt.removeprefix("spine_cat."),
+        state_table=state_qt.removeprefix("spine_cat."),
+        schema=_SCHEMA,
+    )
+    assert spark_fx.current_snapshot_id(spark, state_qt) is None, (
+        "the state table must be genuinely never-folded (zero snapshots) for this test to mean "
+        "anything -- bootstrap DDL creation alone must not itself supply one"
+    )
+
+    _append_facts(spark, fact_qt, [_row("b1", "d1", datetime(2026, 1, 1, tzinfo=UTC), _h(0), "p1")])
+
+    ledger_rows: list[RunFact] = []
+    result = rebuild_fx.rebuild_state_table(
+        spark, "pipelines/m4-genesis-probe", fact_type, record_run=ledger_rows.append
+    )
+
+    assert result.attempts == 1, (
+        "genesis-seeding must not itself count as a refused/retried attempt"
+    )
+    assert len(ledger_rows) == 1, (
+        "genesis-seeding must not emit its own ledger row -- only the swap"
+    )
+    assert ledger_rows[0].outcome == "ok"
+    assert ledger_rows[0].stage == "rebuild"
+    rows_final = sorted((r["domain_id"], r["payload"]) for r in spark.table(state_qt).collect())
+    assert rows_final == [("d1", "p1")]
+
+
+# --- A007-9: refused-swap ledger row carries the OBSERVED wrapped class -----
+
+
+class _FakeJavaClass:
+    def __init__(self, name: str) -> None:
+        self._name = name
+
+    def getName(self) -> str:
+        return self._name
+
+
+class _FakeJavaException:
+    def __init__(self, name: str) -> None:
+        self._klass = _FakeJavaClass(name)
+
+    def getClass(self) -> _FakeJavaClass:
+        return self._klass
+
+
+class _FakePy4JJavaError(Exception):
+    def __init__(self, java_exception: _FakeJavaException) -> None:
+        self.java_exception = java_exception
+
+
+class _RefusingWriter:
+    def __init__(self, exc: Exception) -> None:
+        self._exc = exc
+
+    def option(self, key: str, value: str) -> _RefusingWriter:
+        return self
+
+    def overwrite(self, cond: object) -> None:
+        raise self._exc
+
+
+class _RefusingDataFrame:
+    def __init__(self, exc: Exception) -> None:
+        self._exc = exc
+
+    def writeTo(self, qt: str) -> _RefusingWriter:
+        return _RefusingWriter(self._exc)
+
+
+def test_a007_9_refusal_records_the_observed_wrapped_java_class_not_a_hardcoded_literal() -> None:
+    """A007-9: `SwapOutcome.error_type` (and the ledger row `_rebuild_
+    attempt_fact` derives from it) carries the ACTUAL wrapped Java
+    exception's class name -- `CommitStateUnknownException` here, never a
+    single hardcoded `"ValidationException"` literal borrowed from probe
+    A1's own one observed refusal class. Proven directly against
+    `attempt_state_swap`'s exception handling with a FAKE `Py4JJavaError`
+    (`Py4JJavaError.__init__` only touches `._target_id` -- fakeable
+    without a live gateway, `effects/spark.py`'s own module docstring) and
+    a duck-typed refusing `DataFrame`/`DataFrameWriterV2` stand-in -- no
+    live Spark commit/refusal needed."""
+    exc = _FakePy4JJavaError(
+        _FakeJavaException("org.apache.iceberg.exceptions.CommitStateUnknownException")
+    )
+    rebuilt_df = _RefusingDataFrame(exc)
+
+    outcome = rebuild_fx.attempt_state_swap(
+        None,  # type: ignore[arg-type]  -- never touched on the refusal path
+        "spine_test_tables.fake_state",
+        rebuilt_df,  # type: ignore[arg-type]
+        before_id=1,
+    )
+
+    assert outcome.committed is False
+    assert outcome.state_snapshot_id is None
+    assert outcome.error_type == "org.apache.iceberg.exceptions.CommitStateUnknownException"
+
+
+# --- K-26: rebuild killed before its swap ------------------------------------
+
+
+def test_k26_rebuild_killed_before_its_swap_leaves_state_untouched(spark: SparkSession) -> None:
+    """Pins are reads; the computed frame is ephemeral -- disposability
+    (D-5's promise), no cleanup duty beyond ordinary temp hygiene."""
+    fact_qt, state_qt, spec = _make_tables(spark, "k26")
+    merge_fn = spark_fx.build_merge(spark)
+
+    _append_facts(
+        spark, fact_qt, [_row("bSeed", "d1", datetime(2026, 1, 1, tzinfo=UTC), _h(0), "vSeed")]
+    )
+    merge_fn(
+        spec, reduce_batch_winners(spark.table(fact_qt).where(F.col("batch_id") == "bSeed"), spec)
+    )
+
+    before_id = spark_fx.current_snapshot_id(spark, state_qt)
     rows_before = sorted((r["domain_id"], r["payload"]) for r in spark.table(state_qt).collect())
 
     # Rebuild "starts": pin `before_id` (a read), recompute the rebuilt
@@ -367,11 +689,11 @@ def test_k26_rebuild_killed_before_its_swap_leaves_state_untouched(spark: SparkS
     def recompute():
         return reduce_batch_winners(spark.table(fact_qt), spec)
 
-    _ = rebuild_fx._current_state_snapshot_id(spark, state_qt)  # the pin, a read only
+    _ = spark_fx.current_snapshot_id(spark, state_qt)  # the pin, a read only
     _ = recompute()  # the ephemeral computed frame -- never written
     # (simulated kill here -- no swap call follows)
 
-    after_id = rebuild_fx._current_state_snapshot_id(spark, state_qt)
+    after_id = spark_fx.current_snapshot_id(spark, state_qt)
     rows_after = sorted((r["domain_id"], r["payload"]) for r in spark.table(state_qt).collect())
     assert after_id == before_id, "K26: state snapshot must be untouched"
     assert rows_after == rows_before, "K26: state rows must be untouched"
@@ -389,7 +711,7 @@ def test_k27_killed_between_swap_and_announcement_completed_by_rerunning(
     the run mode" is asserted directly: a second `swap_with_retry` call
     over the SAME facts converges to the SAME content."""
     fact_qt, state_qt, spec = _make_tables(spark, "k27")
-    merge_fn = spark_fx._build_merge(spark)
+    merge_fn = spark_fx.build_merge(spark)
     ledger_rows: list[RunFact] = []
 
     _append_facts(
@@ -431,13 +753,20 @@ def test_k27_killed_between_swap_and_announcement_completed_by_rerunning(
 
 
 def test_budget_exhaustion_raises_transient_error_never_forces_the_write(
-    spark: SparkSession,
+    spark: SparkSession, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """RB-2's "no --force path" holds by construction: a perpetually-refused
     swap raises `TransientError` (D-1's ordinary job-failure/SFN-retry
-    channel) after `max_attempts`, never issuing an unconditional write."""
+    channel) after `max_attempts`, never issuing an unconditional write.
+
+    A007-7: also asserts the `RebuildSwapRetries` EMF -- one line per
+    refused attempt (3, `max_attempts=3`), each carrying `pipeline` and the
+    (correctly-named, U-4) `state_table` dimension, and NO row value
+    ([S-7]/[S-18]: the live folds' own domain ids/payloads never leak into
+    the metric payload)."""
+    pipeline = "pipelines/kbudget-probe"
     fact_qt, state_qt, spec = _make_tables(spark, "kbudget")
-    merge_fn = spark_fx._build_merge(spark)
+    merge_fn = spark_fx.build_merge(spark)
     ledger_rows: list[RunFact] = []
 
     _append_facts(
@@ -471,10 +800,11 @@ def test_budget_exhaustion_raises_transient_error_never_forces_the_write(
         )
         return reduce_batch_winners(spark.table(fact_qt), spec)
 
+    capsys.readouterr()  # drain setup's own EMF lines before asserting the retry loop's own
     with pytest.raises(TransientError):
         rebuild_fx.swap_with_retry(
             spark,
-            "pipelines/kbudget-probe",
+            pipeline,
             spec.target_table,
             recompute,
             ledger_rows.append,
@@ -486,3 +816,12 @@ def test_budget_exhaustion_raises_transient_error_never_forces_the_write(
     assert "live1" in rows_final and "live2" in rows_final and "live3" in rows_final, (
         "RB-2: every live fold's own rows must remain in state -- the swap never forced a write"
     )
+
+    emitted = capsys.readouterr().out
+    retry_lines = [line for line in emitted.splitlines() if '"Name": "RebuildSwapRetries"' in line]
+    assert len(retry_lines) == 3, "A007-7: one RebuildSwapRetries EMF line per refused attempt"
+    for line in retry_lines:
+        assert f'"pipeline": "{pipeline}"' in line
+        assert f'"state_table": "{spec.target_table}"' in line
+    for row_value in ("vSeed", "vLive", "live1", "live2", "live3"):
+        assert row_value not in emitted, "[S-7]/[S-18]: the metric payload must carry no row value"

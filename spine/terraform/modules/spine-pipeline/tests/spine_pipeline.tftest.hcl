@@ -180,15 +180,17 @@ run "spine_pipeline" {
   }
 
   # --- IAM: lake Get/Put/List, no Delete, own tables + run_ledger only ----
+  # F-1 fix: `tables/identity/*` (the TRAILING-segment `table_slug`), not
+  # the pre-fix "--"-joined `tables/pipelines--identity/*`.
 
   assert {
     condition = anytrue([
       for s in jsondecode(data.aws_iam_policy_document.job.json).Statement :
-      contains(flatten([s.Resource]), "arn:aws:s3:::conveyer-test-lake/tables/pipelines--identity/*") &&
+      contains(flatten([s.Resource]), "arn:aws:s3:::conveyer-test-lake/tables/identity/*") &&
       contains(flatten([s.Resource]), "arn:aws:s3:::conveyer-test-lake/spine/run_ledger/*") &&
       length(setsubtract(flatten([s.Action]), ["s3:GetObject", "s3:PutObject"])) == 0
     ])
-    error_message = "I-21: lake Get/Put (no Delete) must be scoped to exactly tables/<slug>/* and spine/run_ledger/*."
+    error_message = "F-1/I-21: lake Get/Put (no Delete) must be scoped to exactly tables/<table_slug>/* and spine/run_ledger/*."
   }
 
   # --- IAM: artifacts read spine/* only (I-23) ------------------------------
@@ -203,15 +205,55 @@ run "spine_pipeline" {
   }
 
   # --- IAM: Glue catalog PER-TABLE only, never database-wide (I-21/S-5) ---
+  #
+  # F-1 fix (security gate `wf_c9aadeb2-8eb`, MEDIUM): the module's own
+  # `pipeline = "pipelines/identity"` (multi-segment, the ONLY deployed
+  # pipeline's own shape) must resolve its table ARNs off the TRAILING-
+  # segment slug (`naming.table_slug`, "identity") -- NOT the "--"-joined
+  # `local.slug` ("pipelines--identity") the module used to compose these
+  # with. The invariant these assertions now prove is "no `table/<db>/*`
+  # wildcard, no database-WIDE grant" -- NOT "no database ARN ever
+  # appears": `PipelineTablesReadWrite` also carries the REQUIRED database
+  # ancestor ARN alongside its per-table ARNs (the Glue Catalog API's own
+  # table+database+catalog resource-hierarchy requirement) -- omitting it
+  # was itself a fail-closed defect this same bead fixes.
 
   assert {
     condition = anytrue([
       for s in jsondecode(data.aws_iam_policy_document.job.json).Statement :
       contains(flatten([s.Action]), "glue:UpdateTable") &&
-      contains(flatten([s.Resource]), "arn:aws:glue:us-east-1:123456789012:table/conveyer_test_lake/pipelines--identity__facts") &&
-      !contains(flatten([s.Resource]), "arn:aws:glue:us-east-1:123456789012:database/conveyer_test_lake")
+      contains(flatten([s.Resource]), "arn:aws:glue:us-east-1:123456789012:table/conveyer_test_lake/identity__facts") &&
+      contains(flatten([s.Resource]), "arn:aws:glue:us-east-1:123456789012:database/conveyer_test_lake") &&
+      !contains(flatten([s.Resource]), "arn:aws:glue:us-east-1:123456789012:table/conveyer_test_lake/*")
     ])
-    error_message = "S-5: glue:UpdateTable must be scoped to this pipeline's own table ARNs (including __facts), never a bare database ARN."
+    error_message = "F-1/S-5: glue:UpdateTable must be scoped to this pipeline's own TRAILING-segment table ARN (identity__facts, naming.table_slug) plus the required database ancestor ARN, never a table/<db>/* wildcard."
+  }
+
+  # The pre-fix, WRONG "--"-joined ARN must never appear anywhere in the
+  # policy -- direct proof the module no longer uses `local.slug` to name
+  # any Glue table.
+  assert {
+    condition = anytrue([
+      for s in jsondecode(data.aws_iam_policy_document.job.json).Statement :
+      !contains(flatten([s.Resource]), "arn:aws:glue:us-east-1:123456789012:table/conveyer_test_lake/pipelines--identity__facts")
+    ])
+    error_message = "F-1/S-5: the pre-fix 'pipelines--identity__facts' ARN (composed from local.slug, not the trailing-segment table_slug) must never appear."
+  }
+
+  # Critique finding N1 (gate wf_a0ef7f3b-6aa, bead conveyer-swb.28, MAJOR):
+  # the marker table (`core/naming.py::markers_table`, 007.1 S6.3/S6.5) had
+  # NO Glue-catalog grant at all -- every commit/bind marker-table touch
+  # would AccessDenied in a real Glue-catalog deployment. Same assertion
+  # shape as the `__facts` one immediately above, for `__markers`.
+  assert {
+    condition = anytrue([
+      for s in jsondecode(data.aws_iam_policy_document.job.json).Statement :
+      contains(flatten([s.Action]), "glue:UpdateTable") &&
+      contains(flatten([s.Resource]), "arn:aws:glue:us-east-1:123456789012:table/conveyer_test_lake/identity__markers") &&
+      contains(flatten([s.Resource]), "arn:aws:glue:us-east-1:123456789012:database/conveyer_test_lake") &&
+      !contains(flatten([s.Resource]), "arn:aws:glue:us-east-1:123456789012:table/conveyer_test_lake/*")
+    ])
+    error_message = "N1/F-1/I-21/S-5: glue:UpdateTable must also be scoped to this pipeline's own TRAILING-segment __markers table ARN (identity__markers) plus the required database ancestor ARN, never a table/<db>/* wildcard."
   }
 
   assert {
@@ -310,8 +352,8 @@ run "spine_pipeline" {
       for k in [
         "--conveyer-env", "--conveyer-aws-region", "--conveyer-catalog-kind",
         "--conveyer-ledger-catalog-kind", "--conveyer-spine-db", "--conveyer-run-ledger-table",
-        "--conveyer-event-bus", "--conveyer-landing-bucket", "--conveyer-pipeline-spec-uri",
-        "--conveyer-run-config", "--conveyer-sla-minutes",
+        "--conveyer-event-bus", "--conveyer-landing-bucket", "--conveyer-artifacts-bucket",
+        "--conveyer-pipeline-spec-uri", "--conveyer-run-config", "--conveyer-sla-minutes",
       ] :
       contains(keys(aws_glue_job.this.default_arguments), k)
     ])

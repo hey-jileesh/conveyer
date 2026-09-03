@@ -414,6 +414,22 @@ def test_commit_happy_path_stamps_lineage_and_appends(
     stamped_row = spark.table(fact_qt).where(f"batch_id = '{batch_id}'").collect()[0]
     assert stamped_row["delivery_id"] == ctx.delivery_id
     assert stamped_row["feed_id"] == ctx.feed_id
+    assert stamped_row["source_ts"] is not None
+    # U-1 (bead conveyer-swb.11): HLD 007 D-3(b) -- `source_ts` := the
+    # delivery's own `received_at`, stamped at commit, never a literal
+    # `NULL` (the pre-fix behavior this test used to leave unasserted).
+    # `.collect()`'s driver-side `TimestampType` marshaling uses the
+    # OS-local zone regardless of `spark.sql.session.timeZone`
+    # ([[spine-quarantine-udf-and-timestamp-hazard]]) -- assert via an
+    # in-Spark equality filter, never a Python `datetime` equality on the
+    # already-collected value.
+    assert (
+        spark.table(fact_qt)
+        .where(f"batch_id = '{batch_id}'")
+        .filter(F.col("source_ts") == F.lit(ctx.received_at))
+        .count()
+        == 1
+    )
 
 
 def test_commit_guard_skip_rerun_zero_appended_same_snapshot(

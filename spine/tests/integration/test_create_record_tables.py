@@ -27,6 +27,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import pytest
+from spine.bootstrap import create_record_tables
 from spine.bootstrap.create_record_tables import (
     MARKER_COLUMNS,
     assert_table_prefixes,
@@ -471,3 +472,81 @@ def test_render_table_class_inventory_json_is_deterministic_and_sorted() -> None
     rendered = render_table_class_inventory_json(inventory)
     assert rendered == render_table_class_inventory_json(dict(reversed(inventory.items())))
     assert rendered.index('"a.table"') < rendered.index('"z.table"')
+
+
+# --- conveyer-6pg.35 item 2: DDL render guards (escaping/quoting/catalog) ---
+# No reachable injection today (every value is a framework constant or an
+# already-validated field -- `bootstrap/**` sits outside the linter's
+# string-SQL sink profile, the priced residual). Defense in depth, tested
+# directly against `_escape_sql_string_literal`/`_qualified` (private, this
+# module's own "small deliberate independent copy" convention -- see its
+# module docstring) plus one real-DDL round trip.
+
+
+def test_escape_sql_string_literal_round_trips_a_quote_and_backslash_through_real_ddl(
+    spark: SparkSession, unique_table: Callable[[str], str]
+) -> None:
+    # Kernel-verified grammar fact (this bead): Spark SQL's `''` is NOT an
+    # ANSI-style doubled-quote escape -- `'a''b'` parses as adjacent-literal
+    # concatenation (`'a'` + `'b'` -> `"ab"`, the quote silently EATEN), not
+    # an escaped embedded quote. Only the backslash form round-trips. This
+    # test proves the fix end-to-end through a REAL `CREATE TABLE`, not just
+    # that `_escape_sql_string_literal` looks right in isolation.
+    qt = unique_table("hostile_prop")
+    hostile = "\\o'reilly's " + chr(39) + "table"
+    sql_text = create_record_tables._render_create_table_sql(
+        qt,
+        (create_record_tables.ColumnDDL("x", "string", False),),
+        partition_by=(),
+        table_class=hostile,
+    )
+    spark.sql(sql_text)
+    props = {r["key"]: r["value"] for r in spark.sql(f"SHOW TBLPROPERTIES {qt}").collect()}
+    assert props["conveyer.table-class"] == hostile
+
+
+def test_escape_sql_string_literal_is_a_noop_for_plain_values() -> None:
+    assert create_record_tables._escape_sql_string_literal("facts") == "facts"
+    assert create_record_tables._escape_sql_string_literal("merge-on-read") == "merge-on-read"
+
+
+@pytest.mark.parametrize(
+    "raw,expected",
+    [
+        ("plain", "plain"),
+        ("o'reilly", "o\\'reilly"),
+        ("a'b'c", "a\\'b\\'c"),
+        ("back\\slash", "back\\\\slash"),
+    ],
+)
+def test_escape_sql_string_literal_escapes_backslash_before_quote(raw: str, expected: str) -> None:
+    assert create_record_tables._escape_sql_string_literal(raw) == expected
+
+
+def test_qualified_composes_catalog_and_table() -> None:
+    assert (
+        create_record_tables._qualified("spine_cat", "lake.identity__facts")
+        == "spine_cat.lake.identity__facts"
+    )
+
+
+def test_qualified_rejects_a_malformed_catalog() -> None:
+    # `--catalog` is a `main()` CLI arg (default `spine_cat`) -- previously
+    # composed unvalidated. A hostile value must be refused before it ever
+    # reaches a `spark.sql(...)` DDL string, never merely produce a
+    # differently-shaped (but still-executed) statement.
+    with pytest.raises(ValueError, match="invalid identifier component"):
+        create_record_tables._qualified("spine_cat; DROP TABLE x --", "lake.identity__facts")
+
+
+def test_bootstrap_state_table_quotes_the_sort_column(
+    spark: SparkSession, unique_table: Callable[[str], str]
+) -> None:
+    # Defense in depth (`domain_id_col` is already `COLUMN_NAME_RE`-validated
+    # at bind time, `FactSchemaModel`'s own membership check) -- the `WRITE
+    # ORDERED BY` clause must still render through `quote_identifier`
+    # without changing behavior: the fresh-CREATE branch must still succeed
+    # against a real Iceberg table.
+    qt = unique_table("identity__state_quoted_sort")
+    bootstrap_state_table(spark, qt, _schema(("amount", "string")))
+    assert spark.catalog.tableExists(qt)

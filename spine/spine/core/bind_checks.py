@@ -16,7 +16,10 @@ exists), **C4** (co-effect table-class), **C5** (co-effect declared columns
 ⊆ catalog schema), **C6** (`own_state` refusal), and **C8's bind half**
 (membership `ref_columns` ⊆ the co-effect's CATALOG schema, only when the
 co-effect declares no `columns:` of its own — the declared-columns half is
-already checked at parse, in `MembershipCheckModel`). **K5 (the engine
+already checked at parse, in `MembershipCheckModel`), and **`marker-table-
+missing`** (critique gate wf_78ea4599-a5b F3, bead conveyer-swb.26 — this
+pipeline's own marker table absent from `CatalogFacts`, see the "F-10 /
+[DC-1]" section's `markers_table` bullet below). **K5 (the engine
 compile gate) is deliberately absent here** — it needs a live Spark session
 to compile against (`df.select(F.expr(text))`, P-2 gate 2), which this
 function's `plain, total over plain values` contract excludes; K5 is the
@@ -43,9 +46,10 @@ raises.
 erratum rows; B2, `conveyer-6pg.12`, landed their PURE halves; B7,
 `conveyer-6pg.18`, lands the effect-side acquisition — 007.1 §6.5/§4.3,
 `bootstrap/create_record_tables.py` + `entrypoints/glue_main.py`).**
-`validate_bindings` takes two more plain-value inputs, both content-pinned
-or derived facts the entrypoint acquires BEFORE calling this function —
-never a second catalog read inside it:
+`validate_bindings` takes two more plain-value inputs (plus a third,
+`markers_table`, added by the F3 fix below), all content-pinned or derived
+facts the entrypoint acquires BEFORE calling this function — never a second
+catalog read inside it:
 
 * **`table_class_inventory` (F-10, 007.1 §6.5's `table-classes.json`).**
   The content-pinned table→class inventory the deploy step emits beside the
@@ -77,7 +81,23 @@ never a second catalog read inside it:
   (`core/naming.py::COMMIT_COMPLETION_SENTINEL`) excluded, tolerating a
   not-yet-provisioned marker table by returning `()` (an empty set is a
   subset of every fact-table set by construction, so this check correctly
-  stays silent in that case too)."""
+  stays silent in that case too).
+* **`markers_table` (critique gate wf_78ea4599-a5b F3, bead
+  conveyer-swb.26).** This pipeline's own bare marker-table identifier
+  (`core/naming.py::markers_table`'s derivation) — a lookup KEY into the
+  ALREADY-ACQUIRED `catalog_facts` (`entrypoints/glue_main.py::
+  _referenced_tables` now includes it), never a second catalog/marker read
+  here. `catalog_facts[markers_table] is None` refuses `bind-defect/
+  marker-table-missing` pre-land: 006.1 P-4's own argument for the
+  pre-land class ("a defect discovered at pull has already landed raw and
+  emitted batch-started") applied to the ONE marker-table primitive that
+  had previously been left to fail only at commit, as a retry-class
+  `TransientError` (`effects/spark.py::_require_marker_table`), which
+  stays the post-land backstop for the same defect surfacing between bind
+  and commit. Defaulted to `None` (the `TransformsMeta.has_fold_export`
+  precedent above) so every pre-existing direct call site keeps
+  constructing without this parameter in mind; `None` skips the check
+  rather than vacuously passing it."""
 
 from __future__ import annotations
 
@@ -99,8 +119,10 @@ class TableFacts:
 
 # Qualified table identifier ("<db>.<table>") -> its facts, or `None` if the
 # table does not exist. One entry per table the spec references: every
-# declared co-effect's `.table`, plus (existence-only, per P-4) every
-# declared type's `fact_table`/`state_table`.
+# declared co-effect's `.table`, (existence-only, per P-4) every declared
+# type's `fact_table`/`state_table`, plus (existence-only, critique gate
+# wf_78ea4599-a5b F3, bead conveyer-swb.26) this pipeline's own marker
+# table (`entrypoints/glue_main.py::_referenced_tables`'s own population).
 CatalogFacts = Mapping[str, "TableFacts | None"]
 
 # Qualified table identifier -> its `conveyer.table-class` (F-10's
@@ -158,6 +180,7 @@ def validate_bindings(
     transforms_meta: TransformsMeta,
     table_class_inventory: TableClassInventory,
     committed_tables: CommittedTables,
+    markers_table: str | None = None,
 ) -> tuple[BindDefect, ...]:
     """Pure, total over plain values. Every declared co-effect is checked
     regardless of whether any check references it (D-2's list applies to
@@ -168,8 +191,41 @@ def validate_bindings(
 
     `table_class_inventory`/`committed_tables` are the F-10/[DC-1] plain-
     value inputs (module docstring's own section) -- both already-acquired
-    facts, never a second catalog/marker read inside this function."""
+    facts, never a second catalog/marker read inside this function.
+
+    `markers_table` (critique gate wf_78ea4599-a5b F3, bead conveyer-swb.26):
+    this pipeline's own bare marker-table identifier (`entrypoints/glue_
+    main.py::naming.markers_table`'s own derivation, the SAME value that
+    call site's `_committed_tables` already reads with) -- a lookup KEY into
+    the ALREADY-ACQUIRED `catalog_facts` (`_referenced_tables` now includes
+    it, module docstring's own "one entry per table the spec references"),
+    never a second catalog read here either. `catalog_facts[markers_table]
+    is None` refuses `bind-defect/marker-table-missing` pre-land: an
+    un-bootstrapped marker table was previously tolerated at bind
+    (`entrypoints/glue_main.py::_committed_tables`'s own `return ()`) and
+    only surfaced at COMMIT, as a retry-class `TransientError` burning SFN
+    attempts until a redeploy (`effects/spark.py::_require_marker_table`) --
+    after a batch had ALREADY landed raw and emitted `batch-started`. Moving
+    the refusal here closes that half-started-batch window; `_require_
+    marker_table` stays the POST-land backstop for the same-shaped defect
+    surfacing between bind and commit (e.g. the table dropped mid-run).
+
+    Defaulted to `None` (the pre-existing `TransformsMeta.has_fold_export`
+    precedent, this module's own docstring): every pre-existing direct
+    `validate_bindings(...)` call site across the repo -- none of which is
+    about this check -- keeps constructing without this parameter in mind;
+    `None` means "the caller has not wired a marker-table probe," never
+    "the marker table is known to exist," so the check is SKIPPED (not
+    vacuously passed) rather than silently assumed satisfied."""
     defects: list[BindDefect] = []
+
+    if markers_table is not None and catalog_facts.get(markers_table) is None:
+        defects.append(
+            _defect(
+                "marker-table-missing",
+                f"marker table {markers_table!r} does not exist",
+            )
+        )
 
     if transforms_meta.has_post_check_export:
         defects.append(

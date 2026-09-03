@@ -795,7 +795,11 @@ def test_fact_schema_model_allows_empty_ordering_default() -> None:
 
 
 def test_fact_schema_model_rejects_duplicate_column_names() -> None:
-    with pytest.raises(ValidationError, match="fact-column-reserved-name"):
+    # A006-9 (conveyer-swb.14): duplicate declared column names are their
+    # OWN uniqueness rule now, distinct from F3's reserved-name/prefix
+    # check just below -- `bind-defect/fact-column-duplicate-name`, not
+    # `fact-column-reserved-name`.
+    with pytest.raises(ValidationError, match="fact-column-duplicate-name"):
         model.FactSchemaModel(
             columns=[{"name": "a", "type": "string"}, {"name": "a", "type": "string"}],
             domain_id_col="a",
@@ -934,6 +938,20 @@ def test_row_check_model_rejects_extra_field() -> None:
         model.RowCheckModel(**{**_ROW_CHECK, "unexpected": True})
 
 
+def test_row_check_model_reason_json_schema_matches_named_validator() -> None:
+    # INT-1 (bead conveyer-swb.33): the exported JSON Schema sidecar is the
+    # PUBLISHED contract for readers who never load this module -- it must
+    # keep stating the grammar/length constraints `_check_reason` enforces
+    # even though neither rides a bare `Field(pattern=...)`/`max_length=`
+    # (K6/A006-9/F-6: those would pre-empt the named `bind-defect/check-
+    # reason-grammar`/`check-reason-too-long` codes). Pin both to the SAME
+    # constants `_check_reason` itself checks so schema and validator can
+    # never drift apart again.
+    reason_schema = model.RowCheckModel.model_json_schema()["properties"]["reason"]
+    assert reason_schema["pattern"] == model.BUSINESS_REASON_RE
+    assert reason_schema["maxLength"] == 128
+
+
 _MEMBERSHIP_CHECK: dict[str, Any] = {
     "kind": "membership",
     "id": "chk-unknown-code",
@@ -955,6 +973,14 @@ def test_membership_check_model_rejects_arity_mismatch() -> None:
         model.MembershipCheckModel(
             **{**_MEMBERSHIP_CHECK, "columns": ["a", "b"], "ref_columns": ["c"]}
         )
+
+
+def test_membership_check_model_reason_json_schema_matches_named_validator() -> None:
+    # INT-1 (bead conveyer-swb.33): see `RowCheckModel`'s own version of
+    # this test -- same schema/validator agreement, same constants.
+    reason_schema = model.MembershipCheckModel.model_json_schema()["properties"]["reason"]
+    assert reason_schema["pattern"] == model.BUSINESS_REASON_RE
+    assert reason_schema["maxLength"] == 128
 
 
 _BATCH_CHECK: dict[str, Any] = {
@@ -1136,3 +1162,33 @@ def test_parse_pipeline_spec_yaml_still_raises_pydantic_validation_error() -> No
     text = "pipeline: not-a-pipeline-slug--evil\n"
     with pytest.raises(ValidationError):
         model.parse_pipeline_spec_yaml(text)
+
+
+# --- A006-10/G-12: the identity_violations exemplar's own deployed shape ---
+
+
+def test_identity_violations_exemplar_yaml_parses() -> None:
+    # 006.1 §12.2/G-12 ("the violations variant's rules live in checks.yaml
+    # (business/negative-amount)") -- the rule is now AUTHORED YAML DATA
+    # (tests/exemplar/identity_violations/pipeline.yaml), parsed through the
+    # SAME strict `parse_pipeline_spec_yaml` loader every deployed spec
+    # uses, mirroring the base identity exemplar's own "deployed shape
+    # parses cleanly" test (`tests/integration/test_scenarios_core.py::
+    # test_pipeline_yaml_parses_into_pipeline_spec_model`).
+    text = (
+        Path(__file__).resolve().parent.parent
+        / "exemplar"
+        / "identity_violations"
+        / "pipeline.yaml"
+    ).read_text()
+
+    spec = model.parse_pipeline_spec_yaml(text)
+
+    assert spec.pipeline == "pipelines/identity-violations"
+    assert spec.transforms_module == "pipelines.identity_violations.transforms"
+    assert set(spec.fact_types) == {"identity"}
+    assert [c.id for c in spec.checks.checks] == ["no-invalid-payload"]
+    check = spec.checks.checks[0]
+    assert isinstance(check, model.RowCheckModel)
+    assert check.fact_type == "identity"
+    assert check.reason == "business/negative-amount"

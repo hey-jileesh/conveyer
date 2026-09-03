@@ -66,7 +66,7 @@ class MergeResult:  # §7.6
     # state -- a correctness defect, not a cosmetic one -- so this is a separate, explicit
     # tri-state rather than a doc-comment convention on the same two fields. Defaults `True` so
     # every OTHER caller/construction site (single-writer happy path, no-op, every existing
-    # test) is unaffected. `effects/spark.py::_build_merge` logs a WARNING on the `False` path
+    # test) is unaffected. `effects/spark.py::build_merge` logs a WARNING on the `False` path
     # (the effects layer's own permitted I/O); no ledger/`BatchContext` field yet distinguishes
     # it from a no-op downstream -- recorded as this bead's own owed follow-up, not silently
     # assumed solved by adding this field alone.

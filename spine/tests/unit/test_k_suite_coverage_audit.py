@@ -126,16 +126,29 @@ REGISTRY: dict[str, tuple[tuple[str, str], ...]] = {
             "integration/test_scenarios_commit.py",
             "test_k12_null_domain_id_candidate_is_a_named_defect_never_silent",
         ),
-    ),
-    "K-13": (
+        # A007-6: the schema-drift case, correctly relabeled/moved here from
+        # its former (double-anchoring) K-13 registration -- the SAME I-24
+        # backstop family, a distinct reaching condition (§7.3(b)), not the
+        # [AE-3] guard-present variant K-13 names.
         (
             "integration/test_scenarios_commit.py",
-            "test_k13_schema_drift_candidate_is_a_named_defect",
+            "test_k12b_missing_declared_column_is_a_named_defect_before_backstop",
         ),
+        # A007-2: the durable-authority door -> unevaluated set -> backstop
+        # composition (§7.3 path 3) -- the 006.1 G-06 twin's FIRST variant
+        # (DURABLE_AUTHORITY), distinct from K-13's DURABLE_SUBTRACT variant.
+        (
+            "integration/test_multi_type_scenarios.py",
+            "test_k12_durable_authority_door_admits_drift_born_null_backstop_names_defect",
+        ),
+    ),
+    "K-13": (
         # the [AE-3] guard-present variant, self-labeled "007.1 §13.1's K-13"
         # in its own docstring -- the G-06 twin's second variant (also
         # registered under G-06 in the G-suite audit; cited, not
-        # duplicated, per the K-suite gathering note, 007.1 §16.1).
+        # duplicated, per the K-suite gathering note, 007.1 §16.1). K-13's
+        # SOLE anchor (A007-6: no longer double-anchored by the schema-drift
+        # case, moved to K-12 above).
         (
             "integration/test_multi_type_scenarios.py",
             "test_g06_guard_present_drift_born_null_variant_ae3",
@@ -176,6 +189,14 @@ REGISTRY: dict[str, tuple[tuple[str, str], ...]] = {
             "integration/test_k_suite_fold.py",
             "test_k16_rebuild_equivalence_fold_all_equals_rebuild_swap",
         ),
+        # A007-5: the named hash-tiebreak variant -- divergent duplicates
+        # (D-2(b)) whose declared ordering columns fully tie, content_hash
+        # (the struct's guaranteed-non-null final element) decides, and does
+        # so order-insensitively.
+        (
+            "integration/test_k_suite_fold.py",
+            "test_k16_divergent_duplicates_hash_tiebreak_is_order_insensitive",
+        ),
     ),
     "K-17": (
         (
@@ -211,6 +232,15 @@ REGISTRY: dict[str, tuple[tuple[str, str], ...]] = {
         (
             "integration/test_k_suite_fold.py",
             "test_k22_kill_between_fold_merges_then_rerun_converges",
+        ),
+        # A007-3: the [AE2-2] zero-merged variant (completion present, NO
+        # MERGE ran at all) plus the standing cross-batch assertion -- a
+        # successor drops against the completed-but-unfolded predecessor,
+        # emits batch-completed, and perception holds the pre-predecessor
+        # value until the predecessor's own fold reruns.
+        (
+            "integration/test_k_suite_fold.py",
+            "test_k22_zero_merged_completed_but_unfolded_successor_drops_and_perception_holds_pre_predecessor",
         ),
     ),
     "K-23": (

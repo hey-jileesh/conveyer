@@ -132,6 +132,24 @@ def test_qualified_rejects_invalid_identifier_component() -> None:
         naming.qualified("lake.bad table")
 
 
+def test_check_qualified_table_accepts_a_component_at_exactly_the_length_cap() -> None:
+    # F-6 (security gate `wf_c9aadeb2-8eb`, LOW): 255 is the AWS Glue Data
+    # Catalog table/database name limit -- exactly at the cap still admits.
+    value = f"lake.{'a' * 255}"
+    assert naming.check_qualified_table(value) == value
+
+
+def test_check_qualified_table_rejects_a_component_one_over_the_length_cap() -> None:
+    with pytest.raises(ValueError, match="exceed 255 chars"):
+        naming.check_qualified_table(f"lake.{'a' * 256}")
+
+
+def test_check_qualified_table_rejects_an_over_long_database_component_too() -> None:
+    # Every dot-component is checked, not just the trailing one.
+    with pytest.raises(ValueError, match="exceed 255 chars"):
+        naming.check_qualified_table(f"{'a' * 256}.facts")
+
+
 # --- execution_name / rerun grammar -------------------------------------------
 
 
@@ -272,6 +290,61 @@ def test_check_object_uris_rejects_wrong_received_at() -> None:
             object_uris=fixture["object_uris"],
             landing_bucket="conveyer-dev-lake",
         )
+
+
+# --- `_format_received_at` overflow guard (conveyer-azr.25, the azr.24 -----
+# arithmetic pre-check idiom applied here too): an aware `received_at` at/
+# near `datetime.min`/`datetime.max` with a UTC offset that walks the
+# instant outside `[MINYEAR, MAXYEAR]` must reject via `ValueError`, never
+# propagate `.astimezone(UTC)`'s bare `OverflowError` -- exercised through
+# the public `check_object_uris` boundary (mirrors `test_canonical.py`'s own
+# choice to test `_timestamp_str`'s identical guard through the public
+# `canonical_json`, never the private helper directly).
+
+
+def test_check_object_uris_rejects_received_at_overflowing_past_minyear() -> None:
+    # An aware value AT `datetime.min` with a positive UTC offset walks the
+    # UTC-converted instant below MINYEAR (there is no year 0).
+    dt = datetime(1, 1, 1, 0, 0, tzinfo=timezone(timedelta(hours=5)))
+    with pytest.raises(ValueError, match="out of representable range"):
+        naming.check_object_uris(
+            feed_id="carrier-a/feed-1",
+            delivery_id=_U5,
+            received_at=dt,
+            object_uris=[],
+            landing_bucket="conveyer-dev-lake",
+        )
+
+
+def test_check_object_uris_rejects_received_at_overflowing_past_maxyear() -> None:
+    # Symmetric edge: an aware value AT `datetime.max` with a negative UTC
+    # offset walks the UTC-converted instant above MAXYEAR.
+    dt = datetime(9999, 12, 31, 23, 59, 59, 999999, tzinfo=timezone(timedelta(hours=-5)))
+    with pytest.raises(ValueError, match="out of representable range"):
+        naming.check_object_uris(
+            feed_id="carrier-a/feed-1",
+            delivery_id=_U5,
+            received_at=dt,
+            object_uris=[],
+            landing_bucket="conveyer-dev-lake",
+        )
+
+
+def test_check_object_uris_accepts_received_at_exactly_at_the_representable_boundary() -> None:
+    # The exact-microsecond boundary (offset consuming the remaining span
+    # EXACTLY) must NOT reject -- the pre-check's `>`/`<` (not `>=`/`<=`)
+    # comparisons are the load-bearing detail (conveyer-azr.24's own
+    # kernel-verified boundary case, reapplied here).
+    offset = timedelta(hours=2)
+    naive = datetime.min + offset
+    dt = naive.replace(tzinfo=timezone(offset))
+    naming.check_object_uris(
+        feed_id="carrier-a/feed-1",
+        delivery_id=_U5,
+        received_at=dt,
+        object_uris=[],
+        landing_bucket="conveyer-dev-lake",
+    )
 
 
 def test_check_object_uris_rejects_one_bad_uri_among_many() -> None:

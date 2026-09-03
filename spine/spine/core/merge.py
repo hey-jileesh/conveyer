@@ -172,7 +172,7 @@ def ordering_predicate(spec: MergeSpec) -> str:
     implementation behavior, not documented contract). Pure SQL-text
     builder over already-§6.7-identifier-validated column names (`merge_spec`
     validates every element of `ordering_cols` before a `MergeSpec` can
-    exist); consumed by `effects/spark.py::_build_merge` at the `MERGE INTO`
+    exist); consumed by `effects/spark.py::build_merge` at the `MERGE INTO`
     site (B10 ground, not wired here) as the `WHEN MATCHED AND <this>` guard.
 
     Per element `e` (`t`/`s` are the MERGE statement's target/source

@@ -102,6 +102,15 @@ class RunFact:  # one row per stage transition per attempt — §6.5 column tabl
     facts_appended: int | None = None
     rows_merged: int | None = None
     snapshot_id: int | None = None
+    # M2 (bead conveyer-swb.25): one column, two meanings keyed by `stage` --
+    # on `stage="rebuild"` rows (`effects/rebuild.py::_rebuild_attempt_fact`)
+    # this carries the PINNED FACT-table snapshot id for that attempt; on
+    # every `stage="fold"` row it is permanently `None` (`_stage_fields`'s
+    # own `fold` branch, below -- the pre-B10 singular fields this column
+    # once served were deleted outright, critique gate wf_24a3125f-ecc F4).
+    # The per-stage sourcing rule is owed a purpose-built vocabulary row in
+    # 004.1's own rebuild stage-vocabulary accretion (007.1 §16) -- this
+    # reuse is the documented INTERIM shape, not silently assumed permanent.
     state_read_snapshot_id: int | None = None
     co_effect_snapshot_ids: Mapping[str, int] | None = None
     merge_summary: Mapping[str, str] | None = None

@@ -27,7 +27,7 @@ waits named" is this bead's own DONE bar, not "every scenario green" (some
 genuinely cannot be, structurally, until 005 v1.x lands or the sibling
 epic's commit/fold rewrite lands).
 
-**Scope discipline**: large PRE-EXISTING corpus files (G-07's 68-case
+**Scope discipline**: large PRE-EXISTING corpus files (G-07's 100+-case
 gatekeeper corpus, G-09's 30-case bind-defect matrix, G-11's record-key
 suite) are registered with a GENEROUS anchor set spanning every major
 section, not exhaustively enumerated case-by-case -- their own files
@@ -87,6 +87,15 @@ REGISTRY: dict[str, tuple[tuple[str, str], ...]] = {
         (
             "integration/test_multi_type_scenarios.py",
             "test_g04c_pre_check_any_door_fires_when_only_the_second_declared_type_has_facts",
+        ),
+        # A006-11: the composed real-kill scenario -- a genuine partial
+        # commit (killed between type appends, A durable / B absent, no
+        # completion row), rerun through the ANY-table DURABLE_AUTHORITY
+        # door, asserting drift-recorded-never-raised alongside per-table
+        # completion (B appended, A untouched).
+        (
+            "integration/test_multi_type_scenarios.py",
+            "test_g04a_kill_between_type_appends_rerun_authority_and_completion",
         ),
     ),
     "G-05": (
@@ -150,10 +159,11 @@ REGISTRY: dict[str, tuple[tuple[str, str], ...]] = {
         ),
     ),
     "G-07": (
-        # Generous anchor set across every major section of the 68-case
-        # gatekeeper corpus (accept / reject / DC-3 divergence points /
-        # property suite / family_of_kind) -- not exhaustive, see module
-        # docstring's "scope discipline."
+        # Generous anchor set across every major section of the gatekeeper
+        # corpus (accept / reject / [EM-2] node-set pins / DC-3 divergence
+        # points + per-function-per-argument-position signature corpus /
+        # property suite / family_of_kind / FunctionEntry data surface) --
+        # not exhaustive, see module docstring's "scope discipline."
         ("unit/test_check_grammar.py", "test_accept_column_and_comparisons"),
         ("unit/test_check_grammar.py", "test_accept_typed_literals_both_spellings"),
         ("unit/test_check_grammar.py", "test_accept_aggregate_position_members"),
@@ -176,40 +186,63 @@ REGISTRY: dict[str, tuple[tuple[str, str], ...]] = {
             "test_property_gatekeeper_fail_closed_regardless_of_nesting_depth",
         ),
         ("unit/test_check_grammar.py", "test_family_of_kind_covers_every_fact_column_kind"),
+        # A006-2 [DC-3]: the per-function, per-argument-position signature
+        # corpus + its own completeness assertion (tied to the data
+        # module's SCALAR_FUNCTION_NAMES/AGGREGATE_FUNCTION_NAMES).
+        (
+            "unit/test_check_grammar.py",
+            "test_dc3_signature_corpus_per_function_per_argument_position",
+        ),
+        ("unit/test_check_grammar.py", "test_dc3_signature_corpus_covers_every_function"),
+        # A006-5: the Track-A-facing FunctionEntry data surface.
+        ("unit/test_check_grammar.py", "test_function_entries_match_handler_tables"),
+        # A006-12: named reject rows (DISTINCT, RLIKE).
+        ("unit/test_check_grammar.py", "test_reject_count_distinct_and_rlike"),
+        # D006-3: IN-list literal-only tightening.
+        ("unit/test_check_grammar.py", "test_d006_3_in_list_column_member_rejected"),
     ),
     "G-08": (
         # Critique gate wf_24a3125f-ecc F3 (bead conveyer-6pg.32): single-
         # homed in `spine.probes.g08_parity` -- `test_g08_executable_
         # semantics_table` now parametrizes over the imported `G08_VECTORS`
-        # (both the 38 value-kind rows and the 7 supplementary dtype/raw
-        # rows), subsuming the four standalone assertion functions this
-        # registry used to name separately (`test_g08_null_safe_eq_both_
-        # null_is_true`, `test_g08_row_position_int_div_int_is_double_
-        # intermediate`, `test_g08_decimal_division_stays_decimal`,
-        # `test_g08_round_bround_negative_control_half_up_vs_bankers`) --
-        # deleted, their own discriminator rows now live as
-        # `ParityVector` entries in the imported table instead.
+        # (the 38 value-kind rows, 7 supplementary dtype/raw rows, and 10
+        # A006-4 aggregate-position rows, 55 total), subsuming the four
+        # standalone assertion functions this registry used to name
+        # separately (`test_g08_null_safe_eq_both_null_is_true`,
+        # `test_g08_row_position_int_div_int_is_double_intermediate`,
+        # `test_g08_decimal_division_stays_decimal`, `test_g08_round_
+        # bround_negative_control_half_up_vs_bankers`) -- deleted, their own
+        # discriminator rows now live as `ParityVector` entries in the
+        # imported table instead. A006-4 (bead conveyer-6pg.32's own
+        # sec6.3-aggregate follow-up, conveyer-swb.12): the four former
+        # skip-stub entries this registry named here (`test_g08_count_1_vs_
+        # count_nullable_col_null_skip`/`test_g08_empty_set_per_aggregate_
+        # node_coalesce`/`test_g08_aggregate_unavailable_all_null_and_
+        # overflow_sum`/`test_g08_decimal_sum_avg_widening_stays_decimal`)
+        # are DELETED (both here and in the test file) -- their own
+        # discriminator rows are now real, GREEN `ParityVector` entries in
+        # `test_g08_executable_semantics_table`'s own parametrize, not a
+        # separate registered function.
         ("frames/test_business_checks.py", "test_g08_executable_semantics_table"),
         ("frames/test_business_checks.py", "test_g08_bround_is_not_grammar_admitted"),
-        # aggregate position: authored, skipped -- the 005 v1.x named wait.
-        ("frames/test_business_checks.py", "test_g08_count_1_vs_count_nullable_col_null_skip"),
-        ("frames/test_business_checks.py", "test_g08_empty_set_per_aggregate_node_coalesce"),
-        (
-            "frames/test_business_checks.py",
-            "test_g08_aggregate_unavailable_all_null_and_overflow_sum",
-        ),
-        ("frames/test_business_checks.py", "test_g08_decimal_sum_avg_widening_stays_decimal"),
     ),
     "G-09": (
-        # Exhaustive -- all 30, §5-section-ordered (S -> C -> F -> K).
+        # §5-section-ordered (S -> C -> F -> K), plus §4.4's own runtime
+        # transform-defect section at the end (A006-1, not a §5 row -- see
+        # this file's own module docstring -- placed here per the LLD's
+        # §5.5 words: "every code is exercised by G-09"). A006-8/A006-9
+        # (bead conveyer-swb.14) added the C1b/C1c/F3b rows and renamed
+        # `test_c1_duplicate_alias_discharged_via_s1_duplicate_key` ->
+        # `test_c1_duplicate_alias_raises_duplicate_alias` / `test_k6a_
+        # check_reason_grammar_is_bare_pydantic` -> `test_k6a_check_reason_
+        # grammar` (both codes are no longer bare-pydantic discharges).
         ("unit/test_bind_defect_matrix.py", "test_s1_duplicate_key_top_level"),
         ("unit/test_bind_defect_matrix.py", "test_s2_fact_table_collision"),
         ("unit/test_bind_defect_matrix.py", "test_s3_custom_fold_refused"),
         ("unit/test_bind_defect_matrix.py", "test_s4_stale_post_check_export"),
-        (
-            "unit/test_bind_defect_matrix.py",
-            "test_c1_duplicate_alias_discharged_via_s1_duplicate_key",
-        ),
+        ("unit/test_bind_defect_matrix.py", "test_c1_duplicate_alias_raises_duplicate_alias"),
+        ("unit/test_bind_defect_matrix.py", "test_c1b_co_effect_alias_grammar"),
+        ("unit/test_bind_defect_matrix.py", "test_c1c_co_effect_columns_grammar_is_bare_pydantic"),
         ("unit/test_bind_defect_matrix.py", "test_c2_co_effect_table_grammar_is_bare_pydantic"),
         ("unit/test_bind_defect_matrix.py", "test_c3_co_effect_missing_table"),
         ("unit/test_bind_defect_matrix.py", "test_c4_co_effect_not_current_state"),
@@ -223,6 +256,7 @@ REGISTRY: dict[str, tuple[tuple[str, str], ...]] = {
         ("unit/test_bind_defect_matrix.py", "test_f1_fact_types_shape_is_bare_pydantic"),
         ("unit/test_bind_defect_matrix.py", "test_f2_fact_schema_unknown_column_ref"),
         ("unit/test_bind_defect_matrix.py", "test_f3_fact_column_reserved_name"),
+        ("unit/test_bind_defect_matrix.py", "test_f3b_fact_column_duplicate_name"),
         ("unit/test_bind_defect_matrix.py", "test_f4_float_double_structurally_unrepresentable"),
         (
             "unit/test_bind_defect_matrix.py",
@@ -236,11 +270,43 @@ REGISTRY: dict[str, tuple[tuple[str, str], ...]] = {
         ("unit/test_bind_defect_matrix.py", "test_k5a_check_expression_uncompilable"),
         ("unit/test_bind_defect_matrix.py", "test_k5b_check_expression_not_boolean"),
         ("unit/test_bind_defect_matrix.py", "test_k5c_check_expression_inexact_type"),
-        ("unit/test_bind_defect_matrix.py", "test_k6a_check_reason_grammar_is_bare_pydantic"),
+        ("unit/test_bind_defect_matrix.py", "test_k6a_check_reason_grammar"),
         ("unit/test_bind_defect_matrix.py", "test_k6b_check_reason_reserved"),
         ("unit/test_bind_defect_matrix.py", "test_k7_batch_check_awaiting_member_grammar"),
         ("unit/test_bind_defect_matrix.py", "test_k8_tolerance_grammar_is_bare_pydantic"),
         ("unit/test_bind_defect_matrix.py", "test_k9_check_expression_mixed_types"),
+        # §4.4 runtime transform-defect codes (A006-1) -- both codes, incl.
+        # all three `_schema_diff` branches and the nullability-ignored rule.
+        (
+            "unit/test_bind_defect_matrix.py",
+            "test_g09_transform_defect_return_shape_missing_key",
+        ),
+        (
+            "unit/test_bind_defect_matrix.py",
+            "test_g09_transform_defect_candidate_schema_missing_column",
+        ),
+        (
+            "unit/test_bind_defect_matrix.py",
+            "test_g09_transform_defect_candidate_schema_extra_column",
+        ),
+        (
+            "unit/test_bind_defect_matrix.py",
+            "test_g09_transform_defect_candidate_schema_type_mismatch",
+        ),
+        (
+            "unit/test_bind_defect_matrix.py",
+            "test_g09_transform_defect_nullable_only_diff_does_not_raise",
+        ),
+        # `marker-table-missing` (critique gate wf_78ea4599-a5b F3, bead
+        # conveyer-swb.26) -- NOT a §5 row (this file's own module
+        # docstring's carve-out, alongside F-10/[DC-1]); registered here per
+        # §5.5's same words G-09's own docstring already cites for the
+        # §4.4 rows above ("every code is exercised by G-09").
+        ("unit/test_bind_defect_matrix.py", "test_marker_table_missing"),
+        (
+            "unit/test_glue_main.py",
+            "test_main_raises_pre_land_when_marker_table_missing",
+        ),
     ),
     "G-10": (
         ("frames/test_check_verdicts.py", "test_check_verdict_fixtures_exist"),
@@ -264,6 +330,15 @@ REGISTRY: dict[str, tuple[tuple[str, str], ...]] = {
             "test_g11_record_key_gate_interplay_domain_id_not_in_record_key_still_derives",
         ),
         ("frames/test_quarantine.py", "test_g11_cross_type_tag_discriminates_value_identical_rows"),
+        # A006-7 (bead conveyer-swb.14): the DC-3 tying test's PROPERTY half
+        # -- the same claim `test_shape_post_quarantine_every_declared_
+        # timestamp_column_is_rendered_em7` pins for one committed vector
+        # instant, generalized over generated instants through the real
+        # `shape_post_quarantine` call site.
+        (
+            "frames/test_quarantine.py",
+            "test_property_shape_post_quarantine_renders_generated_instants_like_canonical_json",
+        ),
     ),
     "G-12": (
         (

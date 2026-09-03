@@ -179,10 +179,12 @@ Local half shipped by `conveyer-6pg.15`; executed by `conveyer-6pg.16`
    wheel/environment (a `spark-submit`/ad hoc job run against a live Glue
    5.0 cluster -- the probe needs no seed/delivery/catalog access of its
    own, `spine/probes/g08_parity.py`'s own docstring) rather than a
-   laptop's local Spark. Expect `45/45 discriminator rows passed on this
+   laptop's local Spark. Expect `55/55 discriminator rows passed on this
    engine` in the job's continuous-logging output and exit code 0 -- a
-   LOCAL rehearsal of the identical command already passed 45/45 under
-   local Spark (this bead, `conveyer-6pg.15`); this step is what settles
+   LOCAL rehearsal of the identical command already passed 55/55 under
+   local Spark (originally 45/45, `conveyer-6pg.15`; extended to 55/55 with
+   the §6.3 aggregate-position engine rows, `conveyer-swb.12`/A006-4); this
+   step is what settles
    whether Glue 5.0's real JVM agrees (§13.1's own class of claim: "only a
    real account can confirm").
 
@@ -270,3 +272,72 @@ during its own abort-cleanup attempt — **expected noise** under the
 append-only bucket policy (no spine role holds `s3:DeleteObject`, §10.3);
 orphaned files are never visible to any snapshot and are swept by 008's
 maintenance design (§15.2). Do not chase these as a real failure signal.
+
+### Out-of-band rebuild (interim) — I-20's governed escape hatch (007.1 §9)
+
+Full rebuild recomputes a pipeline's state tables from ALL committed facts
+through the SAME per-type fold (`core.merge.merge_spec` +
+`frames.fold.reduce_batch_winners`, §8.2's normative plan — bit-for-bit the
+plan `stages/fold.py` runs per batch), then atomically swaps each result
+in via an Iceberg conditional overwrite (`effects.rebuild.swap_with_retry`
+— `validate-from-snapshot-id` + `isolation-level=serializable`, BOTH
+options always, §9.2). It is a separate run mode, invoked directly —
+**there is no `--force` flag anywhere in this path, by construction
+(RB-2)**: a refused swap re-pins facts and recomputes, retrying up to a
+budget before failing loudly (`TransientError`, D-1's ordinary job-
+failure channel); the write is never issued past a refusal.
+
+```
+spine/spine/entrypoints/rebuild_main.py::main(argv) — a SEPARATE entrypoint
+from the Glue job's own glue_main.py (that composition hard-requires a
+seed/delivery event a rebuild invocation does not have). Reuses glue_main's
+own I-23 spec-URI allowlist and file:// / s3:// spec fetch (imported, not
+duplicated).
+
+Required argv (Terraform/operator-supplied, same --conveyer-<kebab> shape
+glue_main's own job args use):
+  --conveyer-pipeline               <pipeline slug, e.g. "pipelines/identity">
+  --conveyer-pipeline-spec-uri      <s3:// or file:// URI under .../spine/specs/<slug>/…>
+  --conveyer-artifacts-bucket       <pinned bucket name; s3:// pipeline-spec-uri must be in it (6pg.35 item 4)>
+  --conveyer-env                    <env name>
+  --conveyer-aws-region             <region>
+  --conveyer-catalog-kind           glue | hadoop
+  --conveyer-warehouse-uri          <hadoop only; omit for glue>
+  --conveyer-ledger-catalog-kind    glue | sql
+  --conveyer-ledger-sql-uri         <sql only; omit for glue>
+  --conveyer-spine-db               <ledger's Glue/SQL database name>
+  --conveyer-run-ledger-table       <run-ledger table name>
+
+A never-folded (virgin) state table converges too (M4, bead conveyer-
+swb.25): `rebuild_state_table` genesis-seeds it first, pushing an empty
+reduce of the fact table's own schema through the SAME `effects/spark.py::
+build_merge` closure production `RunnerFx.merge` uses (no second `MERGE
+INTO`/`.overwrite(` call site) — a zero-row MERGE still commits a real
+first Iceberg snapshot on this runtime, establishing the lineage §9.2's
+swap needs, then the normal swap proceeds. Bootstrap-record-tables' own
+DDL creation alone still carries no snapshot on its own; this run mode's
+own FIRST invocation against a bootstrapped-but-never-folded table is what
+now supplies one, in the SAME call, rather than requiring a prior ordinary
+fold or a hand-run genesis step first.
+
+Observability today (the interim, until 004.1's rebuild stage-vocabulary
+accretion lands, §16): one `stage="rebuild"` run-ledger row per swap
+attempt (`outcome="ok"|"failed"`, `error_type` the OBSERVED wrapped Iceberg
+exception class on a refusal) and a `RebuildSwapRetries` EMF metric per
+refused attempt, dimensioned by `pipeline` and `state_table`.
+```
+
+**The manual re-materialization step — discipline, and says so (§9.3).**
+`rebuild_main.main`'s successful return means every declared fact type's
+state table now reflects `fold(all facts)` — nothing more. No
+`RebuildCompletedV1` event exists yet (004.1's own proposed contract,
+`effects/rebuild.py`'s module docstring), so **this run mode announces
+nothing**: any downstream materialization outside spine's own state tables
+(in particular `domainDB`, or any other consumer that reads spine's state
+tables directly rather than reacting to an event) must be re-triggered BY
+HAND after a successful out-of-band rebuild — re-run whatever job/query
+populates it, the same way you would after any other out-of-band state
+change. A kill between a successful swap and this manual step leaves state
+already correct (§11's K-27 kill-matrix row) — only the announcement is
+stale, closed by re-running this step (or `rebuild_main.main` again:
+idempotent by content, §9.5).

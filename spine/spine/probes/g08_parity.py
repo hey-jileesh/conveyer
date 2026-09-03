@@ -21,7 +21,7 @@ STANDALONE probe it runs — no AWS mutation, no table I/O, no `spine.config`/
 engine (it never imports FROM `tests/`, only the other direction).
 
 `main()` builds its own `SparkSession` (`_build_session`, deliberately no
-`.master(...)` — the identical idiom `entrypoints/glue_main.py::_build_
+`.master(...)` — the identical idiom `entrypoints/session.py::build_
 session` documents: production Glue already provides a master; a bare local
 invocation falls back to pyspark's own `local[*]` default with no extra
 flags needed, verified empirically in the kernel), evaluates every vector in
@@ -90,6 +90,14 @@ _G08_SCHEMA = StructType(
         StructField("s", StringType(), True),
         StructField("ts", TimestampType(), True),
         StructField("ts2", TimestampType(), True),
+        # A006-4: decimal(38,0), precision-CAPPED -- the sole purpose of this
+        # column is `sum-decimal38-overflow-is-null-ansi-off` below (two
+        # 38-nines rows sum to a 39-digit value, which cannot widen further
+        # under the 38-digit cap; ANSI-off resolves that overflow to NULL
+        # rather than raising). Defaulted to `Decimal("0")` in `_G08_ROW` so
+        # every EXISTING scalar-position row (none of which reference this
+        # column) is untouched.
+        StructField("dec38", DecimalType(38, 0), True),
     ]
 )
 _G08_FAMILY: dict[str, cg.Family | None] = {
@@ -100,6 +108,7 @@ _G08_FAMILY: dict[str, cg.Family | None] = {
     "s": "string",
     "ts": "temporal",
     "ts2": "temporal",
+    "dec38": "numeric",
 }
 _G08_ROW = (
     5,
@@ -109,7 +118,19 @@ _G08_ROW = (
     "hello",
     datetime(2026, 1, 2, 3, 4, 5),
     datetime(2026, 1, 5, 3, 4, 5),
+    Decimal("0"),
 )
+_G08_COLUMNS = ("i", "j", "dec", "dec2", "s", "ts", "ts2", "dec38")
+
+
+def _row(**overrides: object) -> tuple[object, ...]:
+    """`_G08_ROW` with named column overrides -- the aggregate vectors'
+    OWN probe rows (§7.5/A006-4) need to vary exactly one or two columns
+    (a NULL `i`, a 38-nines `dec38`) while leaving the rest at their
+    ordinary default, without hand-repeating the whole 8-tuple per row."""
+    base = dict(zip(_G08_COLUMNS, _G08_ROW, strict=True))
+    base.update(overrides)
+    return tuple(base[name] for name in _G08_COLUMNS)
 
 
 @dataclass(frozen=True)
@@ -121,13 +142,24 @@ class ParityVector:
     for the handful of cases that are deliberately OUTSIDE the grammar
     (`bround`'s negative control; the bare `CAST(NULL AS int) <=> ...`
     null-safe-equality probe, which uses `CAST` outside the typed-literal
-    shape §6.1 restricts it to)."""
+    shape §6.1 restricts it to). `group=True` (A006-4, §6.3's aggregate
+    position): validates `expr` at `"aggregate"` position and evaluates it
+    via `df.agg(...)` rather than `df.select(...)` -- the shape every
+    aggregate-position member requires (a single reduced row, not one row
+    per input row). `rows` overrides the probe frame this vector runs
+    against: `None` (the default) is the shared single-row `_G08_ROW`
+    frame every scalar-position vector uses; `()` builds a genuinely EMPTY
+    frame (the empty-set aggregate discriminators); a non-empty tuple
+    supplies exactly those rows (e.g. one NULL-valued row alongside one
+    concrete row, for a NULL-skip discriminator)."""
 
     case_id: str
     expr: str
     expected: object
     kind: Literal["value", "dtype"] = "value"
     raw: bool = False
+    group: bool = False
+    rows: tuple[tuple[object, ...], ...] | None = None
 
 
 # G-08's executable allowlist semantics table, scalar position (A-15 idiom)
@@ -188,7 +220,51 @@ _SUPPLEMENTARY_VECTORS: tuple[ParityVector, ...] = (
     ParityVector("bround-bankers-no-scale-arg", "bround(1.245)", Decimal("1"), raw=True),
 )
 
-G08_VECTORS: tuple[ParityVector, ...] = _VALUE_VECTORS + _SUPPLEMENTARY_VECTORS
+# A006-4: §6.3's aggregate-position engine rows -- these need neither
+# `compile_aggregate` nor the 005 v1.x member grammar (P-6/K7's own
+# dormancy, which blocks the STRUCTURAL-compile-vs-`F.expr` fidelity claim
+# only, D006-1's own single remaining row); `_evaluate` already hands
+# `authored_text` to `F.expr`, so a `group=True` vector is exactly as
+# reachable as every scalar-position row above. This is also the engine
+# witness `entrypoints/glue_main.py::_assert_aggregate_dtype_exact` rests
+# on (K5).
+_ROWS_TWO_DEFAULT: tuple[tuple[object, ...], ...] = (_row(), _row(i=7))
+_ROWS_ONE_NULL_I: tuple[tuple[object, ...], ...] = (_row(i=5), _row(i=None))
+_ROWS_ALL_NULL_I: tuple[tuple[object, ...], ...] = (_row(i=None), _row(i=None))
+_DEC38_NINES = Decimal("9" * 38)
+_ROWS_DEC38_OVERFLOW: tuple[tuple[object, ...], ...] = (
+    _row(dec38=_DEC38_NINES),
+    _row(dec38=_DEC38_NINES),
+)
+
+_AGGREGATE_VECTORS: tuple[ParityVector, ...] = (
+    ParityVector("count-1-counts-rows", "count(1)", 2, group=True, rows=_ROWS_TWO_DEFAULT),
+    ParityVector("count-col-skips-null", "count(i)", 1, group=True, rows=_ROWS_ONE_NULL_I),
+    ParityVector("sum-empty-is-null", "sum(i)", None, group=True, rows=()),
+    ParityVector("min-empty-is-null", "min(i)", None, group=True, rows=()),
+    ParityVector("avg-decimal-stays-decimal", "avg(dec)", "decimal", kind="dtype", group=True),
+    ParityVector("avg-int-is-double", "avg(i)", "double", kind="dtype", group=True),
+    ParityVector(
+        "sum-int-div-count-is-double", "sum(i) / count(1)", "double", kind="dtype", group=True
+    ),
+    ParityVector(
+        "sum-decimal-div-count-is-decimal",
+        "sum(dec) / count(1)",
+        "decimal",
+        kind="dtype",
+        group=True,
+    ),
+    ParityVector("sum-all-null-column-is-null", "sum(i)", None, group=True, rows=_ROWS_ALL_NULL_I),
+    ParityVector(
+        "sum-decimal38-overflow-is-null-ansi-off",
+        "sum(dec38)",
+        None,
+        group=True,
+        rows=_ROWS_DEC38_OVERFLOW,
+    ),
+)
+
+G08_VECTORS: tuple[ParityVector, ...] = _VALUE_VECTORS + _SUPPLEMENTARY_VECTORS + _AGGREGATE_VECTORS
 
 
 @dataclass(frozen=True)
@@ -201,17 +277,36 @@ class ParityResult:
     error: str | None
 
 
-def _build_probe_df(spark: SparkSession) -> DataFrame:
-    return spark.createDataFrame([_G08_ROW], _G08_SCHEMA)
+def _build_probe_df(
+    spark: SparkSession, rows: tuple[tuple[object, ...], ...] | None = None
+) -> DataFrame:
+    """The default (scalar-position) probe frame is the single shared
+    `_G08_ROW`; `rows` (A006-4) overrides it -- `()` builds a genuinely
+    EMPTY frame (`createDataFrame` accepts an empty list given an explicit
+    schema), a non-empty tuple supplies exactly those rows."""
+    data = [_G08_ROW] if rows is None else list(rows)
+    return spark.createDataFrame(data, _G08_SCHEMA)
+
+
+def _probe_df_for(spark: SparkSession, vector: ParityVector) -> DataFrame:
+    """The frame `vector` should be evaluated against -- shared by
+    `run_probe` and `tests/frames/test_business_checks.py`'s own local
+    rehearsal, so both build the SAME per-vector frame (an aggregate vector
+    naming `rows=()`/a NULL-laden override must never silently fall back to
+    the shared single-row scalar frame)."""
+    return _build_probe_df(spark, vector.rows)
 
 
 def _authored_text(vector: ParityVector) -> str | None:
     """The text to hand `F.expr`, or `None` if grammar-gated and rejected
     (a probe-level failure in its own right — the deployed engine's grammar
-    gate must reject exactly what the local one does)."""
+    gate must reject exactly what the local one does). `group=True` vectors
+    validate at `"aggregate"` position (§6.3) -- every `group=True` row in
+    `G08_VECTORS` is, by construction, an aggregate-position member."""
     if vector.raw:
         return vector.expr
-    validated = cg.validate_expression(vector.expr, "scalar", _G08_FAMILY)
+    position: cg.Position = "aggregate" if vector.group else "scalar"
+    validated = cg.validate_expression(vector.expr, position, _G08_FAMILY)
     if not isinstance(validated, cg.ValidatedExpr):
         return None
     return validated.authored_text
@@ -224,10 +319,11 @@ def _evaluate(df: DataFrame, vector: ParityVector) -> ParityResult:
             vector.case_id, vector.expr, vector.expected, None, False, "grammar rejected"
         )
     compiled = F.expr(text).alias("v")
+    reduced = df.agg(compiled) if vector.group else df.select(compiled)
     if vector.kind == "dtype":
-        actual: object = df.select(compiled).schema["v"].dataType.typeName()
+        actual: object = reduced.schema["v"].dataType.typeName()
     else:
-        actual = df.select(compiled).collect()[0]["v"]
+        actual = reduced.collect()[0]["v"]
     return ParityResult(
         vector.case_id, vector.expr, vector.expected, actual, actual == vector.expected, None
     )
@@ -237,9 +333,11 @@ def run_probe(spark: SparkSession) -> list[ParityResult]:
     """Pure(-ish) evaluator over an already-live `SparkSession` — the seam
     `tests/unit/test_g08_parity_probe.py` calls directly against the shared
     `spark` fixture, and the same function `main()` below calls against a
-    freshly built (or Glue-adopted) session."""
-    df = _build_probe_df(spark)
-    return [_evaluate(df, vector) for vector in G08_VECTORS]
+    freshly built (or Glue-adopted) session. Each vector gets its OWN frame
+    (`_probe_df_for`) -- most share the one default scalar-position frame,
+    but the aggregate-position vectors (A006-4) each name their own `rows`
+    override (including the genuinely empty frame, `rows=()`)."""
+    return [_evaluate(_probe_df_for(spark, vector), vector) for vector in G08_VECTORS]
 
 
 def _print_report(results: list[ParityResult]) -> bool:
@@ -262,7 +360,7 @@ def _print_report(results: list[ParityResult]) -> bool:
 
 def _build_session() -> SparkSession:
     """No `.master(...)` set, deliberately — the same idiom `entrypoints/
-    glue_main.py::_build_session` documents: on Glue, the master is already
+    session.py::build_session` documents: on Glue, the master is already
     configured by the job's own bootstrap; run standalone (no active
     session/context anywhere in the process), pyspark falls back to its own
     `local[*]` default with no extra flags needed (verified in the kernel,

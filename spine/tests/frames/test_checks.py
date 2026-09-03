@@ -87,7 +87,18 @@ def _reason_detail_entries(reason_detail: str) -> list[dict]:
 # --- compile_contract: normative evaluation order (§6.1) --------------------
 
 
-def test_compile_contract_evaluation_order_is_row_major_column_minor() -> None:
+def test_compile_contract_evaluation_order_is_row_major_column_minor(
+    spark: SparkSession,
+) -> None:
+    """`spark` is requested but unused beyond forcing the session-scoped
+    fixture into existence BEFORE `compile_contract` runs (conveyer-swb.22
+    F-1): `compile_contract` builds `F.col(...)` expressions internally
+    (`checks.py::_typed_expr`), which needs an active `SparkContext` despite
+    never executing a DataFrame action — see `compile_contract`'s own
+    docstring. Without this, the test only passes when some OTHER test in
+    the same run already brought Spark up first (fixture-ordering coupling,
+    not a real fixture dependency); every other Spark-touching test in this
+    suite already declares `spark` itself for the identical reason."""
     contract = RawContractModel(
         columns=[
             ColumnSpec(name="a", type="int", nullable=False, min="1", max="10"),
@@ -115,7 +126,10 @@ def test_compile_contract_evaluation_order_is_row_major_column_minor() -> None:
     assert [e.column for e in cast_entries] == ["a", "b"]
 
 
-def test_compile_contract_omits_encoding_suspect_when_opted_out() -> None:
+def test_compile_contract_omits_encoding_suspect_when_opted_out(spark: SparkSession) -> None:
+    """`spark` forces the session-scoped fixture up first -- see
+    `test_compile_contract_evaluation_order_is_row_major_column_minor`'s
+    own docstring (conveyer-swb.22 F-1)."""
     contract = RawContractModel(columns=[ColumnSpec(name="a")], forbid_replacement_chars=False)
 
     compiled = checks.compile_contract(contract)
@@ -124,7 +138,10 @@ def test_compile_contract_omits_encoding_suspect_when_opted_out() -> None:
     assert compiled.entries[0].check_id == "malformed-row"
 
 
-def test_compile_contract_declared_columns_is_contract_order() -> None:
+def test_compile_contract_declared_columns_is_contract_order(spark: SparkSession) -> None:
+    """`spark` forces the session-scoped fixture up first -- see
+    `test_compile_contract_evaluation_order_is_row_major_column_minor`'s
+    own docstring (conveyer-swb.22 F-1)."""
     contract = RawContractModel(columns=[ColumnSpec(name="z"), ColumnSpec(name="a")])
 
     compiled = checks.compile_contract(contract)

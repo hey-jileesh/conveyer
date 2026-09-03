@@ -23,6 +23,7 @@ from spine.binding import Transforms
 from spine.core import run_facts
 from spine.core.checks import checks_version
 from spine.core.contract import check_version, read_spec_version
+from spine.core.delta import DELTA_PROBE_REFUSAL_REASONS
 from spine.core.model import PipelineSpecModel
 
 _T0 = datetime(2026, 7, 28, 10, 0, 0, tzinfo=UTC)
@@ -342,16 +343,19 @@ def test_commit_stage_singular_snapshot_id_is_none_on_multi_table_or_all_skip() 
     assert fact_skip.snapshot_id is None
 
 
-def test_commit_stage_delta_probe_refusal_projected_verbatim() -> None:
+@pytest.mark.parametrize("reason", sorted(DELTA_PROBE_REFUSAL_REASONS))
+def test_commit_stage_delta_probe_refusal_projected_verbatim(reason: str) -> None:
+    """A007-4/K-06: all four probe-refusal reasons project verbatim, not
+    just `none-with-key-match` (the only one previously exercised here)."""
     seed = _make_seed()
     after = dataclasses.replace(
         seed,
         facts_appended_by_table={"lake.orders__facts": 0},
         commit_snapshot_ids={},
-        delta_probe_refusal="none-with-key-match",
+        delta_probe_refusal=reason,
     )
     fact = run_facts.transition("commit", seed, after, _T0, _T1)
-    assert fact.delta_probe_refusal == "none-with-key-match"
+    assert fact.delta_probe_refusal == reason
 
 
 def test_fold_stage_fields_no_op_reports_zero_rows_merged() -> None:

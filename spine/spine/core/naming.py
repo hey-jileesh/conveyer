@@ -44,6 +44,17 @@ BATCH_ID_RE = r"^[0-9a-f]{8}-[0-9a-f]{4}-5[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]
 # against this identifier grammar. THE single source -- see module docstring.
 _IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
+# F-6 (security gate `wf_c9aadeb2-8eb`, LOW): the grammar above is
+# length-UNBOUNDED -- every rendered use is a validated/quoted identifier
+# (F.col, `qualified()`) or a Glue table/database name, and Glue itself
+# caps identifier length, so an over-long value fails closed rather than
+# reaching wrong data. The asymmetry with `ColumnSpec`/`FactColumnSpec`/
+# check-id (`core/model.py`, all `max_length=128`) still invites drift, so
+# `check_qualified_table` caps each dot-component at this length -- 255,
+# the AWS Glue Data Catalog table/database name limit (the more permissive
+# of the two ceilings a `<db>.<table>` value here can name).
+_MAX_IDENTIFIER_COMPONENT_LENGTH = 255
+
 # §5 "Pipeline slug" grammar, per segment: `^[a-z0-9]([a-z0-9]|-(?!-))*$` --
 # `--` forbidden inside a segment (makes `slug` injective, [S-11]). THE
 # single source -- see module docstring.
@@ -185,8 +196,9 @@ def table_slug(pipeline: str) -> str:
 
 def check_qualified_table(value: str) -> str:
     """Bare "<db>.<table>" (or deeper) identifier check: split on ".", every
-    non-empty component must match `_IDENTIFIER_RE`, and there must be at
-    least one dot (§6.2, §6.7). THE single source (see module docstring) --
+    non-empty component must match `_IDENTIFIER_RE`, be no longer than
+    `_MAX_IDENTIFIER_COMPONENT_LENGTH` (F-6), and there must be at least one
+    dot (§6.2, §6.7). THE single source (see module docstring) --
     `core/model.py` imports this rather than keeping its own copy (and
     `core/merge.py` in turn imports it from `core/model.py`, unaffected by
     this change).
@@ -201,6 +213,12 @@ def check_qualified_table(value: str) -> str:
     bad = [part for part in parts if not _IDENTIFIER_RE.fullmatch(part)]
     if bad:
         raise ValueError(f"invalid identifier component(s) in {value!r}: {bad!r}")
+    too_long = [part for part in parts if len(part) > _MAX_IDENTIFIER_COMPONENT_LENGTH]
+    if too_long:
+        raise ValueError(
+            f"identifier component(s) exceed {_MAX_IDENTIFIER_COMPONENT_LENGTH} chars "
+            f"in {value!r}: {too_long!r}"
+        )
     return value
 
 

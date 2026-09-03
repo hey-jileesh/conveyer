@@ -16,14 +16,19 @@ such**: C2 (co-effect table identifier grammar), F1/F4 (fact-type/column
 structural shape), K8 (`tolerance` decimal-literal grammar) all raise a
 bare pydantic `ValidationError` with no custom message -- there is nothing
 further to assert about the CODE for these, only that construction refuses.
-**Two rows resolve to a DIFFERENT §5 row's code, by construction, not by
-omission**: C1 ("duplicate-alias") is discharged entirely by S1's generic
-`duplicate-key` mechanism (verified: no literal "duplicate-alias" string
-exists anywhere in this package) -- exercised here at a `co_effects`-nested
-YAML position, same code as S1. K6's FIRST half ("check-reason-grammar")
-is bare pydantic `Field(pattern=BUSINESS_REASON_RE)` validation (no custom
-message either) -- only K6's second half (`check-reason-reserved`) has a
-distinct code string.
+The co-effect alias/column-name grammar (A006-8, §5.2 C1's "alias grammar"
+half and §4.3's `CoEffectDecl.columns` per-name grammar) is the SAME
+posture -- no distinct code, refusal only.
+
+**A006-9 naming-drift fix, landed by this same bead**: C1's "duplicate
+aliases" half now has its own distinct code, `duplicate-alias` --
+`_find_duplicate_co_effect_aliases` (`core/model.py`) cheaply distinguishes
+a duplicate key at exactly the `co_effects:` alias position from every
+other duplicate-key position (which still discharges through S1's generic
+`duplicate-key`, unchanged). K6's FIRST half ("check-reason-grammar") is
+likewise no longer a bare pydantic `Field(pattern=...)` violation -- a
+`@field_validator` now raises the named code ahead of K6's second half
+(`check-reason-reserved`).
 
 **F-10/[DC-1] (007.1's three proposed 006.1 erratum rows, landed in code by
 this same bead) are NOT §5 table rows** -- 006.1's own doc text was never
@@ -31,19 +36,45 @@ edited to add them, so they are outside this matrix's "every §5 code"
 scope by definition; `tests/unit/test_bind_checks.py` carries their own
 dedicated coverage (`co-effect-class-not-in-inventory`,
 `co-effect-table-class-drift`, `fact-type-removed-in-flight`).
+
+**`marker-table-missing` (critique gate wf_78ea4599-a5b F3, bead
+conveyer-swb.26) joins this same NOT-a-§5-row carve-out** -- exercised
+directly below (`validate_bindings`'s own `markers_table` param) AND at
+`entrypoints/glue_main.py::main`'s own grain (`tests/unit/test_glue_main.py::
+test_main_raises_pre_land_when_marker_table_missing`), proving the
+un-bootstrapped marker table now refuses PRE-LAND rather than only at
+commit (`effects/spark.py::_require_marker_table`'s retry-class
+`TransientError`).
+
+**§4.4's two `transform-defect/*` runtime codes (A006-1)** are exercised in
+their own section below, after §5.4 -- §5.5's own words ("the complete code
+table is the union of §5.1-§5.4's columns plus §4.4's two `transform-
+defect/*` runtime codes. Every code is exercised by G-09.") place them in
+this matrix's scope even though they are not §5-numbered rows.
 """
 
 from __future__ import annotations
 
+import uuid
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
 import pytest
 from pydantic import ValidationError
+from pyspark.sql.types import DateType, DecimalType, StringType, StructField, StructType
+from spine.binding import Transforms
+from spine.config import RunConfig
+from spine.context import BatchContext
 from spine.core import bind_checks, model, record
+from spine.core import naming as naming_module
+from spine.core.checks import checks_version
+from spine.core.contract import check_version, read_spec_version
 from spine.entrypoints import glue_main
+from spine.stages import apply as apply_stage
 
 if TYPE_CHECKING:
-    from pyspark.sql import SparkSession
+    from pyspark.sql import DataFrame, SparkSession
+    from spine.effects.records import RunnerFx
 
 _VALID_FACT_SCHEMA: dict[str, Any] = {
     "columns": [
@@ -149,10 +180,12 @@ def test_s4_stale_fold_export() -> None:
 # --- §5.2 co-effect checks (C1-C8) -------------------------------------------
 
 
-def test_c1_duplicate_alias_discharged_via_s1_duplicate_key() -> None:
-    # C1's own §5.2 label ("duplicate-alias") -- no distinct string exists;
-    # S1's generic loader mechanism catches it wherever it occurs, `co_effects:`
-    # included (module docstring's own note).
+def test_c1_duplicate_alias_raises_duplicate_alias() -> None:
+    # A006-9(b): C1's own §5.2 label ("duplicate-alias") is now a distinct
+    # code -- `_find_duplicate_co_effect_aliases` (`core/model.py`) cheaply
+    # distinguishes a duplicate key at exactly the `co_effects:` alias
+    # position from every OTHER duplicate-key position (still S1's generic
+    # `duplicate-key`, `test_s1_duplicate_key_top_level` above).
     text = """
 pipeline: pipelines/g09
 transforms_module: pipelines.g09.transforms
@@ -174,8 +207,29 @@ read:
 raw_contract:
   columns: [{name: id}]
 """
-    with pytest.raises(ValueError, match="bind-defect/duplicate-key"):
+    with pytest.raises(ValueError, match="bind-defect/duplicate-alias"):
         model.parse_pipeline_spec_yaml(text)
+
+
+def test_c1b_co_effect_alias_grammar() -> None:
+    # A006-8/§4.3: alias grammar, C1's OTHER half -- a single alias whose
+    # own shape is illegal (never mind duplication) refuses at parse.
+    with pytest.raises(ValidationError, match="bind-defect/co-effect-alias-grammar"):
+        model.PipelineSpecModel(
+            **{**_VALID_SPEC, "co_effects": {"Bad Alias!": {"table": "lake.rate_cards"}}}
+        )
+
+
+def test_c1c_co_effect_columns_grammar_is_bare_pydantic() -> None:
+    # A006-8/§4.3: `CoEffectDecl.columns`'s own per-name identifier grammar
+    # -- (pydantic) posture, same as C2 below: refusal only, no distinct code.
+    with pytest.raises(ValidationError):
+        model.PipelineSpecModel(
+            **{
+                **_VALID_SPEC,
+                "co_effects": {"rc": {"table": "lake.rate_cards", "columns": ["bad col"]}},
+            }
+        )
 
 
 def test_c2_co_effect_table_grammar_is_bare_pydantic() -> None:
@@ -184,6 +238,28 @@ def test_c2_co_effect_table_grammar_is_bare_pydantic() -> None:
     with pytest.raises(ValidationError):
         model.PipelineSpecModel(
             **{**_VALID_SPEC, "co_effects": {"rc": {"table": "not-a-qualified-table"}}}
+        )
+
+
+def test_f6_co_effect_alias_too_long() -> None:
+    # F-6 (security gate `wf_c9aadeb2-8eb`, LOW): alias grammar's own regex
+    # is length-unbounded -- same `bind-defect/co-effect-alias-grammar` code
+    # as the illegal-shape row above, now also refusing a >128-char alias.
+    with pytest.raises(ValidationError, match="bind-defect/co-effect-alias-grammar"):
+        model.PipelineSpecModel(
+            **{**_VALID_SPEC, "co_effects": {"a" * 129: {"table": "lake.rate_cards"}}}
+        )
+
+
+def test_f6_co_effect_columns_too_long_is_bare_pydantic() -> None:
+    # F-6's sibling cap on `CoEffectDecl.columns` -- same (pydantic) posture
+    # as C1c/C2 above: refusal only, no distinct code.
+    with pytest.raises(ValidationError):
+        model.PipelineSpecModel(
+            **{
+                **_VALID_SPEC,
+                "co_effects": {"rc": {"table": "lake.rate_cards", "columns": ["a" * 129]}},
+            }
         )
 
 
@@ -200,6 +276,32 @@ def test_c4_co_effect_not_current_state() -> None:
     facts = {"lake.rate_cards": bind_checks.TableFacts(table_class="raw", columns={})}
     defects = bind_checks.validate_bindings(
         spec, facts, bind_checks.TransformsMeta(False), {"lake.rate_cards": "raw"}, ()
+    )
+    assert [d.code for d in defects] == ["co-effect-not-current-state"]
+
+
+def test_c4_co_effect_quarantine_class_refused() -> None:
+    # A006-12: C4's own §5.2 code exercised over EVERY non-state table class
+    # named in the F-10 inventory (module docstring's "table_class_inventory
+    # is the AUTHORITY") -- raw and unmarked were already covered
+    # (`test_c4_co_effect_not_current_state`/`test_bind_checks.py`'s own
+    # unmarked case); quarantine was not.
+    spec = _spec(co_effects={"rc": {"table": "lake.rate_cards"}})
+    facts = {"lake.rate_cards": bind_checks.TableFacts(table_class="quarantine", columns={})}
+    defects = bind_checks.validate_bindings(
+        spec, facts, bind_checks.TransformsMeta(False), {"lake.rate_cards": "quarantine"}, ()
+    )
+    assert [d.code for d in defects] == ["co-effect-not-current-state"]
+
+
+def test_c4_co_effect_facts_class_refused() -> None:
+    # A006-12's facts-class variant -- a fact table itself declared as a
+    # co-effect (a fact table reading another pipeline's fact table, not its
+    # current-state table) is refused the same way.
+    spec = _spec(co_effects={"rc": {"table": "lake.rate_cards"}})
+    facts = {"lake.rate_cards": bind_checks.TableFacts(table_class="facts", columns={})}
+    defects = bind_checks.validate_bindings(
+        spec, facts, bind_checks.TransformsMeta(False), {"lake.rate_cards": "facts"}, ()
     )
     assert [d.code for d in defects] == ["co-effect-not-current-state"]
 
@@ -241,6 +343,31 @@ def test_c8_membership_columns_outside_declaration_bind_half() -> None:
     assert [d.code for d in defects] == ["membership-columns-outside-declaration"]
 
 
+# --- F-10/[DC-1]-adjacent (not a §5 row, module docstring's own carve-out): -
+# --- `marker-table-missing` (critique gate wf_78ea4599-a5b F3, bead --------
+# --- conveyer-swb.26) -------------------------------------------------------
+
+
+def test_marker_table_missing() -> None:
+    spec = _spec()
+    markers = naming_module.markers_table(spec.raw_table, spec.pipeline)
+    defects = bind_checks.validate_bindings(
+        spec, {}, bind_checks.TransformsMeta(False), {}, (), markers
+    )
+    assert [d.code for d in defects] == ["marker-table-missing"]
+    assert markers in defects[0].detail
+
+
+def test_marker_table_present_no_defect() -> None:
+    spec = _spec()
+    markers = naming_module.markers_table(spec.raw_table, spec.pipeline)
+    facts = {markers: bind_checks.TableFacts(table_class="markers", columns={})}
+    defects = bind_checks.validate_bindings(
+        spec, facts, bind_checks.TransformsMeta(False), {}, (), markers
+    )
+    assert defects == ()
+
+
 # --- §5.3 fact-schema checks (F1-F5) -----------------------------------------
 
 
@@ -257,7 +384,26 @@ def test_f2_fact_schema_unknown_column_ref() -> None:
 
 
 def test_f3_fact_column_reserved_name() -> None:
+    # F3's own §5.3 row: disjoint from the framework fact-stamp set
+    # (`record.py::FACT_STAMP_COLUMNS`) and the `_conveyer_` prefix --
+    # exhaustive coverage of both lives in `tests/unit/test_model.py`
+    # (`test_fact_schema_model_rejects_each_framework_stamp_column_name`/
+    # `..._rejects_conveyer_prefixed_column_name`); one representative case
+    # here for G-09.
+    stamp_name = next(iter(record.FACT_STAMP_COLUMNS))
     with pytest.raises(ValidationError, match="bind-defect/fact-column-reserved-name"):
+        model.FactSchemaModel(
+            columns=[{"name": stamp_name, "type": "string"}],
+            domain_id_col=stamp_name,
+            record_key=[stamp_name],
+        )
+
+
+def test_f3b_fact_column_duplicate_name() -> None:
+    # A006-9: duplicate declared column names are a DISTINCT uniqueness
+    # rule, not F3's reserved-name check -- `core/model.py`'s own
+    # `_check_columns` now raises a separate code for it.
+    with pytest.raises(ValidationError, match="bind-defect/fact-column-duplicate-name"):
         model.FactSchemaModel(
             columns=[{"name": "a", "type": "string"}, {"name": "a", "type": "string"}],
             domain_id_col="a",
@@ -354,15 +500,29 @@ def test_k5c_check_expression_inexact_type(spark: SparkSession) -> None:
         glue_main._assert_aggregate_dtype_exact(probe_df, "chk-1", "aggregate", "avg(qty)")
 
 
-def test_k6a_check_reason_grammar_is_bare_pydantic() -> None:
-    # K6's FIRST half only -- no custom code string exists for it.
-    with pytest.raises(ValidationError):
+def test_k6a_check_reason_grammar() -> None:
+    # A006-9: K6's FIRST half now has its own distinct code -- a
+    # `@field_validator` raises `check-reason-grammar` ahead of K6's second
+    # half (`check-reason-reserved`, below), rather than a bare pydantic
+    # `Field(pattern=...)` violation.
+    with pytest.raises(ValidationError, match="bind-defect/check-reason-grammar"):
         model.RowCheckModel(**{**_ROW_CHECK, "reason": "not-business-prefixed"})
 
 
 def test_k6b_check_reason_reserved() -> None:
     with pytest.raises(ValidationError, match="bind-defect/check-reason-reserved"):
         model.RowCheckModel(**{**_ROW_CHECK, "reason": "business/missing-domain-id"})
+
+
+def test_k6c_check_reason_too_long() -> None:
+    # F-6 (security gate `wf_c9aadeb2-8eb`, LOW): K6's grammar half was
+    # length-unbounded -- same 128-char cap `ColumnSpec.name`/check-id
+    # already carry, now a THIRD named half ahead of the grammar/reserved
+    # checks (checked first since `Field(max_length=...)` would otherwise
+    # pre-empt this function's own named code, same reasoning as A006-9's
+    # grammar half).
+    with pytest.raises(ValidationError, match="bind-defect/check-reason-too-long"):
+        model.RowCheckModel(**{**_ROW_CHECK, "reason": "business/" + "a" * 130})
 
 
 def test_k7_batch_check_awaiting_member_grammar() -> None:
@@ -395,3 +555,136 @@ def test_k9_check_expression_mixed_types() -> None:
         model.PipelineSpecModel(
             **{**_VALID_SPEC, "checks": {"checks": [{**_ROW_CHECK, "expr": "amount = 'x'"}]}}
         )
+
+
+# --- §4.4 runtime transform-defect codes (A006-1) ---------------------------
+#
+# `stages/apply.py`'s own runtime half of the return-shape law -- unlike
+# every check above, these two codes are raised by `apply.run` itself
+# (post-BIND, at STAGE time), never by a pydantic validator. Driven with a
+# real `Transforms(apply=<double>)` seed, the pattern `tests/integration/
+# test_stages_land_pre_pull_apply.py:455-478` already establishes for this
+# exact stage.
+
+
+def _g09_apply_ctx(spark: SparkSession, transforms: Transforms) -> BatchContext:
+    spec = _spec()
+    valid_df = spark.createDataFrame([], schema=StructType([StructField("id", StringType())]))
+    return BatchContext(
+        pipeline=spec.pipeline,
+        feed_id="feed/g09",
+        delivery_id=str(uuid.uuid4()),
+        batch_id="batch-1",
+        delivery_key="x.csv",
+        content_hash="sha256:" + "a" * 64,
+        object_uris=("s3://unused/x",),
+        received_at=datetime(2026, 1, 1, tzinfo=UTC),
+        spec=spec,
+        run=RunConfig(),
+        transforms=transforms,
+        attempt_id="attempt-1",
+        sfn_retry_count=0,
+        sfn_redrive_count=0,
+        read_spec_version=read_spec_version(spec.read),
+        check_version=check_version(spec.raw_contract, spec.read),
+        checks_version=checks_version(spec.checks),
+        valid_df=valid_df,
+        co_effects={},
+    )
+
+
+def test_g09_transform_defect_return_shape_missing_key(
+    spark: SparkSession, local_runner_fx: RunnerFx
+) -> None:
+    ctx = _g09_apply_ctx(spark, Transforms(apply=lambda valid_df, co_effects: {}))
+    with pytest.raises(
+        ValueError, match=r"transform-defect/return-shape: missing=\['detail'\] extra=\[\]"
+    ):
+        apply_stage.run(ctx, local_runner_fx)
+
+
+def test_g09_transform_defect_candidate_schema_missing_column(
+    spark: SparkSession, local_runner_fx: RunnerFx
+) -> None:
+    missing_schema = StructType(
+        [StructField("domain_id", StringType()), StructField("amount", DecimalType(10, 2))]
+    )
+    candidate: DataFrame = spark.createDataFrame([], schema=missing_schema)
+    ctx = _g09_apply_ctx(
+        spark, Transforms(apply=lambda valid_df, co_effects: {"detail": candidate})
+    )
+    with pytest.raises(
+        ValueError,
+        match=r"transform-defect/candidate-schema: fact_type='detail' diff=missing=\['period'\]",
+    ):
+        apply_stage.run(ctx, local_runner_fx)
+
+
+def test_g09_transform_defect_candidate_schema_extra_column(
+    spark: SparkSession, local_runner_fx: RunnerFx
+) -> None:
+    extra_schema = StructType(
+        [
+            StructField("domain_id", StringType()),
+            StructField("amount", DecimalType(10, 2)),
+            StructField("period", DateType()),
+            StructField("bogus", StringType()),
+        ]
+    )
+    candidate: DataFrame = spark.createDataFrame([], schema=extra_schema)
+    ctx = _g09_apply_ctx(
+        spark, Transforms(apply=lambda valid_df, co_effects: {"detail": candidate})
+    )
+    with pytest.raises(
+        ValueError,
+        match=r"transform-defect/candidate-schema: fact_type='detail' diff=extra=\['bogus'\]",
+    ):
+        apply_stage.run(ctx, local_runner_fx)
+
+
+def test_g09_transform_defect_candidate_schema_type_mismatch(
+    spark: SparkSession, local_runner_fx: RunnerFx
+) -> None:
+    mismatch_schema = StructType(
+        [
+            StructField("domain_id", StringType()),
+            StructField("amount", StringType()),  # declared decimal(10,2)
+            StructField("period", DateType()),
+        ]
+    )
+    candidate: DataFrame = spark.createDataFrame([], schema=mismatch_schema)
+    ctx = _g09_apply_ctx(
+        spark, Transforms(apply=lambda valid_df, co_effects: {"detail": candidate})
+    )
+    with pytest.raises(
+        ValueError,
+        match=(
+            r"transform-defect/candidate-schema: fact_type='detail' "
+            r"diff=type_mismatch=\[\"amount: expected='decimal\(10,2\)' actual='string'\"\]"
+        ),
+    ):
+        apply_stage.run(ctx, local_runner_fx)
+
+
+def test_g09_transform_defect_nullable_only_diff_does_not_raise(
+    spark: SparkSession, local_runner_fx: RunnerFx
+) -> None:
+    # The nullability-ignored rule: `FactColumnSpec` carries no nullability
+    # of its own, so a candidate frame whose declared columns/types match
+    # but whose Spark `nullable` flags differ must NOT raise.
+    nullable_schema = StructType(
+        [
+            StructField("domain_id", StringType(), nullable=False),
+            StructField("amount", DecimalType(10, 2), nullable=False),
+            StructField("period", DateType(), nullable=False),
+        ]
+    )
+    candidate: DataFrame = spark.createDataFrame([], schema=nullable_schema)
+    ctx = _g09_apply_ctx(
+        spark, Transforms(apply=lambda valid_df, co_effects: {"detail": candidate})
+    )
+
+    after = apply_stage.run(ctx, local_runner_fx)
+
+    assert after.candidate_facts is not None
+    assert after.candidate_facts["detail"].schema == nullable_schema

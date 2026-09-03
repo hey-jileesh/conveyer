@@ -26,6 +26,7 @@ shared across every parametrized case."""
 
 from __future__ import annotations
 
+import pytest
 import sqlglot
 from hypothesis import given, settings
 from hypothesis import strategies as st
@@ -41,10 +42,28 @@ _SCHEMA: dict[str, cg.Family | None] = {
 }
 
 
-def _accept(text: str, position: cg.Position = "scalar") -> cg.ValidatedExpr:
+def _node_kinds(text: str) -> frozenset[type]:
+    """[EM-2]/A006-3: the exact set of node TYPES anywhere in the parse tree
+    (deduplicated, not a multiset) -- pinning the SHAPE an admitted
+    construct parses into, not merely its accept verdict, so a sqlglot bump
+    that re-shapes an admitted construct (even between two already-admitted
+    node kinds) fails this corpus at the shape."""
+    tree = sqlglot.parse_one(text, dialect="spark")
+    return frozenset(type(node) for node in tree.walk())
+
+
+def _accept(
+    text: str, position: cg.Position = "scalar", nodes: frozenset[type] | None = None
+) -> cg.ValidatedExpr:
     result = cg.validate_expression(text, position, _SCHEMA)
     assert isinstance(result, cg.ValidatedExpr), f"expected accept, got {result!r}"
     assert result.authored_text == text  # [EM-6][AE-2]: executed-text identity
+    if nodes is not None:
+        actual = _node_kinds(text)
+        assert actual == nodes, (
+            f"{text!r}: node set drifted -- expected "
+            f"{sorted(c.__name__ for c in nodes)}, got {sorted(c.__name__ for c in actual)}"
+        )
     return result
 
 
@@ -112,140 +131,274 @@ def test_em1_scientific_notation_literal_shares_node_kind_with_plain_decimal() -
 
 
 def test_accept_column_and_comparisons() -> None:
-    for text in [
-        "amount > 5",
-        "amount >= 5",
-        "amount < 5",
-        "amount <= 5",
-        "amount != 5",
-        "amount = 5",
+    for text, op in [
+        ("amount > 5", exp.GT),
+        ("amount >= 5", exp.GTE),
+        ("amount < 5", exp.LT),
+        ("amount <= 5", exp.LTE),
+        ("amount != 5", exp.NEQ),
+        ("amount = 5", exp.EQ),
     ]:
-        result = _accept(text)
+        result = _accept(text, nodes=frozenset({exp.Column, exp.Identifier, exp.Literal, op}))
         assert result.family == "boolean"
         assert result.referenced_columns == frozenset({"amount"})
 
 
 def test_accept_null_safe_eq() -> None:
-    assert _accept("amount <=> qty").family == "boolean"
+    nodes = frozenset({exp.Column, exp.Identifier, exp.NullSafeEQ})
+    assert _accept("amount <=> qty", nodes=nodes).family == "boolean"
 
 
 def test_accept_boolean_connectives() -> None:
-    assert _accept("flag AND amount > 0").family == "boolean"
-    assert _accept("flag OR amount > 0").family == "boolean"
-    assert _accept("NOT flag").family == "boolean"
+    assert (
+        _accept(
+            "flag AND amount > 0",
+            nodes=frozenset({exp.And, exp.Column, exp.GT, exp.Identifier, exp.Literal}),
+        ).family
+        == "boolean"
+    )
+    assert (
+        _accept(
+            "flag OR amount > 0",
+            nodes=frozenset({exp.Column, exp.GT, exp.Identifier, exp.Literal, exp.Or}),
+        ).family
+        == "boolean"
+    )
+    assert (
+        _accept("NOT flag", nodes=frozenset({exp.Column, exp.Identifier, exp.Not})).family
+        == "boolean"
+    )
 
 
 def test_accept_null_tests() -> None:
-    assert _accept("amount IS NULL").family == "boolean"
-    assert _accept("amount IS NOT NULL").family == "boolean"
+    assert (
+        _accept(
+            "amount IS NULL", nodes=frozenset({exp.Column, exp.Identifier, exp.Is, exp.Null})
+        ).family
+        == "boolean"
+    )
+    assert (
+        _accept(
+            "amount IS NOT NULL",
+            nodes=frozenset({exp.Column, exp.Identifier, exp.Is, exp.Not, exp.Null}),
+        ).family
+        == "boolean"
+    )
 
 
 def test_accept_in_and_between() -> None:
-    assert _accept("amount IN (1, 2, 3)").family == "boolean"
-    assert _accept("amount BETWEEN 1 AND 10").family == "boolean"
-    assert _accept("amount NOT BETWEEN 1 AND 10").family == "boolean"
-    assert _accept("amount NOT IN (1, 2, 3)").family == "boolean"
+    assert (
+        _accept(
+            "amount IN (1, 2, 3)",
+            nodes=frozenset({exp.Column, exp.Identifier, exp.In, exp.Literal}),
+        ).family
+        == "boolean"
+    )
+    assert (
+        _accept(
+            "amount BETWEEN 1 AND 10",
+            nodes=frozenset({exp.Between, exp.Column, exp.Identifier, exp.Literal}),
+        ).family
+        == "boolean"
+    )
+    assert (
+        _accept(
+            "amount NOT BETWEEN 1 AND 10",
+            nodes=frozenset({exp.Between, exp.Column, exp.Identifier, exp.Literal, exp.Not}),
+        ).family
+        == "boolean"
+    )
+    assert (
+        _accept(
+            "amount NOT IN (1, 2, 3)",
+            nodes=frozenset({exp.Column, exp.Identifier, exp.In, exp.Literal, exp.Not}),
+        ).family
+        == "boolean"
+    )
 
 
 def test_accept_like() -> None:
-    assert _accept("name LIKE 'x%'").family == "boolean"
+    nodes = frozenset({exp.Column, exp.Identifier, exp.Like, exp.Literal})
+    assert _accept("name LIKE 'x%'", nodes=nodes).family == "boolean"
 
 
 def test_accept_typed_literals_both_spellings() -> None:
-    # [EM-1]: both typed-literal spellings accepted.
+    # [EM-1]: both typed-literal spellings accepted -- same node set for
+    # every spelling of both DATE and TIMESTAMP.
+    expected = frozenset({exp.Cast, exp.Column, exp.DataType, exp.EQ, exp.Identifier, exp.Literal})
     for text in (
         "seen_at = DATE '2026-01-01'",
         "seen_at = date('2026-01-01')",
         "seen_at = TIMESTAMP '2026-01-01 00:00:00'",
         "seen_at = timestamp('2026-01-01 00:00:00')",
     ):
-        assert _accept(text).family == "boolean"
+        assert _accept(text, nodes=expected).family == "boolean"
 
 
 def test_accept_arithmetic() -> None:
-    for text in [
-        "amount + qty > 0",
-        "amount - qty > 0",
-        "amount * qty > 0",
-        "amount / qty > 0",
-        "amount % qty = 0",
+    for text, op, cmp_kind in [
+        ("amount + qty > 0", exp.Add, exp.GT),
+        ("amount - qty > 0", exp.Sub, exp.GT),
+        ("amount * qty > 0", exp.Mul, exp.GT),
+        ("amount / qty > 0", exp.Div, exp.GT),
+        ("amount % qty = 0", exp.Mod, exp.EQ),
     ]:
-        assert _accept(text).family == "boolean"
+        nodes = frozenset({exp.Column, exp.Identifier, exp.Literal, op, cmp_kind})
+        assert _accept(text, nodes=nodes).family == "boolean"
 
 
 def test_accept_case_coalesce_nullif() -> None:
-    assert _accept("CASE WHEN amount > 0 THEN 1 ELSE 0 END = 1").family == "boolean"
-    assert _accept("coalesce(name, 'x') = 'x'").family == "boolean"
-    assert _accept("nvl(name, 'x') = 'x'").family == "boolean"
-    assert _accept("ifnull(name, 'x') = 'x'").family == "boolean"
-    assert _accept("nullif(amount, 0) IS NULL").family == "boolean"
+    assert (
+        _accept(
+            "CASE WHEN amount > 0 THEN 1 ELSE 0 END = 1",
+            nodes=frozenset(
+                {exp.Case, exp.Column, exp.EQ, exp.GT, exp.Identifier, exp.If, exp.Literal}
+            ),
+        ).family
+        == "boolean"
+    )
+    coalesce_nodes = frozenset({exp.Coalesce, exp.Column, exp.EQ, exp.Identifier, exp.Literal})
+    assert _accept("coalesce(name, 'x') = 'x'", nodes=coalesce_nodes).family == "boolean"
+    assert _accept("nvl(name, 'x') = 'x'", nodes=coalesce_nodes).family == "boolean"
+    assert _accept("ifnull(name, 'x') = 'x'", nodes=coalesce_nodes).family == "boolean"
+    assert (
+        _accept(
+            "nullif(amount, 0) IS NULL",
+            nodes=frozenset(
+                {exp.Column, exp.Identifier, exp.Is, exp.Literal, exp.Null, exp.Nullif}
+            ),
+        ).family
+        == "boolean"
+    )
 
 
 def test_accept_numeric_functions() -> None:
-    for text in [
-        "abs(amount) > 0",
-        "round(amount) > 0",
-        "round(amount, 2) > 0",
-        "floor(amount) > 0",
-        "ceil(amount) > 0",
-        "greatest(amount, qty) > 0",
-        "least(amount, qty) > 0",
+    for text, kind in [
+        ("abs(amount) > 0", exp.Abs),
+        ("round(amount) > 0", exp.Round),
+        ("round(amount, 2) > 0", exp.Round),
+        ("floor(amount) > 0", exp.Floor),
+        ("ceil(amount) > 0", exp.Ceil),
+        ("greatest(amount, qty) > 0", exp.Greatest),
+        ("least(amount, qty) > 0", exp.Least),
     ]:
-        assert _accept(text).family == "boolean"
+        nodes = frozenset({exp.Column, exp.GT, exp.Identifier, exp.Literal, kind})
+        assert _accept(text, nodes=nodes).family == "boolean"
 
 
 def test_accept_string_functions() -> None:
-    for text in [
-        "length(name) > 0",
-        "trim(name) = name",
-        "ltrim(name) = name",
-        "rtrim(name) = name",
-        "upper(name) = name",
-        "lower(name) = name",
-        "substring(name, 1, 2) = name",
-        "substring(name, 1) = name",
-        "concat(name, name) = name",
-        "replace(name, 'a', 'b') = name",
+    for text, nodes in [
+        (
+            "length(name) > 0",
+            frozenset({exp.Column, exp.GT, exp.Identifier, exp.Length, exp.Literal}),
+        ),
+        ("trim(name) = name", frozenset({exp.Column, exp.EQ, exp.Identifier, exp.Trim})),
+        ("ltrim(name) = name", frozenset({exp.Column, exp.EQ, exp.Identifier, exp.Trim})),
+        ("rtrim(name) = name", frozenset({exp.Column, exp.EQ, exp.Identifier, exp.Trim})),
+        ("upper(name) = name", frozenset({exp.Column, exp.EQ, exp.Identifier, exp.Upper})),
+        ("lower(name) = name", frozenset({exp.Column, exp.EQ, exp.Identifier, exp.Lower})),
+        (
+            "substring(name, 1, 2) = name",
+            frozenset({exp.Column, exp.EQ, exp.Identifier, exp.Literal, exp.Substring}),
+        ),
+        (
+            "substring(name, 1) = name",
+            frozenset({exp.Column, exp.EQ, exp.Identifier, exp.Literal, exp.Substring}),
+        ),
+        ("concat(name, name) = name", frozenset({exp.Column, exp.Concat, exp.EQ, exp.Identifier})),
+        (
+            "replace(name, 'a', 'b') = name",
+            frozenset({exp.Column, exp.EQ, exp.Identifier, exp.Literal, exp.Replace}),
+        ),
     ]:
-        assert _accept(text).family == "boolean"
+        assert _accept(text, nodes=nodes).family == "boolean"
 
 
 def test_accept_temporal_functions() -> None:
-    for text in [
-        "year(seen_at) = 2026",
-        "month(seen_at) = 1",
-        "day(seen_at) = 1",
-        "datediff(seen_at, seen_at) = 0",
-        "date_add(seen_at, 5) = seen_at",
-        "date_sub(seen_at, 5) = seen_at",
+    for text, nodes in [
+        (
+            "year(seen_at) = 2026",
+            frozenset(
+                {exp.Column, exp.EQ, exp.Identifier, exp.Literal, exp.TsOrDsToDate, exp.Year}
+            ),
+        ),
+        (
+            "month(seen_at) = 1",
+            frozenset(
+                {exp.Column, exp.EQ, exp.Identifier, exp.Literal, exp.Month, exp.TsOrDsToDate}
+            ),
+        ),
+        (
+            "day(seen_at) = 1",
+            frozenset({exp.Column, exp.Day, exp.EQ, exp.Identifier, exp.Literal, exp.TsOrDsToDate}),
+        ),
+        (
+            "datediff(seen_at, seen_at) = 0",
+            frozenset(
+                {exp.Column, exp.DateDiff, exp.EQ, exp.Identifier, exp.Literal, exp.TsOrDsToDate}
+            ),
+        ),
+        (
+            "date_add(seen_at, 5) = seen_at",
+            frozenset({exp.Column, exp.EQ, exp.Identifier, exp.Literal, exp.TsOrDsAdd, exp.Var}),
+        ),
+        (
+            "date_sub(seen_at, 5) = seen_at",
+            frozenset(
+                {
+                    exp.Column,
+                    exp.EQ,
+                    exp.Identifier,
+                    exp.Literal,
+                    exp.Mul,
+                    exp.Neg,
+                    exp.TsOrDsAdd,
+                    exp.Var,
+                }
+            ),
+        ),
     ]:
-        assert _accept(text).family == "boolean"
+        assert _accept(text, nodes=nodes).family == "boolean"
 
 
 def test_accept_referenced_columns_union_across_a_multi_column_expression() -> None:
-    result = _accept("amount > 0 AND name = 'x' AND flag")
+    result = _accept(
+        "amount > 0 AND name = 'x' AND flag",
+        nodes=frozenset({exp.And, exp.Column, exp.EQ, exp.GT, exp.Identifier, exp.Literal}),
+    )
     assert result.referenced_columns == frozenset({"amount", "name", "flag"})
 
 
 def test_accept_parentheses() -> None:
-    assert _accept("(amount > 0) AND flag").family == "boolean"
+    nodes = frozenset({exp.And, exp.Column, exp.GT, exp.Identifier, exp.Literal, exp.Paren})
+    assert _accept("(amount > 0) AND flag", nodes=nodes).family == "boolean"
 
 
 def test_accept_aggregate_position_members() -> None:
-    for text in [
-        "sum(amount) > 0",
-        "count(1) > 0",
-        "count(amount) > 0",
-        "avg(amount) > 0",
-        "min(seen_at) IS NOT NULL",
-        "max(seen_at) IS NOT NULL",
+    for text, nodes in [
+        ("sum(amount) > 0", frozenset({exp.Column, exp.GT, exp.Identifier, exp.Literal, exp.Sum})),
+        ("count(1) > 0", frozenset({exp.Count, exp.GT, exp.Literal})),
+        (
+            "count(amount) > 0",
+            frozenset({exp.Column, exp.Count, exp.GT, exp.Identifier, exp.Literal}),
+        ),
+        ("avg(amount) > 0", frozenset({exp.Avg, exp.Column, exp.GT, exp.Identifier, exp.Literal})),
+        (
+            "min(seen_at) IS NOT NULL",
+            frozenset({exp.Column, exp.Identifier, exp.Is, exp.Min, exp.Not, exp.Null}),
+        ),
+        (
+            "max(seen_at) IS NOT NULL",
+            frozenset({exp.Column, exp.Identifier, exp.Is, exp.Max, exp.Not, exp.Null}),
+        ),
     ]:
-        assert _accept(text, "aggregate").family == "boolean"
+        assert _accept(text, "aggregate", nodes=nodes).family == "boolean"
 
 
 def test_accept_aggregate_combined_with_scalar_arithmetic() -> None:
-    assert _accept("sum(amount) + sum(qty) > 0", "aggregate").family == "boolean"
-    assert _accept("sum(amount) + 5 > 0", "aggregate").family == "boolean"
+    nodes = frozenset({exp.Add, exp.Column, exp.GT, exp.Identifier, exp.Literal, exp.Sum})
+    assert _accept("sum(amount) + sum(qty) > 0", "aggregate", nodes=nodes).family == "boolean"
+    assert _accept("sum(amount) + 5 > 0", "aggregate", nodes=nodes).family == "boolean"
 
 
 # --- reject corpus: every named non-member, per §13.1's own enumeration ----
@@ -451,6 +604,338 @@ def test_dc3_aggregate_argument_family() -> None:
     assert _reject("avg(flag) > 0", "aggregate").code == "check-expression-mixed-types"
 
 
+def test_dc3_not_requires_boolean_operand() -> None:
+    # A006-2's own named gap: NOT's boolean operand had no cross-family
+    # reject row (the accept side is `test_accept_boolean_connectives`).
+    assert _reject("NOT amount").code == "check-expression-mixed-types"
+
+
+# --- [DC-3] A006-2: the per-function, PER-ARGUMENT-POSITION signature
+# corpus -- the one normative home of the family signatures encoded in
+# check_grammar.py's handlers (P-9 Y-note [DC-3]; §6.4; §6.5 rule 1; §13.1
+# G-07: "no prose signature table exists, deliberately"). One row per
+# (function, argument position): `accept_text` is a signature-conforming
+# call, `reject_text` swaps EXACTLY that position's argument to a
+# cross-family column (`_SCHEMA`'s own `name`/`amount`/`qty`/`flag`/
+# `seen_at`) and must trip `check-expression-mixed-types`. `reject_text is
+# None` for the three aggregate members (`count`/`min`/`max`) whose
+# argument is STRUCTURALLY family-unrestricted by design (§7.5's
+# reconciliation ground) -- no cross-family violation exists to author,
+# documented here rather than faked. The function set below is tied to
+# `check_grammar`'s own data module (the completeness assertion just below)
+# so this corpus cannot silently drift from `SCALAR_FUNCTION_NAMES`/
+# `AGGREGATE_FUNCTION_NAMES` as either side grows.
+_DC3_SIGNATURE_CORPUS: tuple[tuple[str, int, str, str | None, cg.Position], ...] = (
+    ("abs", 1, "abs(amount) > 0", "abs(name) > 0", "scalar"),
+    ("round", 1, "round(amount, 2) > 0", "round(name, 2) > 0", "scalar"),
+    ("round", 2, "round(amount, 2) > 0", "round(amount, name) > 0", "scalar"),
+    ("floor", 1, "floor(amount) > 0", "floor(name) > 0", "scalar"),
+    ("ceil", 1, "ceil(amount) > 0", "ceil(name) > 0", "scalar"),
+    ("greatest", 1, "greatest(amount, qty) > 0", "greatest(amount, name)", "scalar"),
+    ("least", 1, "least(amount, qty) > 0", "least(amount, name)", "scalar"),
+    ("length", 1, "length(name) > 0", "length(amount) > 0", "scalar"),
+    ("trim", 1, "trim(name) = name", "trim(amount) = name", "scalar"),
+    ("ltrim", 1, "ltrim(name) = name", "ltrim(amount) = name", "scalar"),
+    ("rtrim", 1, "rtrim(name) = name", "rtrim(amount) = name", "scalar"),
+    ("upper", 1, "upper(name) = name", "upper(amount) = name", "scalar"),
+    ("lower", 1, "lower(name) = name", "lower(amount) = name", "scalar"),
+    ("substring", 1, "substring(name, 1, 2) = name", "substring(amount, 1, 2) = name", "scalar"),
+    ("substring", 2, "substring(name, 1) = name", "substring(name, name) = name", "scalar"),
+    ("substring", 3, "substring(name, 1, 2) = name", "substring(name, 1, name) = name", "scalar"),
+    ("concat", 1, "concat(name, name) = name", "concat(amount, name) = name", "scalar"),
+    ("replace", 1, "replace(name, 'a', 'b') = name", "replace(amount, 'a', 'b') = name", "scalar"),
+    ("replace", 2, "replace(name, 'a', 'b') = name", "replace(name, amount, 'b') = name", "scalar"),
+    ("replace", 3, "replace(name, 'a', 'b') = name", "replace(name, 'a', amount) = name", "scalar"),
+    ("coalesce", 1, "coalesce(name, name) = name", "coalesce(amount, 'x')", "scalar"),
+    ("nvl", 1, "nvl(name, 'x') = 'x'", "nvl(amount, 'x')", "scalar"),
+    ("ifnull", 1, "ifnull(name, 'x') = 'x'", "ifnull(amount, 'x')", "scalar"),
+    ("nullif", 1, "nullif(amount, qty) = amount", "nullif(amount, name)", "scalar"),
+    ("year", 1, "year(seen_at) = 2026", "year(amount) = 2026", "scalar"),
+    ("month", 1, "month(seen_at) = 1", "month(amount) = 1", "scalar"),
+    ("day", 1, "day(seen_at) = 1", "day(amount) = 1", "scalar"),
+    ("datediff", 1, "datediff(seen_at, seen_at) = 0", "datediff(amount, seen_at) = 0", "scalar"),
+    ("datediff", 2, "datediff(seen_at, seen_at) = 0", "datediff(seen_at, amount) = 0", "scalar"),
+    ("date_add", 1, "date_add(seen_at, 5) = seen_at", "date_add(amount, 5) = seen_at", "scalar"),
+    (
+        "date_add",
+        2,
+        "date_add(seen_at, 5) = seen_at",
+        "date_add(seen_at, name) = seen_at",
+        "scalar",
+    ),
+    ("date_sub", 1, "date_sub(seen_at, 5) = seen_at", "date_sub(amount, 5) = seen_at", "scalar"),
+    (
+        "date_sub",
+        2,
+        "date_sub(seen_at, 5) = seen_at",
+        "date_sub(seen_at, name) = seen_at",
+        "scalar",
+    ),
+    ("sum", 1, "sum(amount) > 0", "sum(name) > 0", "aggregate"),
+    ("avg", 1, "avg(amount) > 0", "avg(flag) > 0", "aggregate"),
+    ("count", 1, "count(amount) > 0", None, "aggregate"),
+    ("min", 1, "min(seen_at) IS NOT NULL", None, "aggregate"),
+    ("max", 1, "max(seen_at) IS NOT NULL", None, "aggregate"),
+)
+
+
+@pytest.mark.parametrize(
+    "function,position_index,accept_text,reject_text,position",
+    _DC3_SIGNATURE_CORPUS,
+    ids=[f"{row[0]}-arg{row[1]}" for row in _DC3_SIGNATURE_CORPUS],
+)
+def test_dc3_signature_corpus_per_function_per_argument_position(
+    function: str,
+    position_index: int,
+    accept_text: str,
+    reject_text: str | None,
+    position: cg.Position,
+) -> None:
+    result = cg.validate_expression(accept_text, position, _SCHEMA)
+    assert isinstance(result, cg.ValidatedExpr), f"{function} arg{position_index}: {result!r}"
+    if reject_text is not None:
+        rejected = cg.validate_expression(reject_text, position, _SCHEMA)
+        assert isinstance(rejected, cg.GrammarDefect), (
+            f"{function} arg{position_index}: {rejected!r}"
+        )
+        assert rejected.code == "check-expression-mixed-types"
+
+
+def test_dc3_signature_corpus_covers_every_function() -> None:
+    # The completeness assertion: the corpus's own function set is EXACTLY
+    # the data module's (`SCALAR_FUNCTION_NAMES`/`AGGREGATE_FUNCTION_NAMES`)
+    # -- neither side can silently drift from the other.
+    corpus_functions = {row[0] for row in _DC3_SIGNATURE_CORPUS}
+    assert corpus_functions == cg.SCALAR_FUNCTION_NAMES | cg.AGGREGATE_FUNCTION_NAMES
+
+
+def test_dc3_corpus_reject_rows_required_for_every_concrete_arg_family() -> None:
+    # [M5 critique fix]: the corpus's per-position reject/no-reject choice
+    # is checked against `FunctionEntry.arg_families` so it cannot silently
+    # drift from that data module -- every position declared as a CONCRETE
+    # family (not the `None` "polymorphic" marker) must have a corpus row
+    # proving a cross-family swap at that position is refused. Only the
+    # forward direction is asserted: a `None` arg_family covers two
+    # semantically different cases `FunctionEntry` does not itself
+    # distinguish -- structurally-unrestricted (`count`/`min`/`max`'s
+    # argument, no cross-family violation exists to author) and
+    # homogeneous-but-must-unify-with-siblings (`greatest`/`least`/
+    # `coalesce`/`nvl`/`ifnull`/`nullif`, which DO have a real reject row) --
+    # so the absence of a declared family does not, by itself, predict
+    # whether a reject row should exist.
+    entry_by_name = {e.name: e for e in cg.SCALAR_FUNCTIONS} | {
+        e.name: e for e in cg.AGGREGATE_FUNCTIONS
+    }
+    for function, position_index, _accept_text, reject_text, _position in _DC3_SIGNATURE_CORPUS:
+        entry = entry_by_name[function]
+        declared_family = entry.arg_families[position_index - 1]
+        if declared_family is not None:
+            assert reject_text is not None, (
+                f"{function} arg{position_index} is declared {declared_family!r} in "
+                "FunctionEntry.arg_families but the corpus has no cross-family reject row"
+            )
+
+
+# --- [M5 critique fix] one arity-violation row per function, tied to
+# `FunctionEntry.arity` -- every allowlisted function's declared (min, max)
+# argument-count bound is proven refused OUTSIDE that bound by an executed
+# row, not merely asserted from the data module's own (until now
+# unverified) `arity` field. Several rows double as regression pins for
+# hidden-extra-argument-field holes this derivation itself found and fixed
+# in `check_grammar.py`: `count`/`min`/`max` never checked their shared
+# `expressions` field (silently admitting a second, even cross-family,
+# argument -- `min(seen_at, amount)` used to validate clean) and
+# `substring` never checked its `zero_start` 4th field (silently admitting
+# a fully UNVALIDATED 4th argument, including a bare column reference).
+# `reject_text` is `check-expression-rejected` in every row -- both a
+# native sqlglot `ParseError` (converted by `_parse_expression`) and a
+# handler-level hidden-field refusal use that same code, so the corpus
+# needs no separate "how it failed" column.
+_DC3_ARITY_CORPUS: tuple[tuple[str, str, cg.Position], ...] = (
+    ("abs", "abs(amount, qty) > 0", "scalar"),
+    ("round", "round(amount, 2, 3) > 0", "scalar"),
+    ("floor", "floor(amount, 2) > 0", "scalar"),
+    ("ceil", "ceil(amount, 2) > 0", "scalar"),
+    ("greatest", "greatest() > 0", "scalar"),
+    ("least", "least() > 0", "scalar"),
+    ("length", "length(name, 2) > 0", "scalar"),
+    ("trim", "trim(name, name) = name", "scalar"),
+    ("ltrim", "ltrim(name, name) = name", "scalar"),
+    ("rtrim", "rtrim(name, name) = name", "scalar"),
+    ("upper", "upper(name, name) = name", "scalar"),
+    ("lower", "lower(name, name) = name", "scalar"),
+    ("substring", "substring(name, 1, 2, 3) = name", "scalar"),
+    ("concat", "concat() = name", "scalar"),
+    ("replace", "replace(name, 'a', 'b', 'c') = name", "scalar"),
+    ("coalesce", "coalesce() = name", "scalar"),
+    ("nvl", "nvl() = name", "scalar"),
+    ("ifnull", "ifnull() = name", "scalar"),
+    ("nullif", "nullif(amount, qty, qty) = amount", "scalar"),
+    ("year", "year(seen_at, seen_at) = 2026", "scalar"),
+    ("month", "month(seen_at, seen_at) = 1", "scalar"),
+    ("day", "day(seen_at, seen_at) = 1", "scalar"),
+    ("datediff", "datediff(seen_at, seen_at, seen_at) = 0", "scalar"),
+    ("date_add", "date_add(seen_at, 5, 5) = seen_at", "scalar"),
+    ("date_sub", "date_sub(seen_at) = seen_at", "scalar"),
+    ("sum", "sum(amount, qty) > 0", "aggregate"),
+    ("count", "count(amount, qty) > 0", "aggregate"),
+    ("avg", "avg(amount, qty) > 0", "aggregate"),
+    ("min", "min(seen_at, seen_at) IS NOT NULL", "aggregate"),
+    ("max", "max(seen_at, seen_at) IS NOT NULL", "aggregate"),
+)
+
+
+@pytest.mark.parametrize(
+    "function,reject_text,position",
+    _DC3_ARITY_CORPUS,
+    ids=[row[0] for row in _DC3_ARITY_CORPUS],
+)
+def test_dc3_arity_corpus_per_function(
+    function: str, reject_text: str, position: cg.Position
+) -> None:
+    result = cg.validate_expression(reject_text, position, _SCHEMA)
+    assert isinstance(result, cg.GrammarDefect), f"{function}: {result!r}"
+    assert result.code == "check-expression-rejected"
+
+
+def test_dc3_arity_corpus_covers_every_function() -> None:
+    # Same completeness shape as the signature corpus: one arity row per
+    # function, tied to the same data-module function sets.
+    corpus_functions = {row[0] for row in _DC3_ARITY_CORPUS}
+    assert corpus_functions == cg.SCALAR_FUNCTION_NAMES | cg.AGGREGATE_FUNCTION_NAMES
+
+
+# --- A006-5: the Track-A-facing data surface (arity/portability notes) -----
+
+
+def test_function_entries_match_handler_tables() -> None:
+    # Forward: every entry's node_kind is a real key in its handler table.
+    for entry in cg.SCALAR_FUNCTIONS:
+        assert entry.node_kind in cg._HANDLERS_SCALAR, entry
+        assert entry.portability_note
+        assert entry.arity[0] <= entry.arity[1]
+    for entry in cg.AGGREGATE_FUNCTIONS:
+        assert entry.node_kind in cg._HANDLERS_AGGREGATE_EXTRA, entry
+        assert entry.portability_note
+        assert entry.arity[0] <= entry.arity[1]
+    # Backward ("vice versa"): every FUNCTION-CALL node kind in the scalar
+    # handler table (i.e. excluding operators/leaves/the year-month-day-
+    # datediff-injected TsOrDsToDate wrapper, never authored directly) has
+    # at least one FunctionEntry naming it.
+    non_function_scalar_kinds = {
+        exp.Column,
+        exp.Literal,
+        exp.Boolean,
+        exp.Null,
+        exp.Paren,
+        exp.Cast,
+        exp.EQ,
+        exp.NEQ,
+        exp.LT,
+        exp.LTE,
+        exp.GT,
+        exp.GTE,
+        exp.NullSafeEQ,
+        exp.And,
+        exp.Or,
+        exp.Not,
+        exp.Is,
+        exp.In,
+        exp.Between,
+        exp.Like,
+        exp.Add,
+        exp.Sub,
+        exp.Mul,
+        exp.Div,
+        exp.Mod,
+        exp.Neg,
+        exp.Case,
+        exp.TsOrDsToDate,
+    }
+    handler_function_kinds = set(cg._HANDLERS_SCALAR) - non_function_scalar_kinds
+    assert {e.node_kind for e in cg.SCALAR_FUNCTIONS} == handler_function_kinds
+    assert {e.node_kind for e in cg.AGGREGATE_FUNCTIONS} == set(cg._HANDLERS_AGGREGATE_EXTRA)
+    assert {e.name for e in cg.SCALAR_FUNCTIONS} == cg.SCALAR_FUNCTION_NAMES
+    assert {e.name for e in cg.AGGREGATE_FUNCTIONS} == cg.AGGREGATE_FUNCTION_NAMES
+
+
+# --- A006-12: named reject/refusal rows absent from G-07 --------------------
+
+
+def test_reject_count_distinct_and_rlike() -> None:
+    # §6.1: DISTINCT is a named non-member (previously reject-by-omission
+    # with no corpus row); §6.2: RLIKE is a named non-member.
+    assert _reject("count(DISTINCT amount) > 0", "aggregate").code == "check-expression-rejected"
+    assert _reject("name RLIKE 'x'").code == "check-expression-rejected"
+
+
+# --- D006-3 (coordinator ruling): IN-list members must be literals ---------
+
+
+def test_d006_3_in_list_column_member_rejected() -> None:
+    # Before the fix, a column (or arbitrary expression) IN-list member
+    # walked the full scalar handler table and accepted -- structurally
+    # equivalent to `amount = qty OR amount = 5`, an authorable form outside
+    # §6.2's own prose ("IN over literal lists only").
+    assert _reject("amount IN (qty, 5)").code == "check-expression-rejected"
+
+
+def test_d006_3_in_list_typed_literal_members_still_accepted() -> None:
+    # The [EM-1] typed-literal Cast shape is still an admitted IN-list
+    # member (it is a literal, structurally) -- the tightening excludes
+    # columns/expressions only, not the other admitted literal shapes.
+    result = _accept("seen_at IN (DATE '2026-01-01', DATE '2026-01-02')")
+    assert result.family == "boolean"
+
+
+# --- F1 (critique fix): IN-list negative numeric literals -------------------
+
+
+def test_f1_in_list_negative_numeric_literal_accepted() -> None:
+    # sqlglot parses `-1` as `exp.Neg(exp.Literal)`, not `exp.Literal`
+    # itself -- a literal list under §6.2 that the D006-3 tightening
+    # regressed (previously accepted, now refused with a misleading
+    # "column or expression" detail). `exp.Neg` wrapping a non-string
+    # `exp.Literal` is admitted; the normal walk still family-checks it.
+    result = _accept(
+        "amount IN (-1, 5)",
+        nodes=frozenset({exp.Column, exp.Identifier, exp.In, exp.Literal, exp.Neg}),
+    )
+    assert result.family == "boolean"
+
+
+def test_f1_in_list_negated_column_member_still_rejected() -> None:
+    # `-qty` is also `exp.Neg`, but wrapping a `Column`, not a `Literal` --
+    # the F1 fix's admission test is narrow enough to keep this refused,
+    # same as the pre-existing bare-column D006-3 case.
+    assert _reject("amount IN (-qty, 5)").code == "check-expression-rejected"
+
+
+# --- N2 (critique fix, swb.28): min/max aggregate RESULT family in an ------
+# --- enclosing comparison ---------------------------------------------------
+
+
+def test_n2_min_max_result_family_tightening_still_rejected() -> None:
+    # [M5 critique fix]'s `_aggregate_unary(None, None)` pass-through
+    # (swb.24) was itself unpinned in the TIGHTENING direction:
+    # `test_dc3_aggregate_argument_family` only pins the argument-family
+    # check INSIDE the aggregate (`sum(name) > 0`); min/max's own RESOLVED
+    # result family, compared against a cross-family literal OUTSIDE the
+    # aggregate, must independently still reject.
+    assert _reject("min(seen_at) = 5", "aggregate").code == "check-expression-mixed-types"
+    assert _reject("max(name) = 5", "aggregate").code == "check-expression-mixed-types"
+
+
+def test_n2_min_max_result_family_same_family_widening_accepted() -> None:
+    # The complementary WIDENING direction (§7.5's reconciliation ground):
+    # a same-family comparison over min/max's own polymorphic result family
+    # was previously false-refused (numeric result hardcoded pre-swb.24)
+    # and now validates clean -- the only DC-3 corpus rows for min/max
+    # (`min(seen_at) IS NOT NULL`) never exercised this, since `IS NOT
+    # NULL` erases the operand's family before any comparison.
+    assert _accept("min(name) = 'x'", "aggregate").family == "boolean"
+
+
 # --- property suite (§13.2's slice for this module) -------------------------
 
 
@@ -535,3 +1020,92 @@ def test_family_of_kind_covers_every_fact_column_kind() -> None:
 
 def test_family_of_kind_unrecognized_kind_returns_none() -> None:
     assert cg.family_of_kind("garbage") is None
+
+
+# --- §7.5/[EM-4] `compile_aggregate` -- dormant behind P-6/K7 (conveyer-swb.15,
+# D006-1's "build now, dormant" ruling). Scope: the five §6.3 aggregates,
+# §6.2 arithmetic, columns, and literals -- §13.2's own DC-2 property scope,
+# this module's own new-section docstring.
+
+
+def _compile_agg(text: str) -> cg.CompiledAggregate | cg.GrammarDefect:
+    validated = cg.validate_expression(text, "aggregate", _SCHEMA)
+    assert isinstance(validated, cg.ValidatedExpr), f"expected accept, got {validated!r}"
+    return cg.compile_aggregate(validated, _SCHEMA)
+
+
+def test_compile_aggregate_accepts_a_bare_sum_and_coalesces_it() -> None:
+    result = _compile_agg("sum(amount)")
+    assert isinstance(result, cg.CompiledAggregate)
+    assert result.tree == cg.AggCall(
+        kind="sum", argument=cg.AggColumnRef(name="amount"), coalesce_zero=True
+    )
+    assert result.referenced_columns == frozenset({"amount"})
+
+
+def test_compile_aggregate_accepts_combined_arithmetic_over_two_sums() -> None:
+    # [EM-4]'s own worked example: `sum(net) + sum(fees)` -- each `sum`
+    # call is its own coalesce-to-zero node, never a top-level wrap.
+    result = _compile_agg("sum(amount) + sum(qty)")
+    assert isinstance(result, cg.CompiledAggregate)
+    assert result.tree == cg.AggBinOp(
+        op="+",
+        left=cg.AggCall(kind="sum", argument=cg.AggColumnRef(name="amount"), coalesce_zero=True),
+        right=cg.AggCall(kind="sum", argument=cg.AggColumnRef(name="qty"), coalesce_zero=True),
+    )
+    assert result.referenced_columns == frozenset({"amount", "qty"})
+
+
+def test_compile_aggregate_accepts_the_count_1_row_count_idiom() -> None:
+    result = _compile_agg("count(1)")
+    assert isinstance(result, cg.CompiledAggregate)
+    assert result.tree == cg.AggCall(
+        kind="count", argument=cg.AggLiteral(text="1"), coalesce_zero=False
+    )
+    assert result.referenced_columns == frozenset()
+
+
+def test_compile_aggregate_min_max_avg_never_coalesce_to_zero() -> None:
+    # §7.5 verbatim: "min/max/avg take no zero" -- `coalesce_zero=False`
+    # for all three, unlike `sum`'s own `True`.
+    for fn in ("min", "max", "avg"):
+        result = _compile_agg(f"{fn}(amount)")
+        assert isinstance(result, cg.CompiledAggregate)
+        assert isinstance(result.tree, cg.AggCall)
+        assert result.tree.coalesce_zero is False, fn
+
+
+def test_compile_aggregate_arithmetic_and_negation_compose() -> None:
+    result = _compile_agg("-sum(amount) % 2")
+    assert isinstance(result, cg.CompiledAggregate)
+    assert result.tree == cg.AggBinOp(
+        op="%",
+        left=cg.AggNeg(
+            operand=cg.AggCall(
+                kind="sum", argument=cg.AggColumnRef(name="amount"), coalesce_zero=True
+            )
+        ),
+        right=cg.AggLiteral(text="2"),
+    )
+
+
+def test_compile_aggregate_rejects_a_construct_outside_its_scoped_surface() -> None:
+    # `sum(CASE WHEN ... END)` is grammar-ACCEPTED by gate 1 (§6.1/§6.2) but
+    # outside `compile_aggregate`'s own scope (the module's own new-section
+    # docstring: aggregates + §6.2 arithmetic + literals only, §13.2's DC-2
+    # property scope) -- a named, deletable coverage gap, not a silent
+    # mistranslation.
+    result = _compile_agg("sum(CASE WHEN amount > 0 THEN amount ELSE 0 END)")
+    assert isinstance(result, cg.GrammarDefect)
+    assert result.code == "check-expression-rejected"
+
+
+def test_compile_aggregate_authored_text_reparse_is_deterministic() -> None:
+    # compile_aggregate re-parses `validated.authored_text` (never the raw
+    # caller-supplied text directly) -- byte-identical re-parse, same tree,
+    # same result, every time (pure, total).
+    validated = cg.validate_expression("sum(amount) + sum(qty)", "aggregate", _SCHEMA)
+    assert isinstance(validated, cg.ValidatedExpr)
+    first = cg.compile_aggregate(validated, _SCHEMA)
+    second = cg.compile_aggregate(validated, _SCHEMA)
+    assert first == second

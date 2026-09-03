@@ -379,6 +379,40 @@ def _h_in(
     for item in items:
         if isinstance(item, exp.Null):
             return _defect("check-expression-rejected", "NULL is not allowed inside an IN list")
+        # [D006-3]: IN is admitted over literal lists only (§6.2's "no
+        # subquery node exists to accept" -- the doc's own wording extends
+        # to "no column/expression member either"). A member's node kind is
+        # exactly one of: `Literal` (numeric/string), `Boolean`, or `Cast`
+        # (the [EM-1] typed-literal shape, itself re-validated below via the
+        # normal walk -- this gate only excludes columns/expressions, not
+        # non-typed-literal casts, which `_h_cast` still refuses on its own
+        # terms). A bare column reference (`amount IN (qty, 5)`) is
+        # otherwise structurally indistinguishable from `x = col OR ...` and
+        # was accepted before this fix -- an authorable form outside §6.2's
+        # own prose.
+        #
+        # [F1 critique fix]: sqlglot parses a negative numeric literal
+        # (`-1`) as `exp.Neg(exp.Literal)`, not `exp.Literal` itself -- a
+        # literal list member under §6.2 that this gate previously refused
+        # with the misleading "column or expression" detail. Admit it, but
+        # ONLY when `.this` is a non-string `Literal`: `Neg` wrapping a
+        # `Column` (`-qty`) stays refused by the same test (its `.this` is a
+        # `Column`, not a `Literal`), and `Neg` wrapping a string/boolean
+        # literal (`-'x'`, `-TRUE`) is nonsensical SQL that sqlglot still
+        # parses syntactically -- excluded explicitly rather than left to
+        # the arithmetic-unary walk below (which would happily unify a
+        # string's `None`-mapped family against numeric and accept it).
+        is_negative_numeric_literal = (
+            isinstance(item, exp.Neg)
+            and isinstance(item.this, exp.Literal)
+            and not item.this.args.get("is_string")
+        )
+        is_admitted_literal = isinstance(item, (exp.Literal, exp.Boolean, exp.Cast))
+        if not is_admitted_literal and not is_negative_numeric_literal:
+            return _defect(
+                "check-expression-rejected",
+                "IN list members must be literals -- a column or expression member is not allowed",
+            )
     subject = _walk(node.this, schema, allowed)
     if isinstance(subject, GrammarDefect):
         return subject
@@ -644,6 +678,15 @@ def _h_substring(
     """[DC-3]'s "substring result family feeding enclosing comparisons"
     divergence point -- the RESULT is string, checkable by an enclosing
     comparison against another string."""
+    # [M5 critique fix]: `Substring.arg_types` carries a hidden 4th
+    # `zero_start` field this handler never checked -- a previously
+    # unnoticed hidden-extra-argument hole (this module's own recurring
+    # hazard class) that silently accepted a 4-argument `substring(...)`
+    # call, including an ENTIRELY UNVALIDATED 4th-position expression (a
+    # bare column reference in that slot was never even walked). Arity is
+    # (1, 3); reject the extra argument outright.
+    if node.args.get("zero_start") is not None:
+        return _defect("check-expression-rejected", "substring() takes at most three arguments")
     subject = _walk(node.this, schema, allowed)
     if isinstance(subject, GrammarDefect):
         return subject
@@ -771,10 +814,31 @@ def _h_ts_or_ds_add(
 # --- aggregate handlers (aggregate position only; args re-enter SCALAR only) --
 
 
-def _aggregate_unary(operand_family: Family | None, result_family: Family) -> _Handler:
+def _aggregate_unary(operand_family: Family | None, result_family: Family | None) -> _Handler:
+    """`result_family=None` means the result is POLYMORPHIC -- passes the
+    (already-validated) argument's own resolved family straight through,
+    rather than a fixed family regardless of input (min/max's [M5 critique
+    fix] shape: §7.5's reconciliation ground makes them family-unrestricted
+    on the way IN, but the way OUT was wrongly hardcoded to `"numeric"`,
+    silently accepting `min(seen_at) = 5`/`min(name) = 5` -- a temporal/
+    string aggregate compared against a numeric literal)."""
+
     def handler(
         node: exp.Expression, schema: Mapping[str, Family | None], allowed: _HandlerTable
     ) -> _WalkResult:
+        # [M5 critique fix]: `Min`/`Max` (and, structurally, `Count`) carry a
+        # hidden `expressions` field sqlglot's grammar accepts for a SECOND+
+        # positional argument (`min(a, b)`) that `Sum`/`Avg` do not have at
+        # all (their arity is enforced at the sqlglot parse layer instead) --
+        # exactly this module's own "hidden extra-argument field" hazard,
+        # previously unchecked here, silently admitting a second (even
+        # cross-family) argument. FunctionEntry's own arity is (1, 1) for
+        # every one of these four functions; reject the extra argument.
+        if node.args.get("expressions"):
+            return _defect(
+                "check-expression-rejected",
+                "aggregate function admits exactly one argument -- extra arguments are not allowed",
+            )
         # §6.3: "no nesting of aggregates" -- the argument re-enters under
         # the SCALAR table regardless of the outer `allowed`, so a nested
         # aggregate is simply an unrecognized node kind there.
@@ -790,7 +854,8 @@ def _aggregate_unary(operand_family: Family | None, result_family: Family) -> _H
                 "check-expression-mixed-types",
                 f"aggregate argument is not {operand_family}: {inner.family!r}",
             )
-        return _NodeInfo(family=result_family, referenced_columns=inner.referenced_columns)
+        family = result_family if result_family is not None else inner.family
+        return _NodeInfo(family=family, referenced_columns=inner.referenced_columns)
 
     return handler
 
@@ -802,6 +867,14 @@ def _h_count(
     # is a bare `exp.Star`, unrecognized by `_HANDLERS_SCALAR`; the
     # authorable row-count idiom is `count(1)`. `count(DISTINCT ...)` is
     # rejected the same way `DISTINCT` is everywhere else (not a member).
+    # [M5 critique fix]: `Count.arg_types` also carries the hidden
+    # `expressions` field described on `_aggregate_unary` above -- reject a
+    # second+ argument the same way.
+    if node.args.get("expressions"):
+        return _defect(
+            "check-expression-rejected",
+            "count admits exactly one argument -- extra arguments are not allowed",
+        )
     this = node.this
     if isinstance(this, exp.Star):
         return _defect("check-expression-rejected", "count(*) is not allowed -- author count(1)")
@@ -878,10 +951,12 @@ _HANDLERS_SCALAR: dict[type, _Handler] = {
 _HANDLERS_AGGREGATE_EXTRA: dict[type, _Handler] = {
     exp.Sum: _aggregate_unary("numeric", "numeric"),
     exp.Count: _h_count,
-    exp.Min: _aggregate_unary(
-        None, "numeric"
-    ),  # any comparable family in; numeric out (§7.5's reconciliation ground)
-    exp.Max: _aggregate_unary(None, "numeric"),
+    # any comparable family in; result family PASSES THROUGH the argument's
+    # own family (§7.5's reconciliation ground) -- [M5 critique fix]: was
+    # hardcoded to a fixed "numeric" result regardless of input, silently
+    # accepting `min(seen_at) = 5`/`min(name) = 5`.
+    exp.Min: _aggregate_unary(None, None),
+    exp.Max: _aggregate_unary(None, None),
     exp.Avg: _aggregate_unary("numeric", "numeric"),
 }
 
@@ -889,6 +964,328 @@ _HANDLERS_BY_POSITION: Mapping[Position, dict[type, _Handler]] = {
     "scalar": _HANDLERS_SCALAR,
     "aggregate": {**_HANDLERS_SCALAR, **_HANDLERS_AGGREGATE_EXTRA},
 }
+
+# --- Track A's data surface (P-2/§6.4; A006-2/A006-5): the AUTHORED-SPELLING
+# function names this grammar admits, one entry per name (several spellings
+# share one node kind -- `ltrim`/`rtrim`/`trim` all parse to `exp.Trim`,
+# `nvl`/`ifnull`/`coalesce` all parse to `exp.Coalesce`, `date_add`/`date_sub`
+# both parse to `exp.TsOrDsAdd` -- each spelling is its own name here since
+# each is an independent authored surface with its own portability note).
+# `test_check_grammar.py`'s [DC-3] per-argument-position signature corpus is
+# tied to this exact set (a completeness assertion), so the corpus cannot
+# silently drift from this data module -- add a function here FIRST, then
+# its corpus rows, never the reverse. Comparison/boolean/arithmetic
+# OPERATORS (`=`, `AND`, `+`, `CASE`, `IN`, ...) and the `TsOrDsToDate`
+# wrapper sqlglot injects around `year`/`month`/`day`/`datediff` (never
+# authored directly) are excluded -- this set is function-CALL syntax only.
+SCALAR_FUNCTION_NAMES: frozenset[str] = frozenset(
+    {
+        "abs",
+        "round",
+        "floor",
+        "ceil",
+        "greatest",
+        "least",
+        "length",
+        "trim",
+        "ltrim",
+        "rtrim",
+        "upper",
+        "lower",
+        "substring",
+        "concat",
+        "replace",
+        "coalesce",
+        "nvl",
+        "ifnull",
+        "nullif",
+        "year",
+        "month",
+        "day",
+        "datediff",
+        "date_add",
+        "date_sub",
+    }
+)
+AGGREGATE_FUNCTION_NAMES: frozenset[str] = frozenset({"sum", "count", "avg", "min", "max"})
+
+
+@dataclass(frozen=True)
+class FunctionEntry:
+    """One §6.2/§6.3 function's data record (P-2's "scalar functions with
+    arity + event-lane portability notes"; §6.4's "per-function event-lane
+    portability notes ride the data module as fields"). `arity` is this
+    GRAMMAR's own admitted (min, max) authored argument count -- not
+    necessarily sqlglot's raw parse-time bound (`round(a, b, c)` parses at
+    the sqlglot layer but is refused here by `_h_round`'s `truncate` check,
+    so `round`'s own arity is `(1, 2)`); `999` is the "no upper bound"
+    sentinel for a variadic function. `arg_families`/`result_family` use
+    `None` for a homogeneous-but-polymorphic position (unifies with its
+    siblings, any concrete family) -- `greatest`/`least`/`coalesce`/`nvl`/
+    `ifnull`/`nullif`'s own divergence points, `count`/`min`/`max`'s
+    argument (structurally family-unrestricted, §7.5's reconciliation
+    ground for `min`/`max`)."""
+
+    name: str
+    node_kind: type
+    arity: tuple[int, int]
+    arg_families: tuple[Family | None, ...]
+    result_family: Family | None
+    portability_note: str
+
+
+SCALAR_FUNCTIONS: tuple[FunctionEntry, ...] = (
+    FunctionEntry(
+        "abs", exp.Abs, (1, 1), ("numeric",), "numeric", "no cross-engine quirks; portable"
+    ),
+    FunctionEntry(
+        "round",
+        exp.Round,
+        (1, 2),
+        ("numeric", "numeric"),
+        "numeric",
+        "HALF_UP on Spark -- confirm the event lane's rounding mode matches before porting",
+    ),
+    FunctionEntry(
+        "floor",
+        exp.Floor,
+        (1, 1),
+        ("numeric",),
+        "numeric",
+        "single-argument only; the decimal-place/TO-unit overloads are refused",
+    ),
+    FunctionEntry(
+        "ceil",
+        exp.Ceil,
+        (1, 1),
+        ("numeric",),
+        "numeric",
+        "single-argument only; the decimal-place/TO-unit overloads are refused",
+    ),
+    FunctionEntry(
+        "greatest",
+        exp.Greatest,
+        (1, 999),
+        (None,),
+        None,
+        "NULL-skipping homogeneous variadic -- confirm the event lane also skips NULLs "
+        "rather than propagating",
+    ),
+    FunctionEntry(
+        "least",
+        exp.Least,
+        (1, 999),
+        (None,),
+        None,
+        "NULL-skipping homogeneous variadic -- confirm the event lane also skips NULLs "
+        "rather than propagating",
+    ),
+    FunctionEntry(
+        "length",
+        exp.Length,
+        (1, 1),
+        ("string",),
+        "numeric",
+        "counts characters, not bytes -- confirm parity for multi-byte UTF-8 payloads",
+    ),
+    FunctionEntry(
+        "trim",
+        exp.Trim,
+        (1, 1),
+        ("string",),
+        "string",
+        "single-argument only (no TRIM(chars FROM x) overload); whitespace only",
+    ),
+    FunctionEntry(
+        "ltrim",
+        exp.Trim,
+        (1, 1),
+        ("string",),
+        "string",
+        "single-argument only (no TRIM(chars FROM x) overload); whitespace only",
+    ),
+    FunctionEntry(
+        "rtrim",
+        exp.Trim,
+        (1, 1),
+        ("string",),
+        "string",
+        "single-argument only (no TRIM(chars FROM x) overload); whitespace only",
+    ),
+    FunctionEntry(
+        "upper",
+        exp.Upper,
+        (1, 1),
+        ("string",),
+        "string",
+        "locale-independent ASCII case folding under Spark -- confirm parity for non-ASCII scripts",
+    ),
+    FunctionEntry(
+        "lower",
+        exp.Lower,
+        (1, 1),
+        ("string",),
+        "string",
+        "locale-independent ASCII case folding under Spark -- confirm parity for non-ASCII scripts",
+    ),
+    FunctionEntry(
+        "substring",
+        exp.Substring,
+        (1, 3),
+        ("string", "numeric", "numeric"),
+        "string",
+        "1-indexed, matching SQL convention -- confirm the event lane's substring is not 0-indexed",
+    ),
+    FunctionEntry(
+        "concat",
+        exp.Concat,
+        (1, 999),
+        ("string",),
+        "string",
+        "a NULL argument yields NULL (Spark semantics, not empty-string concatenation) -- "
+        "confirm parity",
+    ),
+    FunctionEntry(
+        "replace",
+        exp.Replace,
+        (2, 3),
+        ("string", "string", "string"),
+        "string",
+        "case-sensitive literal substring replacement, not regex",
+    ),
+    FunctionEntry(
+        "coalesce",
+        exp.Coalesce,
+        (1, 999),
+        (None,),
+        None,
+        "NULL-polymorphic homogeneous variadic; first non-NULL argument wins",
+    ),
+    FunctionEntry(
+        "nvl",
+        exp.Coalesce,
+        (1, 999),
+        (None,),
+        None,
+        "normalizes to the same node as coalesce()/ifnull() -- NULL-polymorphic, first "
+        "non-NULL wins",
+    ),
+    FunctionEntry(
+        "ifnull",
+        exp.Coalesce,
+        (1, 999),
+        (None,),
+        None,
+        "normalizes to the same node as coalesce()/nvl() -- NULL-polymorphic, first non-NULL wins",
+    ),
+    FunctionEntry(
+        "nullif",
+        exp.Nullif,
+        (2, 2),
+        (None, None),
+        None,
+        "returns NULL on equality, the left value otherwise -- both arguments unify to one "
+        "polymorphic family",
+    ),
+    FunctionEntry(
+        "year",
+        exp.Year,
+        (1, 1),
+        ("temporal",),
+        "numeric",
+        "extracted under the pinned session time zone (SESSION_PINS) -- confirm the event "
+        "lane extracts under the same zone",
+    ),
+    FunctionEntry(
+        "month",
+        exp.Month,
+        (1, 1),
+        ("temporal",),
+        "numeric",
+        "extracted under the pinned session time zone (SESSION_PINS) -- confirm the event "
+        "lane extracts under the same zone",
+    ),
+    FunctionEntry(
+        "day",
+        exp.Day,
+        (1, 1),
+        ("temporal",),
+        "numeric",
+        "extracted under the pinned session time zone (SESSION_PINS) -- confirm the event "
+        "lane extracts under the same zone",
+    ),
+    FunctionEntry(
+        "datediff",
+        exp.DateDiff,
+        (2, 2),
+        ("temporal", "temporal"),
+        "numeric",
+        "day-granularity difference (end - start); only the native 2-arg Spark form is "
+        "admitted, not the 3-arg ANSI unit form",
+    ),
+    FunctionEntry(
+        "date_add",
+        exp.TsOrDsAdd,
+        (2, 2),
+        ("temporal", "numeric"),
+        "temporal",
+        "day-granularity only; result is DATE-typed even over a TIMESTAMP subject",
+    ),
+    FunctionEntry(
+        "date_sub",
+        exp.TsOrDsAdd,
+        (2, 2),
+        ("temporal", "numeric"),
+        "temporal",
+        "day-granularity only; result is DATE-typed even over a TIMESTAMP subject",
+    ),
+)
+
+AGGREGATE_FUNCTIONS: tuple[FunctionEntry, ...] = (
+    FunctionEntry(
+        "sum",
+        exp.Sum,
+        (1, 1),
+        ("numeric",),
+        "numeric",
+        "returns NULL over an empty or all-NULL set, not zero",
+    ),
+    FunctionEntry(
+        "count",
+        exp.Count,
+        (1, 1),
+        (None,),
+        "numeric",
+        "count(1) counts rows; count(col) skips NULLs -- author with the intended spelling",
+    ),
+    FunctionEntry(
+        "avg",
+        exp.Avg,
+        (1, 1),
+        ("numeric",),
+        "numeric",
+        "widens int to double, keeps decimal as decimal -- confirm the event lane's avg "
+        "widening matches",
+    ),
+    FunctionEntry(
+        "min",
+        exp.Min,
+        (1, 1),
+        (None,),
+        None,
+        "family-polymorphic in AND out; comparable across any single family, no cross-family "
+        "reject applies -- the result carries whatever family the argument resolved to",
+    ),
+    FunctionEntry(
+        "max",
+        exp.Max,
+        (1, 1),
+        (None,),
+        None,
+        "family-polymorphic in AND out; comparable across any single family, no cross-family "
+        "reject applies -- the result carries whatever family the argument resolved to",
+    ),
+)
 
 
 def _parse_expression(text: str) -> exp.Expression | None:
@@ -947,3 +1344,203 @@ def family_of_kind(kind: str) -> Family | None:
     if kind == "bool":
         return "boolean"
     return None
+
+
+# =============================================================================
+# §6.3/§7.5 [EM-4]: `compile_aggregate` — the aggregate position's ONE
+# framework-composed translation, dormant behind P-6/K7 (conveyer-swb.15,
+# D006-1's "build now, dormant" ruling).
+#
+# **Why a plain-value tree, not a `Column` (deviation from §6.4's own literal
+# phrasing).** §6.4 describes the aggregate position as "compiled ... as a
+# Column-expression tree" — but `core/**` bans importing `pyspark`
+# (`tools/linter_configs/spine.py::_CORE_PROFILE`, unconditional, no
+# per-file exemption mechanism for import-root bans), so this module can
+# never hold a live `Column`. The split this module already draws for the
+# SCALAR position — `validate_expression` (pure, this module) hands a
+# byte-exact `authored_text` to `frames/business_checks.py::_compiled_expr`,
+# which is the one place `F.expr` actually runs — extends here unchanged:
+# `compile_aggregate` (this function) walks the ACCEPTED AST into a pure
+# `AggNode` value tree (never a `Column`, never regenerated SQL text); the
+# FRAMES layer (`frames/business_checks.py::aggregate_column`, which may
+# import pyspark) turns that tree into the real Column-expression tree §6.4
+# actually means — "no sqlglot-rendered text executes" holds exactly the
+# same either way, since neither this module nor that one ever calls
+# `sqlglot`'s own `.sql()` renderer to produce anything that executes.
+#
+# **Scope, pinned to §13.2's own DC-2 property definition.** §6.3 permits an
+# aggregate's argument to be an arbitrary §6.2 scalar expression, but §13.2
+# defines the DC-2 fidelity property's OWN generator as "compositions of the
+# five §6.3 aggregates, §6.2 ARITHMETIC, and literals" — that is this
+# function's exact, deliberate coverage: the five aggregate calls, `+ - * /
+# %` and unary `-`, bare columns, and non-string literals. An aggregate
+# argument nested inside a broader §6.2 construct (`CASE`, `coalesce`,
+# `round`, a string function, ...) is grammar-ACCEPTED by gate 1 (§6.1/§6.2)
+# but returns a `GrammarDefect` here — a named, deletable, additive gap
+# (D006-1's own framing: "additive and reversible by deletion"), not a
+# silent mistranslation; extending it is 005 v1.x's — or a later bead's —
+# job, against this function's own kernel-validated corpus.
+# =============================================================================
+
+AggOp = Literal["+", "-", "*", "/", "%"]
+
+
+@dataclass(frozen=True)
+class AggColumnRef:
+    """A bare column reference inside an aggregate-position expression."""
+
+    name: str
+
+
+@dataclass(frozen=True)
+class AggLiteral:
+    """A numeric literal, raw text (sqlglot's own `Literal.this` shape,
+    §6.1's own docstring) — int-vs-decimal rendering is the frames layer's
+    call (`"." in text`), never decided here."""
+
+    text: str
+
+
+@dataclass(frozen=True)
+class AggNeg:
+    operand: AggNode
+
+
+@dataclass(frozen=True)
+class AggBinOp:
+    op: AggOp
+    left: AggNode
+    right: AggNode
+
+
+@dataclass(frozen=True)
+class AggCall:
+    """One of the five §6.3 aggregate functions. `coalesce_zero` is [EM-4]'s
+    own per-node law: `True` for `sum` only — `min`/`max`/`avg` "take no
+    zero" (§7.5 verbatim) and stay NULL over an empty candidate set. `count`
+    carries `coalesce_zero=False` here too: unlike `sum`, `count` is ALREADY
+    zero-safe by SQL definition (count over zero rows, or over an all-NULL
+    column, is 0, never NULL) — the frames layer's own `count` translation
+    (`frames/business_checks.py::_aggregate_call_column`) reproduces that
+    unconditionally, needing no candidate-set-empty gate at all, which is
+    exactly why it is not a THIRD `coalesce_zero` variant here."""
+
+    kind: Literal["sum", "count", "min", "max", "avg"]
+    argument: AggNode
+    coalesce_zero: bool
+
+
+AggNode = AggColumnRef | AggLiteral | AggNeg | AggBinOp | AggCall
+
+
+@dataclass(frozen=True)
+class CompiledAggregate:
+    """§7.5/[EM-4]'s pure translation result: `tree` is the framework-
+    composed value tree (never a `Column`, never regenerated SQL — this
+    module's own docstring); `referenced_columns` is K3's input, the same
+    role `ValidatedExpr.referenced_columns` plays for the scalar position."""
+
+    tree: AggNode
+    referenced_columns: frozenset[str]
+
+
+_AGG_OP_BY_NODE: Mapping[type, AggOp] = {
+    exp.Add: "+",
+    exp.Sub: "-",
+    exp.Mul: "*",
+    exp.Div: "/",
+    exp.Mod: "%",
+}
+_AGG_CALL_BY_NODE: Mapping[type, Literal["sum", "count", "min", "max", "avg"]] = {
+    exp.Sum: "sum",
+    exp.Count: "count",
+    exp.Min: "min",
+    exp.Max: "max",
+    exp.Avg: "avg",
+}
+
+
+def _compile_agg_node(node: exp.Expression) -> tuple[AggNode, frozenset[str]] | None:
+    """Bottom-up, pure, total (never raises — returns `None` on anything
+    outside this function's own scoped surface, per this section's own
+    docstring). No family/K9 checks here: `compile_aggregate`'s caller
+    obligation is a text ALREADY accepted by gate 1 at `"aggregate"`
+    position (this function's own precondition, mirroring `frames/
+    business_checks.py::_compiled_expr`'s identical "already validated at
+    bind" contract for the scalar position) — re-deriving family coherence
+    a second time here would be a second type calculus, exactly what
+    §6.5 rule 2's "one-oracle rule" and this bead's own brief reject."""
+    node_type = type(node)
+    if node_type is exp.Paren:
+        return _compile_agg_node(node.this)
+    if node_type is exp.Column:
+        return AggColumnRef(name=node.name), frozenset({node.name})
+    if node_type is exp.Literal:
+        if node.args.get("is_string"):
+            return None  # out of scope: the aggregate surface is numeric-only per §6.3
+        return AggLiteral(text=str(node.this)), frozenset()
+    if node_type is exp.Neg:
+        inner = _compile_agg_node(node.this)
+        if inner is None:
+            return None
+        inner_node, inner_cols = inner
+        return AggNeg(operand=inner_node), inner_cols
+    op = _AGG_OP_BY_NODE.get(node_type)
+    if op is not None:
+        left = _compile_agg_node(node.this)
+        right = _compile_agg_node(node.expression)
+        if left is None or right is None:
+            return None
+        left_node, left_cols = left
+        right_node, right_cols = right
+        return AggBinOp(op=op, left=left_node, right=right_node), left_cols | right_cols
+    kind = _AGG_CALL_BY_NODE.get(node_type)
+    if kind is not None:
+        # §6.3: "no nesting of aggregates" — already gate-1-refused at bind
+        # (this function's own precondition), so `node.this` here is always
+        # a §6.2 scalar-position expression, never a nested aggregate call.
+        inner = _compile_agg_node(node.this)
+        if inner is None:
+            return None
+        arg_node, cols = inner
+        return AggCall(kind=kind, argument=arg_node, coalesce_zero=(kind == "sum")), cols
+    return None  # out of this function's scoped surface (§13.2's own generator scope)
+
+
+def compile_aggregate(
+    validated: ValidatedExpr, schema: Mapping[str, Family | None]
+) -> CompiledAggregate | GrammarDefect:
+    """§7.5/[EM-4]: `validated` MUST already be an ACCEPTED `"aggregate"`-
+    position `ValidatedExpr` (`validate_expression(text, "aggregate",
+    schema)` — the caller's own obligation, this function's precondition,
+    exactly as `frames/business_checks.py::_compiled_expr` requires for the
+    scalar position). Re-parses `validated.authored_text` BYTE-EXACT (a
+    deterministic re-parse — the SAME `_parse_expression` this module's own
+    gate 1 uses, never a second grammar) and walks it into a pure `AggNode`
+    tree (never a `Column` — this section's own docstring). `schema` is
+    accepted for signature symmetry with `validate_expression` and as a
+    reserved hook for 005 v1.x's member-grammar coherence check (§9's named
+    wait) — this function does not itself consult it: family coherence was
+    already asserted once, at gate 1, over the SAME text (§6.5 rule 1's
+    one-pass law; re-deriving it here would be the second type calculus
+    §6.5 rule 2 and this bead's own brief both reject). A construct outside
+    this function's own scoped surface (this section's docstring) returns a
+    `GrammarDefect` — a framework-coverage gap, not an authored-spec defect,
+    but shaped identically so callers already handling `GrammarDefect`
+    (e.g. `entrypoints/glue_main.py`'s K5) need no second result type."""
+    tree = _parse_expression(validated.authored_text)
+    if tree is None:
+        return _defect(
+            "check-expression-rejected",
+            "compile_aggregate: authored_text does not re-parse (framework defect)",
+        )
+    result = _compile_agg_node(tree)
+    if result is None:
+        return _defect(
+            "check-expression-rejected",
+            "compile_aggregate: construct outside its scoped surface (the five §6.3 "
+            "aggregates, §6.2 arithmetic, columns, and literals — §13.2's own DC-2 "
+            "property scope)",
+        )
+    agg_node, referenced_columns = result
+    return CompiledAggregate(tree=agg_node, referenced_columns=referenced_columns)

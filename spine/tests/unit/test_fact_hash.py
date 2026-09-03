@@ -22,7 +22,11 @@ file, §5.4): identical convention to §5.3's record-key vectors and 005.1
 `_parse_fixture_value` below is this module's **own** untagging parser --
 NOT imported from `test_canonical.py` or `test_identity.py` (§5.4: "every
 consumer writes its own untagging parser... shared vectors, never shared
-code", 004 D-13).
+code", 004 D-13). See `contracts/fixtures/README.md` for the full
+fixture-review checklist (synthetic-only [DS-5], resident-serializer
+regeneration reproducing every committed family first, the untagging-
+parser rule above, NFC/NFD authoring discipline) shared by every committed
+vector family in that directory.
 """
 
 from __future__ import annotations

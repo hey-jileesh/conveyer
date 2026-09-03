@@ -29,7 +29,7 @@ def test_run_probe_all_vectors_pass_under_local_spark(spark: SparkSession) -> No
 
 
 def test_build_session_adopts_the_shared_session(spark: SparkSession) -> None:
-    # No `.master(...)` set (mirrors `entrypoints/glue_main.py::_build_session`'s
+    # No `.master(...)` set (mirrors `entrypoints/session.py::build_session`'s
     # documented idiom): inside the shared test JVM, `getOrCreate()` adopts the
     # already-live `spark` fixture rather than building a second session.
     assert g08_parity._build_session() is spark
@@ -63,6 +63,45 @@ def test_print_report_returns_false_on_any_failure(capsys: pytest.CaptureFixture
     out = capsys.readouterr().out
     assert "[PASS] ok" in out
     assert "[FAIL] bad" in out
+
+
+def test_probe_df_for_rows_override_and_empty_frame(spark: SparkSession) -> None:
+    # A006-4: `rows=None` (the default) is the shared single-row frame every
+    # scalar-position vector uses; `rows=()` builds a genuinely EMPTY frame
+    # (the empty-set aggregate discriminators); a non-empty override supplies
+    # exactly those rows.
+    default_vector = g08_parity.ParityVector("default", "i", 5)
+    assert g08_parity._probe_df_for(spark, default_vector).count() == 1
+
+    empty_vector = g08_parity.ParityVector("empty", "sum(i)", None, group=True, rows=())
+    assert g08_parity._probe_df_for(spark, empty_vector).count() == 0
+
+    two_row = (g08_parity._row(), g08_parity._row(i=7))
+    override_vector = g08_parity.ParityVector("override", "count(1)", 2, group=True, rows=two_row)
+    assert g08_parity._probe_df_for(spark, override_vector).count() == 2
+
+
+def test_evaluate_group_true_reduces_via_agg(spark: SparkSession) -> None:
+    # A `group=True` vector must reduce via `df.agg(...)`, not `df.select
+    # (...)` -- over a 2-row frame, `count(1)` correctly reduces to a SINGLE
+    # row with value 2 only under `.agg(...)`.
+    two_row = (g08_parity._row(), g08_parity._row(i=7))
+    df = g08_parity._build_probe_df(spark, two_row)
+    vector = g08_parity.ParityVector("count-two-rows", "count(1)", 2, group=True)
+    result = g08_parity._evaluate(df, vector)
+    assert result.passed is True
+    assert result.actual == 2
+
+
+def test_evaluate_group_true_validates_at_aggregate_position(spark: SparkSession) -> None:
+    # `sum(...)` is an aggregate-position-only member (§6.3) -- a `group=True`
+    # vector must validate at "aggregate" position, not "scalar" (which
+    # would reject it as "aggregate outside aggregate position").
+    df = g08_parity._build_probe_df(spark)
+    vector = g08_parity.ParityVector("sum-i", "sum(i)", 5, group=True)
+    result = g08_parity._evaluate(df, vector)
+    assert result.passed is True
+    assert result.error is None
 
 
 def test_main_raises_systemexit_1_on_any_failure(

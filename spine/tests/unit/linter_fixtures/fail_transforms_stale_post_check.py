@@ -12,9 +12,9 @@ REAL imported module -- this fixture IS that real module, committed so the
 scenario is a reviewable, versioned artifact rather than a `tmp_path`-
 authored throwaway string.
 
-Consumed by `tests/unit/test_bind_checks.py`
-(`test_s4_stale_post_check_export_fixture_is_flagged_by_the_real_module_read`),
-via the `pipelines.__path__.append(...)` technique `tests/unit/
+Consumed by `tests/unit/test_glue_main.py`
+(`test_acquire_transforms_meta_flags_the_committed_stale_post_check_corpus_fixture`,
+line 667), via the `pipelines.__path__.append(...)` technique `tests/unit/
 test_binding.py`/`tests/unit/test_glue_main.py` already established for
 throwaway `pipelines.<name>` modules -- pointed at THIS directory instead
 of a `tmp_path`, so the committed fixture is the thing under test.

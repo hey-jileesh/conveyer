@@ -67,8 +67,9 @@ any pipeline's spec — no I-23 self-scoping here: bootstrap runs as the
 *deploy principal* naming any pipeline's spec by hand, never the job role
 reading only its own, §4.5), `--catalog` (default `spine_cat`), `--env`
 (required — carried into the Spark app name for log correlation, same
-shape as `glue_main._build_session`'s `appName(f"conveyer-spine-
-{config.env}")`). Deliberately NOT the full `RunnerConfig`/`from_args`
+shape as `entrypoints/session.py::build_session`'s `app_name` kwarg
+(`glue_main.py`'s own call site: `f"conveyer-spine-{config.env}"`)).
+Deliberately NOT the full `RunnerConfig`/`from_args`
 argv contract `create_run_ledger.py` uses (that module's own docstring
 records the resulting "recorded gap" of an under-specified one-shot
 invocation) — this bootstrap needs only these three values, so it parses
@@ -443,8 +444,8 @@ def _catalog_conf(catalog: str) -> dict[str, str]:
     names only `--spec-uri`/`--catalog`/`--env`; `main()` is the real-AWS
     path, matching `create_run_ledger.main`'s own documented-untested
     shape). No `spark.jars.packages` — Glue 5.0 ships the Iceberg runtime
-    natively (I-1), the same reason `glue_main._catalog_conf` sets none;
-    the local Hadoop-catalog jar-download conf is test-substrate-only
+    natively (I-1), the same reason `entrypoints/session.py::catalog_conf`
+    sets none; the local Hadoop-catalog jar-download conf is test-substrate-only
     (`tests/conftest.py::_iceberg_conf`)."""
     return {
         "spark.sql.extensions": _ICEBERG_EXTENSIONS,
@@ -456,7 +457,7 @@ def _catalog_conf(catalog: str) -> dict[str, str]:
 def _build_session(env: str, catalog: str) -> SparkSession:
     from pyspark.sql import SparkSession  # local import -- keeps this module importable
 
-    # without a live JVM even being reachable (mirrors `glue_main._build_session`).
+    # without a live JVM even being reachable (mirrors `entrypoints/session.py::build_session`).
     builder = SparkSession.builder.appName(f"conveyer-spine-bootstrap-admission-{env}")
     for key, value in _catalog_conf(catalog).items():
         builder = builder.config(key, value)

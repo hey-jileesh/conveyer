@@ -312,3 +312,59 @@ def test_main_returns_zero_against_the_real_spine_root(capsys: pytest.CaptureFix
 
     assert exit_code == 0
     assert out == ""
+
+
+# --- [DS-4]/[DS2-2] CODEOWNERS (conveyer-6pg.35 item 3; widened by F-1/F-3, --
+# security gate `wf_c9aadeb2-8eb`, this bead conveyer-swb.30) ----------------
+# 006.1 §16.8's approver pair (platform data-architecture owner + security-
+# gate countersign) governs growth of `core/check_grammar.py`/its corpus AND
+# -- 007.1 §15/§16's [DC2-2]/[DS2-2] extension -- growth of THIS linter
+# engine's banned-attribute profile or its per-file exemption list. F-3
+# widens the governed set to the files 006.1 §16.8's own row already NAMED
+# in prose but CODEOWNERS never mechanically covered: the grammar engine
+# itself, its G-07/G-08 corpus tests, and (F-1's own subject this same
+# bead) the per-pipeline IAM policy document the "never database-wide"
+# invariant is expressed in. Asserts the CODEOWNERS artifact covers every
+# governed file identically (never that GitHub actually enforces
+# two-reviewer count today -- this repo has exactly one accredited
+# identity; see the file's own header comment for the recorded gap).
+
+_CODEOWNERS_GOVERNED_PATHS = (
+    "tools/purity_linter.py",
+    "tools/linter_configs/spine.py",
+    "spine/spine/core/check_grammar.py",
+    "spine/tests/unit/test_check_grammar.py",
+    "spine/spine/probes/g08_parity.py",
+    "spine/tests/frames/test_business_checks.py",
+    "spine/terraform/modules/spine-pipeline/iam.tf",
+)
+
+
+def test_codeowners_covers_the_linter_engine_and_config() -> None:
+    repo_root = Path(__file__).resolve().parents[3]  # .../conveyer (repo root)
+    codeowners_path = repo_root / ".github" / "CODEOWNERS"
+    assert codeowners_path.is_file(), "expected .github/CODEOWNERS at the repo root"
+
+    owned: dict[str, list[str]] = {}
+    for line in codeowners_path.read_text(encoding="utf-8").splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        path, *owners = stripped.split()
+        owned[path] = owners
+
+    for governed in _CODEOWNERS_GOVERNED_PATHS:
+        assert governed in owned, f"CODEOWNERS is missing the [DS-4]/[DS2-2] entry: {governed}"
+        assert owned[governed], f"CODEOWNERS lists no owner for {governed}"
+
+    # Every governed file is ONE pair's surface (§15's own framing: "an
+    # exemption is precisely a licensed hole in the construction") -- they
+    # must all carry the IDENTICAL owner set, never allowed to drift apart
+    # into a laxer review bar for any one of them.
+    owner_sets = {governed: set(owned[governed]) for governed in _CODEOWNERS_GOVERNED_PATHS}
+    first_governed, first_owners = next(iter(owner_sets.items()))
+    for governed, owners in owner_sets.items():
+        assert owners == first_owners, (
+            f"CODEOWNERS owner set for {governed!r} ({owners}) drifted from "
+            f"{first_governed!r} ({first_owners}) -- this is one governed pair, not several"
+        )

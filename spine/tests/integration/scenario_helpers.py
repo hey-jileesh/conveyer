@@ -83,7 +83,7 @@ from spine.core.model import (
     PipelineSpecModel,
     RawContractModel,
     ReadSpecModel,
-    RowCheckModel,
+    parse_pipeline_spec_yaml,
 )
 
 if TYPE_CHECKING:
@@ -92,6 +92,9 @@ if TYPE_CHECKING:
 CATALOG_PREFIX = "spine_cat."
 EXEMPLAR_DIR = Path(__file__).resolve().parent.parent / "exemplar" / "identity"
 FIXTURES_DIR = EXEMPLAR_DIR / "fixtures"
+IDENTITY_VIOLATIONS_EXEMPLAR_DIR = (
+    Path(__file__).resolve().parent.parent / "exemplar" / "identity_violations"
+)
 
 
 def bare(qualified_table: str) -> str:
@@ -141,13 +144,18 @@ IDENTITY_FACT_SCHEMA = FactSchemaModel(
     record_key=["domain_id"],
     # B10 (bead conveyer-6pg.22, 007.1 §4.1/§8.1): `ordering` may be empty
     # ("order = (source_ts, content_hash)", `FactSchemaModel.ordering`'s own
-    # docstring) -- but `source_ts` stays NULL for every fact in Phase 1
-    # (`stages/commit.py`'s own module docstring: no data source yet), so an
-    # EMPTY declared ordering here would collapse the exemplar's fold order
-    # to `content_hash`-only -- an arbitrary-but-deterministic winner, not
-    # the event-time LWW semantics `pipelines.identity.transforms`'s own
+    # docstring) -- but `source_ts` (HLD 007 D-3(b): `= ` the batch's own
+    # `received_at`, fixed by U-1's fix in `stages/commit.py`) is the SAME
+    # single value for EVERY candidate row of one batch (one `LineageStamp`
+    # per attempt) -- an EMPTY declared ordering here would still collapse
+    # the fold order WITHIN one batch to `content_hash`-only (every row of a
+    # batch ties on `source_ts` by construction), and, across batches, would
+    # order purely by delivery-arrival time -- neither is the event-time
+    # (business-time) LWW semantics `pipelines.identity.transforms`'s own
     # module docstring and the R-07 scenario suite both document and assert
-    # on. Declaring `event_time` here is what makes `core.merge.merge_spec`'s
+    # on (R-07 folds two batches OUT of arrival order deliberately, so an
+    # arrival-time-only order would fold them the WRONG way round).
+    # Declaring `event_time` here is what makes `core.merge.merge_spec`'s
     # per-type `MergeSpec.ordering_cols` = `(event_time, source_ts,
     # content_hash)` -- the SAME triple v1's hardcoded `frames.folds.
     # LWW_ORDERING_COLUMNS` used, now sourced from the declaration instead
@@ -225,22 +233,18 @@ def create_markers_table_for(spark: SparkSession, spec: PipelineSpecModel) -> No
     create_markers_table(spark, markers_table_for(spec))
 
 
-# 006.1 §12.2/G-12: the violations variant's rule now lives in `checks.yaml`
-# (declared data), not a second Python `post_check` -- see `pipelines.
-# identity_violations.transforms`'s own module docstring. Bound to the
-# `identity` fact type; fails iff `payload` equals the fixture's own
-# violation marker.
-VIOLATIONS_CHECKS = ChecksModel(
-    checks=[
-        RowCheckModel(
-            kind="row",
-            id="no-invalid-payload",
-            fact_type="identity",
-            expr="payload != 'INVALID'",
-            reason="business/negative-amount",
-        )
-    ]
-)
+# 006.1 §12.2/G-12 (A006-10, bead conveyer-swb.14): the violations variant's
+# rule now lives in `checks.yaml`-shaped AUTHORED DATA (`tests/exemplar/
+# identity_violations/pipeline.yaml`), not a hand-built Python `ChecksModel`
+# constant -- parsed through the SAME strict `parse_pipeline_spec_yaml`
+# loader every deployed spec uses, so this constant stays a real artifact of
+# a committed yaml file, not a parallel Python-authored copy of its rule.
+# Bound to the `identity` fact type; fails iff `payload` equals the
+# fixture's own violation marker (`pipelines.identity_violations.
+# transforms.VIOLATION_MARKER`).
+VIOLATIONS_CHECKS = parse_pipeline_spec_yaml(
+    (IDENTITY_VIOLATIONS_EXEMPLAR_DIR / "pipeline.yaml").read_text()
+).checks
 
 
 def make_spec(

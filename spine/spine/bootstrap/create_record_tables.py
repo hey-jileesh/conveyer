@@ -36,7 +36,13 @@ small, deliberate, independent copy -- the SAME "mirror the shape, don't
 cross-import the CLI plumbing" choice `create_admission_tables.py`'s own
 docstring already makes about `create_run_ledger.py`, applied symmetrically
 here to keep the two per-pipeline bootstrap scripts independently runnable
-and reviewable.
+and reviewable. (This bootstrap's own `_catalog_conf`/`_build_session` are
+its OWN private names, distinct from -- and independent of -- `entrypoints/
+session.py`'s shared PUBLIC `catalog_conf`/`build_session` that
+`glue_main.py`/`rebuild_main.py` both import, F2, bead conveyer-swb.25: that
+fix stopped the two ENTRYPOINTS duplicating each other, but this bootstrap
+script's own deliberate copy of the same shape was never in that fix's
+scope.)
 
 **The marker table (§6.3, §6.5 step 4).** `MARKER_COLUMNS` is a VERSIONLESS
 CONSTANT (framework-owned shape, D-7's "quarantine's pattern" restated) --
@@ -104,6 +110,7 @@ from spine.bootstrap.create_admission_tables import (
     render_set_table_class_sql,
 )
 from spine.core import naming, record
+from spine.core.merge import quote_identifier
 from spine.core.model import FactSchemaModel, PipelineSpecModel, parse_pipeline_spec_yaml
 
 if TYPE_CHECKING:
@@ -196,6 +203,28 @@ def fact_and_state_columns_ordered(schema: FactSchemaModel) -> tuple[ColumnDDL, 
     return stamps + declared
 
 
+def _escape_sql_string_literal(value: str) -> str:
+    """conveyer-6pg.35 item 2: TBLPROPERTIES value rendering defense in
+    depth -- every value passed today is a framework constant or an
+    already-validated field (`table_class` literals, `_STATE_MERGE_
+    PROPERTIES`), never externally controlled, but `bootstrap/**` sits
+    outside the linter's string-SQL sink profile (the priced residual), so
+    this module escapes anyway rather than relying on that fact holding
+    forever.
+
+    **Kernel-verified grammar fact (this bead) -- Spark SQL string literals
+    do NOT use ANSI's doubled-quote escape.** `'a''b'` parses as the
+    adjacent-literal-concatenation `'a'` + `'b'` -> `"ab"` (the embedded
+    quote is silently EATEN, not escaped) -- confirmed via a live
+    `spark.sql("SELECT 'a''b'")` probe. The backslash form (`\\'`) is what
+    actually round-trips a literal embedded quote; backslashes themselves
+    must therefore be escaped FIRST (so an already-backslash-escaped input
+    is never double-unescaped), then quotes -- verified round-trip-clean
+    through a real `spark.sql(...)` for both a quote-only and a
+    quote-plus-backslash value."""
+    return value.replace("\\", "\\\\").replace("'", "\\'")
+
+
 def _render_create_table_sql(
     qualified_table: str,
     columns: tuple[ColumnDDL, ...],
@@ -210,11 +239,12 @@ def _render_create_table_sql(
     version`/`conveyer.table-class` always stamped), extended with
     `extra_properties` for the state table's merge-mode/isolation-level
     pair (§6.2) -- a new function, not a signature change to admission's
-    already-tested one."""
+    already-tested one. TBLPROPERTIES values pass through `_escape_sql_
+    string_literal` (conveyer-6pg.35 item 2)."""
     cols_sql = ", ".join(render_column_def(c) for c in columns)
     partition_sql = f" PARTITIONED BY ({', '.join(partition_by)})" if partition_by else ""
     properties = {"format-version": "2", "conveyer.table-class": table_class, **extra_properties}
-    props_sql = ", ".join(f"'{k}'='{v}'" for k, v in properties.items())
+    props_sql = ", ".join(f"'{k}'='{_escape_sql_string_literal(v)}'" for k, v in properties.items())
     return (
         f"CREATE TABLE {qualified_table} ({cols_sql}) USING iceberg{partition_sql} "
         f"TBLPROPERTIES ({props_sql})"
@@ -318,7 +348,9 @@ def _assert_and_repair_state_properties(spark: SparkSession, qualified_table: st
         qualified_table,
         {k: (current.get(k), v) for k, v in drifted.items()},
     )
-    props_sql = ", ".join(f"'{k}'='{v}'" for k, v in _STATE_MERGE_PROPERTIES.items())
+    props_sql = ", ".join(
+        f"'{k}'='{_escape_sql_string_literal(v)}'" for k, v in _STATE_MERGE_PROPERTIES.items()
+    )
     spark.sql(f"ALTER TABLE {qualified_table} SET TBLPROPERTIES ({props_sql})")
 
 
@@ -343,7 +375,15 @@ def bootstrap_state_table(
                 extra_properties=_STATE_MERGE_PROPERTIES,
             )
         )
-        spark.sql(f"ALTER TABLE {qualified_table} WRITE ORDERED BY {schema.domain_id_col}")
+        # conveyer-6pg.35 item 2: `quote_identifier` (defense in depth --
+        # `domain_id_col` is already `COLUMN_NAME_RE`-validated at bind
+        # time, `FactSchemaModel._check_columns`'s membership check, the
+        # identical grammar `core.merge.quote_identifier`'s own callers
+        # already trust unvalidated-a-second-time, e.g. `frames/checks.py`).
+        spark.sql(
+            f"ALTER TABLE {qualified_table} WRITE ORDERED BY "
+            f"{quote_identifier(schema.domain_id_col)}"
+        )
         return
     actual = _actual_columns_by_name(spark, qualified_table)
     declared_names = frozenset(c.name for c in schema.columns)
@@ -435,7 +475,17 @@ def assert_table_prefixes(spec: PipelineSpecModel) -> None:
 
 
 def _qualified(catalog: str, table: str) -> str:
-    return f"{catalog}.{table}"
+    """conveyer-6pg.35 item 2: `--catalog` (a `main()` CLI arg, default
+    `spine_cat`) previously composed unvalidated -- no reachable injection
+    today (Terraform-pinned in prod; `table` is always this module's own
+    already-validated fact/state/marker name), but bootstrap/** sits
+    outside the linter's string-SQL sink profile. `naming.check_qualified_
+    table` validates EVERY dot-component of the composed identifier
+    (catalog included) against `_IDENTIFIER_RE` before it reaches a `spark.
+    sql(...)` DDL string -- the same "validate before composing" idiom
+    `naming.qualified` already applies to the framework's own default
+    catalog."""
+    return naming.check_qualified_table(f"{catalog}.{table}")
 
 
 def bootstrap_record_tables(spark: SparkSession, catalog: str, spec: PipelineSpecModel) -> None:
