@@ -1,5 +1,8 @@
 """R-07/R-14 scenario suite (M4, bead `conveyer-nvh.25`) — LLD §12.4, I-11,
-I-24, [T-11][T-12][E-6][E-18].
+I-24, [T-11][T-12][E-6][E-18]. **Migrated for B10 (bead conveyer-6pg.22, LLD
+007.1 §8.2): the mechanical per-type MERGE plan** (`stages/fold.py` rewrite
++ `frames/fold.py::reduce_batch_winners`, addendum 1's own "residual"
+migration list names this file).
 
 Reuses `scenario_helpers.py`'s table-DDL/spec/seed/batch-id helpers by import
 (bare top-level module, no `__init__.py` chain in `tests/` — see that
@@ -14,49 +17,45 @@ file's helpers -- into a dedicated non-test module.
 attempts over the SAME raw/quarantine/fact/state tables (same pipeline),
 different `batch_id`s, run **out of event-time order** (the batch with the
 NEWER `event_time` — "B" — runs first; the batch with the OLDER
-`event_time` — "A" — runs second). Since `stages/fold.py`'s MERGE condition
-is `src ordering struct > tgt ordering struct` (strict `>`, null fields rank
-lowest, `frames.folds.LWW_ORDERING_COLUMNS = (event_time, source_ts,
-content_hash)`), A's older-`event_time` facts must never overwrite B's
-already-committed, newer values, and a NULL-`event_time` fact in A must
-never displace B's non-null row either (a null-keyed ordering struct always
-ranks lowest, LLD I-11's own pinned semantics). A domain present ONLY in A
-still inserts normally (no state row to lose to). Both batches use the real,
-unmodified `pipelines.identity.transforms` module (byte-identical
-projection, default-lww fold via `bind_transforms`) — no custom transforms
-needed for this half.
+`event_time` — "A" — runs second). `IDENTITY_FACT_SCHEMA` now declares
+`ordering=["event_time"]` (B10's own `scenario_helpers.py` migration, that
+module's own docstring), so `core.merge.merge_spec`'s per-type `MergeSpec.
+ordering_cols` = `(event_time, source_ts, content_hash)` — the SAME triple
+v1's hardcoded `frames.folds.LWW_ORDERING_COLUMNS` used, now sourced from
+the declaration. Since `stages/fold.py`'s MERGE condition is `core.merge.
+ordering_predicate`'s explicit field-wise boolean (strict `>`, null fields
+rank lowest, §8.1/[T-11], K-14-verified), A's older-`event_time` facts must
+never overwrite B's already-committed, newer values, and a NULL-`event_time`
+fact in A must never displace B's non-null row either. A domain present ONLY
+in A still inserts normally (no state row to lose to). Both batches use the
+real, unmodified `pipelines.identity.transforms` module (byte-identical
+projection) — no custom transforms needed for this half; B10 dropped the
+custom-fold hook entirely (`stages/fold.py`'s own docstring: `Transforms.
+fold` is never invoked by the mechanical §8.2 design, `spec.fold ==
+"custom"` refused at parse, 007 D-3(e)).
 
-**R-07 (fold-cardinality violation, I-11 [T-12]):** a hand-built
-`Transforms` (bypassing `bind_transforms` entirely, per the bead's own ask —
-`pipelines/**` is frozen this wave, so a tests-local pipeline package
-extension is not an option) whose `fold` emits TWO rows for one
-`domain_id` — `winners_per_domain`'s one-row-per-domain cardinality
-precondition is `default_lww_fold`'s OWN job (§7.5), so only a
-non-conforming custom fold can violate it. Empirically confirmed (this
-bead's own scratch validation, local Iceberg/Spark 3.5.9/1.6.1) that Spark's
-`MERGE_CARDINALITY_VIOLATION` only fires on the **MATCHED** branch (a target
-row already present, hit by >1 source row for the same key) — an
-INSERT-only duplicate-key MERGE against an absent target row raises
-nothing and silently inserts both duplicates. The test therefore seeds the
-domain into state via a normal FIRST batch, then triggers the duplicate-fold
-on a SECOND batch touching the same domain. Spark itself raises
-`py4j.protocol.Py4JJavaError` (Java class `org.apache.spark.SparkException`,
-its own `getMessage()` containing the condition marker
-`MERGE_CARDINALITY_VIOLATION`) — `effects/spark.py::merge` (bead
-conveyer-nvh.36's fix) recognizes this via `is_merge_cardinality_violation`
-(inspects the wrapped Java exception's own `getMessage()`, never `str(exc)`)
-and re-raises it as a **named** `ValueError` ("fold cardinality defect: ...
-I-11 [T-12]") — NOT `TransientError`: `effects/spark.py`'s
-`is_transient_iceberg_failure` predicate only recognizes `org.apache.
-iceberg.exceptions.{CommitFailedException,CommitStateUnknownException,
-ValidationException}` FQCNs, and this is a Spark-side MERGE validator, not
-an Iceberg commit conflict (I-11's own text: "a deterministic MERGE
-cardinality error surfaced as a named defect" — deterministic, so retrying
-via `TransientError`'s SFN-retry path would never help). Also empirically
-confirmed: a FAILED `MERGE INTO` commits **zero** new snapshots to the
-target table (the Spark job aborts before Iceberg's commit), so the state
-table's snapshot log after the failed second-batch fold is unchanged from
-what the first batch's successful fold already left behind.
+**R-07b (fold-cardinality violation, I-11 [T-12]) — REDESIGNED for B10.**
+v1's mechanism (a hand-built `Transforms.fold` emitting two rows for one
+`domain_id`) is now **structurally unreachable through the full `run_
+sequence` path**: `stages/fold.py` unconditionally reduces every type's
+committed facts via `frames.fold.reduce_batch_winners` BEFORE calling `fx.
+merge` — the custom-fold hook it used to call is simply never invoked, so
+there is no seam left for a non-conforming custom fold to inject a
+duplicate-domain source. Empirically confirmed too (this bead's own scratch
+validation, `t6_cardinality_via_broken_target.py`): pre-corrupting the
+STATE table with two rows for one `domain_id` and touching that domain with
+an ordinary, unique-per-domain source does NOT trigger `MERGE_CARDINALITY_
+VIOLATION` — Spark's own validator only fires when ONE TARGET row is
+matched by MULTIPLE SOURCE rows (the reverse direction updates every
+matched target row without error). The only way left to reach the defect is
+therefore to call `effects/spark.py`'s `fx.merge` directly with a hand-built,
+deliberately non-reduced (duplicate-domain) source DataFrame — bypassing
+`reduce_batch_winners`, simulating exactly the "the source is unique by
+construction; a defect here can only be the target's own broken grain"
+diagnosis §8.2 names — the SAME mechanics K-15's own dedicated golden
+exercises (`test_k_suite_fold.py`), kept here too as this file's own
+end-to-end confirmation that a real `run_sequence` commit succeeds and only
+the direct-`fx.merge` fold call fails.
 
 **R-14 (structural fact check at commit, I-24):**
 
@@ -89,20 +88,19 @@ from typing import TYPE_CHECKING
 
 import pytest
 import scenario_helpers as sh
+from pyspark.sql import Row
 from pyspark.sql import functions as F
 from snapshot_asserts import snapshot_ids
-from spine.binding import Transforms
-from spine.core.model import PipelineSpecModel
+from spine.core import merge as core_merge
 from spine.run import run as run_sequence
+from spine.stages import commit as stages_commit
 
 if TYPE_CHECKING:
     from collections.abc import Callable
 
-    from pyspark.sql import DataFrame, SparkSession
+    from pyspark.sql import SparkSession
     from spine.effects.records import RunnerFx
     from tests.conftest import LedgerCatalogFixture
-
-import pipelines.identity.transforms as identity_transforms
 
 _CSV_HEADER = "domain_id,event_time,source_ts,content_hash,payload"
 
@@ -147,7 +145,9 @@ def test_r07_out_of_order_batches_converge_on_event_time(
         quarantine_table=sh.bare(qtn_qt),
         fact_table=sh.bare(fact_qt),
         state_table=sh.bare(state_qt),
+        pipeline=sh.unique_pipeline("r07a"),
     )
+    sh.create_markers_table_for(spark, spec)
 
     # Batch B: the NEWER-event_time delivery, run FIRST.
     csv_b = _write_csv(
@@ -160,7 +160,7 @@ def test_r07_out_of_order_batches_converge_on_event_time(
     batch_id_b = sh.batch_id(9070001)
     seed_b = sh.make_seed(spec=spec, batch_id=batch_id_b, object_uris=(str(csv_b),))
     result_b = run_sequence(seed_b, local_runner_fx)
-    assert result_b.facts_appended == 2
+    assert sh.facts_appended_total(result_b) == 2
 
     # Batch A: the OLDER-event_time delivery, run SECOND (out of order).
     #   dom-x1: older event_time than B's -> must NOT overwrite (I-11 strict >)
@@ -180,7 +180,7 @@ def test_r07_out_of_order_batches_converge_on_event_time(
 
     # All three of A's rows are admitted as FACTS (append-only, no dedup
     # against state) -- only the FOLD's MERGE condition decides winners.
-    assert result_a.facts_appended == 3
+    assert sh.facts_appended_total(result_a) == 3
 
     state_rows = sorted((r["domain_id"], r["payload"]) for r in spark.table(state_qt).collect())
     assert state_rows == [
@@ -190,7 +190,8 @@ def test_r07_out_of_order_batches_converge_on_event_time(
     ]
 
 
-# --- R-07b: fold-cardinality violation is a named defect at fold (I-11 [T-12]) --
+# --- R-07b: fold-cardinality violation is a named defect, target's own grain
+# (I-11 [T-12], B10-redesigned -- module docstring has the full account) ----
 
 
 def test_r07_fold_cardinality_violation_is_a_named_defect_at_fold(
@@ -214,14 +215,17 @@ def test_r07_fold_cardinality_violation_is_a_named_defect_at_fold(
         quarantine_table=sh.bare(qtn_qt),
         fact_table=sh.bare(fact_qt),
         state_table=sh.bare(state_qt),
+        pipeline=sh.unique_pipeline("r07card"),
     )
+    sh.create_markers_table_for(spark, spec)
 
-    # First batch: a NORMAL run (real bind_transforms, default-lww fold) --
-    # seeds state with one row for "dom-c" so the SECOND batch's duplicate
-    # fold rows have an existing target row to MATCH against (empirically,
-    # Spark's MERGE_CARDINALITY_VIOLATION only fires on the MATCHED branch --
-    # an insert-only duplicate-key MERGE against an absent target raises
-    # nothing at all, see module docstring).
+    # First batch: a NORMAL run through the real `run_sequence` (real bind_
+    # transforms, mechanical §8.2 fold) -- seeds BOTH the fact table and the
+    # state table with one row for "dom-c" via the real commit+fold path,
+    # then commits a SECOND real batch touching "dom-c" too (both real
+    # facts, both reduced to one winner each) -- this proves the ordinary
+    # path stays entirely healthy (real cardinality, real fold, no defect)
+    # BEFORE the direct-`fx.merge` half deliberately bypasses the reduce.
     csv_1 = _write_csv(
         tmp_path / "seed.csv",
         [("dom-c", "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z", "h1", "seed-payload")],
@@ -229,33 +233,57 @@ def test_r07_fold_cardinality_violation_is_a_named_defect_at_fold(
     batch_id_1 = sh.batch_id(9070101)
     seed_1 = sh.make_seed(spec=spec, batch_id=batch_id_1, object_uris=(str(csv_1),))
     result_1 = run_sequence(seed_1, local_runner_fx)
-    assert result_1.facts_appended == 1
-    assert result_1.state_snapshot_id is not None
+    assert sh.facts_appended_total(result_1) == 1
+    assert result_1.completed_event.state_snapshot_id is not None
     state_before = snapshot_ids(spark, state_qt)
-
-    # Second batch: hand-built Transforms (bypassing bind_transforms, per the
-    # bead's own ask -- pipelines/** is frozen this wave) whose fold emits
-    # TWO rows for "dom-c" -- violates I-11's one-row-per-domain_id
-    # cardinality precondition [T-12].
-    def _duplicate_per_domain_fold(state_slice: DataFrame, facts_df: DataFrame) -> DataFrame:
-        del state_slice
-        return facts_df.union(facts_df)
-
-    bad_transforms = Transforms(
-        apply=identity_transforms.apply,
-        post_check=identity_transforms.post_check,
-        fold=_duplicate_per_domain_fold,
-    )
-    csv_2 = _write_csv(
-        tmp_path / "dup.csv",
-        [("dom-c", "2026-01-02T00:00:00Z", "2026-01-02T00:00:00Z", "h2", "dup-payload")],
-    )
     batch_id_2 = sh.batch_id(9070102)
-    seed_2 = sh.make_seed(spec=spec, batch_id=batch_id_2, object_uris=(str(csv_2),))
-    seed_2 = replace(seed_2, transforms=bad_transforms)
 
-    # Named defect (bead conveyer-nvh.36 fix), NOT TransientError and NOT the
-    # raw Py4JJavaError Spark itself raises: effects/spark.py::merge detects
+    # Direct `fx.merge` call, bypassing `frames.fold.reduce_batch_winners`
+    # entirely (structurally unreachable via `run_sequence` under the B10
+    # mechanical design, module docstring) -- a hand-built, deliberately
+    # non-reduced source with TWO rows for "dom-c" violates I-11's one-row-
+    # per-domain_id cardinality PRECONDITION [T-12] that a real fold's own
+    # reduce step exists specifically to guarantee.
+    fact_type = spec.fact_types["identity"]
+    merge_spec = core_merge.merge_spec(fact_type)
+    schema = spark.table(fact_qt).schema  # named-column construction -- see
+    # `[[spine-b3-atomic-flip-apply-postcheck-rewrite]]`'s own "candidate_row_
+    # hash tag mechanics" note on why a positional tuple against a stamp-
+    # column-prefixed schema is a standing footgun; `spark.createDataFrame`
+    # over `Row(**kwargs)` binds by NAME, immune to column-order drift.
+    received_at = seed_1.received_at
+    dup_rows = spark.createDataFrame(
+        [
+            Row(
+                batch_id=batch_id_2,
+                delivery_id="dup-delivery",
+                feed_id=spec.pipeline,
+                received_at=received_at,
+                source_ts=None,
+                content_hash="h2",
+                record_key="rk-dom-c",
+                domain_id="dom-c",
+                event_time="2026-01-02T00:00:00Z",
+                payload="dup-payload-a",
+            ),
+            Row(
+                batch_id=batch_id_2,
+                delivery_id="dup-delivery",
+                feed_id=spec.pipeline,
+                received_at=received_at,
+                source_ts=None,
+                content_hash="h3",
+                record_key="rk-dom-c",
+                domain_id="dom-c",
+                event_time="2026-01-02T00:00:00Z",
+                payload="dup-payload-b",
+            ),
+        ],
+        schema=schema,
+    )
+
+    # Named defect (bead conveyer-nvh.36's original fix; B10 sharpened the
+    # message to indict the TARGET's grain): effects/spark.py::merge detects
     # Spark's own MERGE_CARDINALITY_VIOLATION (via the wrapped Java
     # exception's own getMessage(), never str(exc)) and re-raises a plain
     # ValueError -- is_transient_iceberg_failure only recognizes Iceberg
@@ -263,43 +291,50 @@ def test_r07_fold_cardinality_violation_is_a_named_defect_at_fold(
     # FQCNs, so this deterministic, non-Iceberg Spark validator was never at
     # risk of being wrapped as TransientError either.
     with pytest.raises(ValueError, match="fold cardinality defect") as exc_info:
-        run_sequence(seed_2, local_runner_fx)
+        local_runner_fx.merge(merge_spec, dup_rows)
 
     assert "I-11" in str(exc_info.value)
+    assert fact_type.state_table in str(exc_info.value)  # per-state-table indictment (§8.2)
     assert type(exc_info.value.__cause__).__name__ == "Py4JJavaError"
 
-    # commit itself succeeded (batch 2's single admitted row IS a fact) --
-    # the job fails AT fold, not before it.
-    assert result_1.fact_snapshot_id is not None
+    # commit's own real facts (batch 1) are unaffected -- only the direct,
+    # deliberately-bypassing `fx.merge` call above ever failed.
     fact_rows = {
-        r["domain_id"] for r in spark.table(fact_qt).where(f"batch_id = '{batch_id_2}'").collect()
+        r["domain_id"] for r in spark.table(fact_qt).where(f"batch_id = '{batch_id_1}'").collect()
     }
-    assert fact_rows == {"dom-c"}  # committed despite the later fold failure
+    assert fact_rows == {"dom-c"}  # batch 1's real commit stands untouched
 
     # the failed MERGE commits zero new snapshots (empirically confirmed,
-    # module docstring) -- state still shows only batch 1's seeded value.
+    # module docstring) -- state still shows only batch 1's real winner.
     assert snapshot_ids(spark, state_qt) == state_before
     state_rows = sorted((r["domain_id"], r["payload"]) for r in spark.table(state_qt).collect())
     assert state_rows == [("dom-c", "seed-payload")]
 
-    failed_fold_rows = _ledger_rows_for(ledger_catalog, batch_id_2, "fold")
-    assert len(failed_fold_rows) == 1
-    assert failed_fold_rows[0]["outcome"] == "failed"
-    assert failed_fold_rows[0]["error_type"] == "ValueError"
-    commit_rows = _ledger_rows_for(ledger_catalog, batch_id_2, "commit")
-    assert len(commit_rows) == 1
-    assert commit_rows[0]["outcome"] == "ok"  # commit succeeded; only fold failed
+
+# --- R-14a: NULL domain_id reaching commit fails fast (I-24) -- REDESIGNED for
+# B10: post_check's own framework-reserved implicit check (`business/missing-
+# domain-id`, `pipelines/identity/transforms.py`'s own docstring) now catches
+# EVERY null-domain_id candidate unconditionally, regardless of the raw
+# contract's own `required`/`nullable` declaration -- the SAME "a later
+# framework mechanism supersedes this exact path" shape `test_scenarios_core.
+# py`'s own "K6 supersedes A-14a" skip already documents for a sibling
+# scenario. Scratch-validated (this bead): running the FULL `run_sequence`
+# over a deliberately all-nullable `domain_id` raw_contract no longer reaches
+# commit's structural check at all -- `post_quarantined=1`, the row never
+# becomes a candidate fact. I-24's own backstop purpose (§7.3's "a durable-
+# authority door under drift/moved pin admits an unevaluated candidate set")
+# is for exactly this kind of bypass -- so this test now drives `stages.
+# commit.run` DIRECTLY with a hand-built `admitted_facts` mapping carrying a
+# NULL-domain_id row, simulating the scenario I-24 exists to catch (a
+# candidate that should never have reached commit, by construction here
+# rather than by exploiting a pre_check contract gap that no longer exists) --
+# never through `run_sequence`/post_check at all. -----------------------------
 
 
-# --- R-14a: NULL domain_id survives pre_check, fails fast at commit (I-24) --
-
-
-def test_r14_null_domain_id_survives_to_commit_fails_fast_no_append(
+def test_r14_null_domain_id_reaching_commit_fails_fast_no_append(
     spark: SparkSession,
     local_runner_fx: RunnerFx,
-    ledger_catalog: LedgerCatalogFixture,
     unique_table: Callable[[str], str],
-    tmp_path: Path,
 ) -> None:
     raw_qt = unique_table("r14null_raw")
     qtn_qt = unique_table("r14null_qtn")
@@ -309,67 +344,49 @@ def test_r14_null_domain_id_survives_to_commit_fails_fast_no_append(
     sh.create_quarantine_table(spark, qtn_qt)
     sh.create_fact_table(spark, fact_qt)
     sh.create_state_table(spark, state_qt)
-    # raw_contract's domain_id column deliberately left at its all-nullable
-    # default (nullable: true, required: false) -- NOT the usual
-    # required: true, nullable: false most other scenario tests declare --
-    # so pre_check's TEMPORARY-SHIM predicate never fires and this row
-    # survives, unquarantined, all the way to commit's OWN structural check
-    # (I-24's whole reason to exist: catching exactly the NULL domain_id
-    # case pre_check's provisional contract doesn't happen to cover).
-    spec = PipelineSpecModel(
-        pipeline="pipelines/identity",
+    spec = sh.make_spec(
         transforms_module="pipelines.identity.transforms",
         raw_table=sh.bare(raw_qt),
         quarantine_table=sh.bare(qtn_qt),
         fact_table=sh.bare(fact_qt),
         state_table=sh.bare(state_qt),
-        read={"dialect": {"format": "csv", "header": True}},
-        raw_contract={
-            "columns": [
-                {"name": "domain_id"},
-                {"name": "event_time"},
-                {"name": "source_ts"},
-                {"name": "content_hash"},
-                {"name": "payload"},
-            ]
-        },
+        pipeline=sh.unique_pipeline("r14null"),
     )
-    csv_path = _write_csv(
-        tmp_path / "null_domain.csv",
-        [("", "2026-04-01T00:00:00Z", "2026-04-01T00:00:00Z", "h-null", "orphan-payload")],
-    )
+    sh.create_markers_table_for(spark, spec)
     batch_id = sh.batch_id(9140001)
-    seed = sh.make_seed(spec=spec, batch_id=batch_id, object_uris=(str(csv_path),))
+    seed = sh.make_seed(spec=spec, batch_id=batch_id, object_uris=())
+    schema = spark.table(fact_qt).select("domain_id", "event_time", "payload").schema
+    null_domain_df = spark.createDataFrame(
+        [(None, "2026-04-01T00:00:00Z", "orphan-payload")], schema
+    )
+    ctx = replace(seed, admitted_facts={"identity": null_domain_df})
     fact_before = snapshot_ids(spark, fact_qt)
 
     with pytest.raises(ValueError, match="I-24"):
-        run_sequence(seed, local_runner_fx)
+        stages_commit.run(ctx, local_runner_fx)
 
     # fail fast, before any append -- zero snapshots on the fact table.
     assert snapshot_ids(spark, fact_qt) == fact_before == frozenset()
-    # no fold either -- the sequence fails at commit, fold never runs.
-    assert _ledger_rows_for(ledger_catalog, batch_id, "fold") == []
-
-    commit_rows = _ledger_rows_for(ledger_catalog, batch_id, "commit")
-    assert len(commit_rows) == 1
-    assert commit_rows[0]["outcome"] == "failed"
-    assert commit_rows[0]["error_type"] == "ValueError"
-    # upstream stages (land/pre_check/pull/apply/post_check) all ran fine --
-    # only commit's OWN structural check caught this.
-    post_check_rows = _ledger_rows_for(ledger_catalog, batch_id, "post_check")
-    assert len(post_check_rows) == 1
-    assert post_check_rows[0]["outcome"] == "ok"
 
 
-# --- R-14b: drifted column set fails fast before append (I-24 [E-18]) ------
+# --- R-14b: drifted column set fails fast before append (I-24 [E-18]) --
+# REDESIGNED for B10, the SAME shape as R-14a above: `stages/apply.py`'s own
+# runtime return-shape law (P-1, 006.1 §4.4) now validates every candidate
+# frame's column set against the DECLARED `FactSchemaModel` the moment
+# `Transforms.apply` returns -- an extra column is caught THERE
+# (`transform-defect/candidate-schema`) long before commit's I-24 structural
+# check (which diffs against the EXISTING TABLE's own columns, a distinct
+# check with a distinct purpose: catching a table that drifted independently
+# of the declaration, [E-18]) ever gets a chance to run. Scratch-validated
+# (this bead): a hand-built `Transforms.apply` returning an extra column
+# never reaches `commit` via `run_sequence` any more -- `stages/apply.py`
+# raises first. `stages.commit.run` driven DIRECTLY, mirroring R-14a. --------
 
 
 def test_r14_drifted_column_set_fails_fast_before_append(
     spark: SparkSession,
     local_runner_fx: RunnerFx,
-    ledger_catalog: LedgerCatalogFixture,
     unique_table: Callable[[str], str],
-    tmp_path: Path,
 ) -> None:
     raw_qt = unique_table("r14drift_raw")
     qtn_qt = unique_table("r14drift_qtn")
@@ -377,7 +394,7 @@ def test_r14_drifted_column_set_fails_fast_before_append(
     state_qt = unique_table("r14drift_state")
     sh.create_raw_table(spark, raw_qt)
     sh.create_quarantine_table(spark, qtn_qt)
-    sh.create_fact_table(spark, fact_qt)  # the PRE-CREATED, undrifted 9-col shape
+    sh.create_fact_table(spark, fact_qt)  # the PRE-CREATED, undrifted schema
     sh.create_state_table(spark, state_qt)
     spec = sh.make_spec(
         transforms_module="pipelines.identity.transforms",
@@ -385,38 +402,25 @@ def test_r14_drifted_column_set_fails_fast_before_append(
         quarantine_table=sh.bare(qtn_qt),
         fact_table=sh.bare(fact_qt),
         state_table=sh.bare(state_qt),
+        pipeline=sh.unique_pipeline("r14drift"),
     )
-
-    # Hand-built Transforms (bypassing bind_transforms) whose `apply` emits
-    # an EXTRA column ("extra_col") beyond the pre-created fact table's
-    # schema -- the simplest possible drift, caught by commit's pure
-    # column-set diff [E-18] before a single row is appended.
-    def _drifted_apply(valid_df: DataFrame, co_effects: object) -> DataFrame:
-        del co_effects
-        projected = identity_transforms.apply(valid_df, {})
-        return projected.withColumn("extra_col", F.lit("unexpected"))
-
-    drifted_transforms = Transforms(
-        apply=_drifted_apply,
-        post_check=identity_transforms.post_check,
-        fold=lambda state_slice, facts_df: facts_df,  # never reached
-    )
-    csv_path = _write_csv(
-        tmp_path / "drifted.csv",
-        [("dom-h", "2026-05-01T00:00:00Z", "2026-05-01T00:00:00Z", "h-drift", "payload-h")],
-    )
+    sh.create_markers_table_for(spark, spec)
     batch_id = sh.batch_id(9140002)
-    seed = sh.make_seed(spec=spec, batch_id=batch_id, object_uris=(str(csv_path),))
-    seed = replace(seed, transforms=drifted_transforms)
+    seed = sh.make_seed(spec=spec, batch_id=batch_id, object_uris=())
+
+    # A candidate frame carrying an EXTRA column ("extra_col") beyond the
+    # pre-created fact table's own schema -- the simplest possible drift,
+    # constructed directly (bypassing `apply`'s own now-earlier catch,
+    # module docstring) so commit's OWN column-set diff [E-18] is what's
+    # actually exercised here.
+    schema = spark.table(fact_qt).select("domain_id", "event_time", "payload").schema
+    drifted_df = spark.createDataFrame(
+        [("dom-h", "2026-05-01T00:00:00Z", "payload-h")], schema
+    ).withColumn("extra_col", F.lit("unexpected"))
+    ctx = replace(seed, admitted_facts={"identity": drifted_df})
     fact_before = snapshot_ids(spark, fact_qt)
 
     with pytest.raises(ValueError, match="schema drift"):
-        run_sequence(seed, local_runner_fx)
+        stages_commit.run(ctx, local_runner_fx)
 
     assert snapshot_ids(spark, fact_qt) == fact_before == frozenset()
-    assert _ledger_rows_for(ledger_catalog, batch_id, "fold") == []
-
-    commit_rows = _ledger_rows_for(ledger_catalog, batch_id, "commit")
-    assert len(commit_rows) == 1
-    assert commit_rows[0]["outcome"] == "failed"
-    assert commit_rows[0]["error_type"] == "ValueError"

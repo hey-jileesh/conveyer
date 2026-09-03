@@ -77,7 +77,13 @@ from scenario_helpers import (
     FIXTURES_DIR as _FIXTURES_DIR,
 )
 from scenario_helpers import (
+    IDENTITY_FACT_SCHEMA as _IDENTITY_FACT_SCHEMA,
+)
+from scenario_helpers import (
     IDENTITY_RAW_CONTRACT as _IDENTITY_RAW_CONTRACT,
+)
+from scenario_helpers import (
+    VIOLATIONS_CHECKS as _VIOLATIONS_CHECKS,
 )
 from scenario_helpers import (
     bare as _bare,
@@ -89,6 +95,9 @@ from scenario_helpers import (
     create_fact_table as _create_fact_table,
 )
 from scenario_helpers import (
+    create_markers_table_for as _create_markers_table_for,
+)
+from scenario_helpers import (
     create_quarantine_table as _create_quarantine_table,
 )
 from scenario_helpers import (
@@ -96,6 +105,9 @@ from scenario_helpers import (
 )
 from scenario_helpers import (
     create_state_table as _create_state_table,
+)
+from scenario_helpers import (
+    facts_appended_total as _facts_appended_total,
 )
 from scenario_helpers import (
     make_seed as _make_seed,
@@ -106,6 +118,12 @@ from scenario_helpers import (
 from scenario_helpers import (
     quarantine_rows as _quarantine_rows,
 )
+from scenario_helpers import (
+    rows_merged_total as _rows_merged_total,
+)
+from scenario_helpers import (
+    unique_pipeline as _unique_pipeline,
+)
 from snapshot_asserts import assert_no_new_snapshot, snapshot_ids
 from spine.binding import Transforms
 from spine.bootstrap.create_admission_tables import (
@@ -115,6 +133,7 @@ from spine.bootstrap.create_admission_tables import (
 from spine.core.model import (
     ColumnSpec,
     DialectModel,
+    FactTypeModel,
     PipelineSpecModel,
     RawContractModel,
     ReadSpecModel,
@@ -128,6 +147,20 @@ if TYPE_CHECKING:
     from tests.conftest import LedgerCatalogFixture, MotoEventsBus
 
 
+def _fact_types(fact_table: str, state_table: str) -> dict[str, FactTypeModel]:
+    """006.1 P-1 (bead conveyer-6pg.13, B3): the per-type `fact_types`
+    mapping every direct `PipelineSpecModel(...)` construction in this file
+    now needs, in place of the deleted singular `fact_table`/`state_table`
+    fields -- one `identity` type, `scenario_helpers.IDENTITY_FACT_SCHEMA`'s
+    own declared shape (matching `pipelines.identity.transforms.apply`'s
+    real candidate columns byte-exact)."""
+    return {
+        "identity": FactTypeModel(
+            fact_table=fact_table, state_table=state_table, schema=_IDENTITY_FACT_SCHEMA
+        )
+    }
+
+
 # --- a test asserts the deployed-shape yaml parses into PipelineSpecModel ---
 
 
@@ -138,8 +171,9 @@ def test_pipeline_yaml_parses_into_pipeline_spec_model() -> None:
     assert spec.transforms_module == "pipelines.identity.transforms"
     assert spec.raw_table == "conveyer_dev_lake.identity__raw"
     assert spec.quarantine_table == "conveyer_dev_lake.identity__quarantine"
-    assert spec.fact_table == "conveyer_dev_lake.identity__facts"
-    assert spec.state_table == "conveyer_dev_lake.identity__state"
+    assert set(spec.fact_types) == {"identity"}
+    assert spec.fact_types["identity"].fact_table == "conveyer_dev_lake.identity__facts"
+    assert spec.fact_types["identity"].state_table == "conveyer_dev_lake.identity__state"
     assert spec.raw_contract.columns[0].name == "domain_id"
     assert spec.raw_contract.columns[0].required is True
     assert spec.raw_contract.columns[0].nullable is False
@@ -165,12 +199,14 @@ def test_r01_identity_e2e_matches_goldens_and_emits_both_events(
     _create_fact_table(spark, fact_qt)
     _create_state_table(spark, state_qt)
     spec = _make_spec(
+        pipeline=_unique_pipeline("mkspec1"),
         transforms_module="pipelines.identity.transforms",
         raw_table=_bare(raw_qt),
         quarantine_table=_bare(qtn_qt),
         fact_table=_bare(fact_qt),
         state_table=_bare(state_qt),
     )
+    _create_markers_table_for(spark, spec)
     batch_id = _batch_id(101)
     object_uris = (
         str(_FIXTURES_DIR / "clean" / "object_1.csv"),
@@ -183,7 +219,7 @@ def test_r01_identity_e2e_matches_goldens_and_emits_both_events(
     assert result.raw_count == 3
     assert result.pre_quarantined_count == 0
     assert result.post_quarantined_count == 0
-    assert result.facts_appended == 3
+    assert _facts_appended_total(result) == 3
     assert result.guard_skips == ()
     assert result.published is True
 
@@ -210,8 +246,8 @@ def test_r01_identity_e2e_matches_goldens_and_emits_both_events(
     assert completed["pre_quarantined"] == 0
     assert completed["post_quarantined"] == 0
     assert completed["fact_count"] == 3
-    assert completed["fact_snapshot_id"] == result.fact_snapshot_id
-    assert completed["state_snapshot_id"] == result.state_snapshot_id
+    assert completed["fact_snapshot_id"] == result.completed_event.fact_snapshot_id
+    assert completed["state_snapshot_id"] == result.completed_event.state_snapshot_id
     assert completed["state_snapshot_id"] is not None
 
 
@@ -233,12 +269,14 @@ def test_r02_rerun_same_batch_id_zero_new_rows_and_guard_skips(
     _create_fact_table(spark, fact_qt)
     _create_state_table(spark, state_qt)
     spec = _make_spec(
+        pipeline=_unique_pipeline("mkspec2"),
         transforms_module="pipelines.identity.transforms",
         raw_table=_bare(raw_qt),
         quarantine_table=_bare(qtn_qt),
         fact_table=_bare(fact_qt),
         state_table=_bare(state_qt),
     )
+    _create_markers_table_for(spark, spec)
     batch_id = _batch_id(102)
     object_uris = (
         str(_FIXTURES_DIR / "clean" / "object_1.csv"),
@@ -271,8 +309,12 @@ def test_r02_rerun_same_batch_id_zero_new_rows_and_guard_skips(
     # branch every attempt (never a guard-skip, §7.5) -- fold has no presence
     # guard at all (idempotence is the fold's own contract).
     assert second.raw_count == first.raw_count == 3
-    assert second.facts_appended == 0  # this attempt's own delta -- the ledger signature
-    assert second.fact_snapshot_id == first.fact_snapshot_id  # I-19 own-commit resolution
+    assert _facts_appended_total(second) == 0  # this attempt's own delta -- the ledger signature
+    # I-19 own-commit resolution: `ctx.commit_snapshot_ids` is ATTEMPT-scoped
+    # (absent key on a guard-skip, §4.2) -- the DURABLE resolution that
+    # survives a guard-skip rerun is `completed_event.fact_snapshot_id`
+    # (`stages/publish.py`'s own `fx.resolve_batch_snapshot`-sourced
+    # derivation), asserted below via each attempt's own completed event.
     assert second.land_snapshot_id == first.land_snapshot_id
     # Known erratum (LLD R-02 vs. [C-7][T-8], recorded in the handoff report):
     # a fold no-op rerun's state_snapshot_id is None even though the ORIGINAL
@@ -280,8 +322,8 @@ def test_r02_rerun_same_batch_id_zero_new_rows_and_guard_skips(
     # conveyer.batch-id/stage stamp (only `append` stamps), so there is no
     # channel to recover the original id on this path. Do not assert equality
     # here; assert the documented None explicitly instead.
-    assert first.state_snapshot_id is not None
-    assert second.state_snapshot_id is None
+    assert first.completed_event.state_snapshot_id is not None
+    assert second.completed_event.state_snapshot_id is None
 
     envelopes = [e for e in moto_events_bus.read_events() if e["detail"]["batch_id"] == batch_id]
     assert len(envelopes) == 2  # unconditional re-emit, I-7 -- guard-skip never skips events
@@ -316,12 +358,15 @@ def test_r04_violations_variant_quarantine_never_drops(
     _create_fact_table(spark, fact_qt)
     _create_state_table(spark, state_qt)
     spec = _make_spec(
+        pipeline=_unique_pipeline("mkspec3"),
         transforms_module="pipelines.identity_violations.transforms",
         raw_table=_bare(raw_qt),
         quarantine_table=_bare(qtn_qt),
         fact_table=_bare(fact_qt),
         state_table=_bare(state_qt),
+        checks=_VIOLATIONS_CHECKS,
     )
+    _create_markers_table_for(spark, spec)
     batch_id = _batch_id(104)
     object_uris = (str(_FIXTURES_DIR / "violations" / "object_1.csv"),)
     seed = _make_seed(spec=spec, batch_id=batch_id, object_uris=object_uris)
@@ -332,15 +377,19 @@ def test_r04_violations_variant_quarantine_never_drops(
     assert result.pre_quarantined_count == 1  # the null-domain_id row
     valid_count = result.raw_count - result.pre_quarantined_count
     assert valid_count == 3
-    assert result.candidate_facts_df.count() == valid_count  # apply is a pure projection
+    # 006.1 §4.5: `apply` returns a one-entry MAPPING (P-1) -- `candidate_
+    # facts["identity"]` replaces the deleted singular `candidate_facts_df`.
+    assert result.candidate_facts["identity"].count() == valid_count  # apply is a pure projection
     assert result.post_quarantined_count == 1  # the payload == "INVALID" row
-    admitted_count = result.candidate_facts_df.count() - result.post_quarantined_count
+    admitted_count = result.candidate_facts["identity"].count() - result.post_quarantined_count
     assert admitted_count == 2
-    assert result.facts_appended == 2
+    assert _facts_appended_total(result) == 2
 
     # I-12's own count identities, both stages:
     assert result.raw_count == valid_count + result.pre_quarantined_count
-    assert result.candidate_facts_df.count() == admitted_count + result.post_quarantined_count
+    assert (
+        result.candidate_facts["identity"].count() == admitted_count + result.post_quarantined_count
+    )
 
     pre_rows = _quarantine_rows(spark, qtn_qt, batch_id, "pre_check")
     assert len(pre_rows) == 1
@@ -382,12 +431,14 @@ def test_r09_all_quarantined_batch_completes_with_zero_counts(
     _create_fact_table(spark, fact_qt)
     _create_state_table(spark, state_qt)
     spec = _make_spec(
+        pipeline=_unique_pipeline("mkspec4"),
         transforms_module="pipelines.identity.transforms",
         raw_table=_bare(raw_qt),
         quarantine_table=_bare(qtn_qt),
         fact_table=_bare(fact_qt),
         state_table=_bare(state_qt),
     )
+    _create_markers_table_for(spark, spec)
     batch_id = _batch_id(109)
     object_uris = (str(_FIXTURES_DIR / "all_quarantined" / "object_1.csv"),)
     seed = _make_seed(spec=spec, batch_id=batch_id, object_uris=object_uris)
@@ -397,19 +448,19 @@ def test_r09_all_quarantined_batch_completes_with_zero_counts(
 
     assert result.raw_count == 2
     assert result.pre_quarantined_count == 2  # every row -- all-quarantined at pre_check
-    assert result.candidate_facts_df.count() == 0
+    assert result.candidate_facts["identity"].count() == 0
     assert result.post_quarantined_count == 0  # nothing reached post_check
-    assert result.facts_appended == 0
-    assert result.committed_facts_df.count() == 0
+    assert _facts_appended_total(result) == 0
+    assert result.commit_snapshot_ids == {}  # zero-fact corollary: no key at all (§4.2)
 
-    # fold skipped entirely (§7.5: "Empty committed_facts_df => skip the
-    # merge entirely") -- no fx.merge call at all, so a bare snapshot-log
-    # equality check IS valid here (unlike R-02's fold no-op case, which
-    # makes a real fx.merge call that leaves a harmless physical snapshot).
+    # fold skipped entirely (§8.2's per-type "empty facts -> skip the merge
+    # entirely", `stages/fold.py`'s own step 2) -- no fx.merge call at all,
+    # so a bare snapshot-log equality check IS valid here (unlike R-02's
+    # fold no-op case, which makes a real fx.merge call that leaves a
+    # harmless physical snapshot).
     assert_no_new_snapshot(spark, state_qt, state_before)
-    assert result.state_snapshot_id is None
-    assert result.state_read_snapshot_id is None
-    assert result.merge_summary is None
+    assert _rows_merged_total(result) == 0
+    assert result.fold_snapshot_ids == {}
     assert result.published is True
 
     envelopes = [e for e in moto_events_bus.read_events() if e["detail"]["batch_id"] == batch_id]
@@ -458,15 +509,15 @@ def test_a01_clean_multi_object_gzip_delivery_e2e(
     _create_state_table(spark, state_qt)
     gzip_read = ReadSpecModel(compression="gzip", dialect=DialectModel(format="csv", header=True))
     spec = PipelineSpecModel(
-        pipeline="pipelines/identity",
+        pipeline=_unique_pipeline("core1"),
         transforms_module="pipelines.identity.transforms",
         raw_table=_bare(raw_qt),
         quarantine_table=_bare(qtn_qt),
-        fact_table=_bare(fact_qt),
-        state_table=_bare(state_qt),
+        fact_types=_fact_types(_bare(fact_qt), _bare(state_qt)),
         read=gzip_read,
         raw_contract=_IDENTITY_RAW_CONTRACT,
     )
+    _create_markers_table_for(spark, spec)
     obj1 = tmp_path / "object_1.csv.gz"
     obj2 = tmp_path / "object_2.csv.gz"
     obj1.write_bytes(gzip.compress((_FIXTURES_DIR / "clean" / "object_1.csv").read_bytes()))
@@ -480,9 +531,12 @@ def test_a01_clean_multi_object_gzip_delivery_e2e(
     assert result.raw_count == 3
     assert result.pre_quarantined_count == 0
     assert result.post_quarantined_count == 0
-    assert result.facts_appended == 3
+    assert _facts_appended_total(result) == 3
     # counts reconcile (§6.3's identity, externally confirmed too)
-    assert result.raw_count == result.candidate_facts_df.count() + result.pre_quarantined_count
+    assert (
+        result.raw_count
+        == result.candidate_facts["identity"].count() + result.pre_quarantined_count
+    )
 
     raw_rows = spark.table(raw_qt).where(f"batch_id = '{batch_id}'").collect()
     assert len(raw_rows) == 3
@@ -520,12 +574,14 @@ def test_a02_ragged_and_unterminated_quote_rows_flag_into_raw_and_quarantine(
     _create_fact_table(spark, fact_qt)
     _create_state_table(spark, state_qt)
     spec = _make_spec(
+        pipeline=_unique_pipeline("mkspec5"),
         transforms_module="pipelines.identity.transforms",
         raw_table=_bare(raw_qt),
         quarantine_table=_bare(qtn_qt),
         fact_table=_bare(fact_qt),
         state_table=_bare(state_qt),
     )
+    _create_markers_table_for(spark, spec)
     path = tmp_path / "object_1.csv"
     path.write_text(
         "domain_id,event_time,source_ts,content_hash,payload\n"
@@ -541,7 +597,7 @@ def test_a02_ragged_and_unterminated_quote_rows_flag_into_raw_and_quarantine(
 
     assert result.raw_count == 4  # the ragged row/two junk rows count too -- flagged into raw
     assert result.pre_quarantined_count == 3
-    assert result.facts_appended == 1  # only the well-formed row-1 admitted
+    assert _facts_appended_total(result) == 1  # only the well-formed row-1 admitted
 
     malformed_rows = spark.table(raw_qt).where(
         f"batch_id = '{batch_id}' AND malformed_text IS NOT NULL"
@@ -595,15 +651,15 @@ def test_a03_replacement_char_rows_quarantine_unless_opted_out(
             forbid_replacement_chars=forbid_replacement_chars,
         )
         spec = PipelineSpecModel(
-            pipeline="pipelines/identity",
+            pipeline=_unique_pipeline("core2"),
             transforms_module="pipelines.identity.transforms",
             raw_table=_bare(raw_qt),
             quarantine_table=_bare(qtn_qt),
-            fact_table=_bare(fact_qt),
-            state_table=_bare(state_qt),
+            fact_types=_fact_types(_bare(fact_qt), _bare(state_qt)),
             read=ReadSpecModel(dialect=DialectModel(format="csv", header=True)),
             raw_contract=contract,
         )
+        _create_markers_table_for(spark, spec)
         batch_id = _batch_id(1103_0 + batch_num)
         seed = _make_seed(spec=spec, batch_id=batch_id, object_uris=(str(path),))
         return run_sequence(seed, local_runner_fx), qtn_qt, batch_id
@@ -611,7 +667,7 @@ def test_a03_replacement_char_rows_quarantine_unless_opted_out(
     default_result, default_qtn, default_batch = _run(forbid_replacement_chars=True, batch_num=1)
     assert default_result.raw_count == 2
     assert default_result.pre_quarantined_count == 1
-    assert default_result.facts_appended == 1
+    assert _facts_appended_total(default_result) == 1
     default_pre = _quarantine_rows(spark, default_qtn, default_batch, "pre_check")
     assert len(default_pre) == 1
     assert default_pre[0]["reason_code"] == "unreadable/encoding-suspect"
@@ -621,7 +677,7 @@ def test_a03_replacement_char_rows_quarantine_unless_opted_out(
     )
     assert opted_out_result.raw_count == 2
     assert opted_out_result.pre_quarantined_count == 0  # admitted, U+FFFD kept in the cell
-    assert opted_out_result.facts_appended == 2
+    assert _facts_appended_total(opted_out_result) == 2
 
 
 # --- A-04: tier-3 matrix — one row per check type + one multi-failure row ---
@@ -653,11 +709,19 @@ def test_a04_tier3_matrix_one_row_per_check_type_plus_multi_failure(
         transforms_module="pipelines.identity.transforms",  # never called (land+pre_check only)
         raw_table=_bare(raw_qt),
         quarantine_table=_bare(qtn_qt),
-        fact_table=_bare(fact_qt),
-        state_table="spine_test_tables.unused_state",
+        fact_types=_fact_types(_bare(fact_qt), "spine_test_tables.unused_state"),
         read=read,
         raw_contract=contract,
     )
+    # No `_create_markers_table_for` here -- this scenario drives `land`/
+    # `pre_check` directly (never `commit`, see below), so no marker table
+    # is ever read or written; `pipeline="pipelines/a04-matrix"` (a legal
+    # PIPELINE-grammar slug, `_PIPELINE_SEGMENT` permits single dashes) is
+    # therefore never fed through `naming.markers_table`'s own IDENTIFIER-
+    # grammar check, which forbids `-` (`[[spine-commit-b9b-marker-
+    # mechanics]]` point 2's dash trap, confirmed here the OTHER direction:
+    # harmless as long as the pipeline never reaches a marker-deriving
+    # stage).
     path = tmp_path / "object_1.csv"
     path.write_text(
         "id,amount,status,code\n"
@@ -724,12 +788,14 @@ def test_a05_required_column_missing_raises_pre_append_no_trace(
     _create_fact_table(spark, fact_qt)
     _create_state_table(spark, state_qt)
     spec = _make_spec(
+        pipeline=_unique_pipeline("mkspec6"),
         transforms_module="pipelines.identity.transforms",
         raw_table=_bare(raw_qt),
         quarantine_table=_bare(qtn_qt),
         fact_table=_bare(fact_qt),
         state_table=_bare(state_qt),
     )
+    _create_markers_table_for(spark, spec)
     path = tmp_path / "object_1.csv"
     # `domain_id` (required: true) is missing entirely from the header.
     path.write_text("event_time,source_ts,content_hash,payload\n2026-01-01T00:00:00Z,x,y,z\n")
@@ -769,12 +835,14 @@ def test_a08_undeclared_columns_land_in_extras_then_promotion_lands_natively(
     _create_quarantine_table(spark, qtn_qt)
     _create_fact_table(spark, fact_qt)
     spec = _make_spec(
+        pipeline=_unique_pipeline("mkspec7"),
         transforms_module="pipelines.identity.transforms",
         raw_table=_bare(raw_qt),
         quarantine_table=_bare(qtn_qt),
         fact_table=_bare(fact_qt),
         state_table="spine_test_tables.unused_state",
     )
+    _create_markers_table_for(spark, spec)
     path1 = tmp_path / "object_1.csv"
     path1.write_text(
         "domain_id,event_time,source_ts,content_hash,payload,region\n"
@@ -811,15 +879,22 @@ def test_a08_undeclared_columns_land_in_extras_then_promotion_lands_natively(
 
     # A fresh batch under the promoted contract lands `region` NATIVELY.
     promoted_spec = _make_spec(
+        pipeline=_unique_pipeline("mkspec8"),
         transforms_module="pipelines.identity.transforms",
         raw_table=_bare(raw_qt),
         quarantine_table=_bare(qtn_qt),
         fact_table=_bare(fact_qt),
         state_table="spine_test_tables.unused_state",
     )
-    promoted_spec = PipelineSpecModel(
-        **{**promoted_spec.model_dump(), "raw_contract": promoted_contract}
-    )
+    _create_markers_table_for(spark, promoted_spec)
+    # `model_copy(update=...)` -- unlike `model_dump()` + reconstruction,
+    # preserves every OTHER field as its already-validated model instance
+    # (nested `fact_types`' `FactTypeModel.schema_` field is alias-only on
+    # input, `Field(alias="schema")` -- a `model_dump()` round-trip emits
+    # the Python field name `schema_`, which the model then refuses on
+    # reconstruction; `model_copy` sidesteps this entirely, `tests/unit/
+    # test_binding.py`'s own established precedent for this exact pattern).
+    promoted_spec = promoted_spec.model_copy(update={"raw_contract": promoted_contract})
     path2 = tmp_path / "object_2.csv"
     path2.write_text(
         "domain_id,event_time,source_ts,content_hash,payload,region\n"
@@ -856,12 +931,14 @@ def test_a11_batch_started_raw_count_includes_flagged_rows(
     _create_fact_table(spark, fact_qt)
     _create_state_table(spark, state_qt)
     spec = _make_spec(
+        pipeline=_unique_pipeline("mkspec9"),
         transforms_module="pipelines.identity.transforms",
         raw_table=_bare(raw_qt),
         quarantine_table=_bare(qtn_qt),
         fact_table=_bare(fact_qt),
         state_table=_bare(state_qt),
     )
+    _create_markers_table_for(spark, spec)
     path = tmp_path / "object_1.csv"
     path.write_text(
         "domain_id,event_time,source_ts,content_hash,payload\n"
@@ -882,7 +959,7 @@ def test_a11_batch_started_raw_count_includes_flagged_rows(
 
     # §6.3's count identity, externally confirmed (asserted internally too,
     # fresh path only, inside `stages/pre_check.py`):
-    valid_count = result.candidate_facts_df.count()
+    valid_count = result.candidate_facts["identity"].count()
     assert result.raw_count == valid_count + result.pre_quarantined_count
 
 
@@ -908,12 +985,15 @@ def test_a07a_pre_check_rerun_unchanged_contract_subtraction_matches_fresh(
     _create_fact_table(spark, fact_qt)
     _create_state_table(spark, state_qt)
     spec = _make_spec(
+        pipeline=_unique_pipeline("mkspec10"),
         transforms_module="pipelines.identity_violations.transforms",
         raw_table=_bare(raw_qt),
         quarantine_table=_bare(qtn_qt),
         fact_table=_bare(fact_qt),
         state_table=_bare(state_qt),
+        checks=_VIOLATIONS_CHECKS,
     )
+    _create_markers_table_for(spark, spec)
     batch_id = _batch_id(1112)
     object_uris = (str(_FIXTURES_DIR / "violations" / "object_1.csv"),)
 
@@ -957,12 +1037,14 @@ def test_a07c_pre_check_dc1_door_zero_violation_batch_rerun_after_contract_tight
     _create_fact_table(spark, fact_qt)
     _create_state_table(spark, state_qt)
     spec = _make_spec(
+        pipeline=_unique_pipeline("mkspec11"),
         transforms_module="pipelines.identity.transforms",
         raw_table=_bare(raw_qt),
         quarantine_table=_bare(qtn_qt),
         fact_table=_bare(fact_qt),
         state_table=_bare(state_qt),
     )
+    _create_markers_table_for(spark, spec)
     batch_id = _batch_id(1113)
     object_uris = (
         str(_FIXTURES_DIR / "clean" / "object_1.csv"),
@@ -971,7 +1053,7 @@ def test_a07c_pre_check_dc1_door_zero_violation_batch_rerun_after_contract_tight
     first_seed = _make_seed(spec=spec, batch_id=batch_id, object_uris=object_uris)
     first = run_sequence(first_seed, local_runner_fx)
     assert first.pre_quarantined_count == 0
-    assert first.facts_appended == 3
+    assert _facts_appended_total(first) == 3
     moto_events_bus.read_events()  # drain attempt 1's events
 
     qtn_before = snapshot_ids(spark, qtn_qt)
@@ -990,7 +1072,9 @@ def test_a07c_pre_check_dc1_door_zero_violation_batch_rerun_after_contract_tight
             ColumnSpec(name="payload", pattern="a.*"),
         ]
     )
-    tightened_spec = PipelineSpecModel(**{**spec.model_dump(), "raw_contract": tightened})
+    # `model_copy(update=...)`, not `model_dump()` + reconstruction -- see
+    # the identical note a few tests up (`test_a08_...`'s own `promoted_spec`).
+    tightened_spec = spec.model_copy(update={"raw_contract": tightened})
     second_seed = _make_seed(spec=tightened_spec, batch_id=batch_id, object_uris=object_uris)
     second = run_sequence(second_seed, local_runner_fx)
 
@@ -1045,28 +1129,38 @@ def test_a07d_post_check_r2_1_door_zero_violation_batch_rerun_after_business_rul
     _create_fact_table(spark, fact_qt)
     _create_state_table(spark, state_qt)
     spec = _make_spec(
+        pipeline=_unique_pipeline("mkspec12"),
         transforms_module="pipelines.identity.transforms",
         raw_table=_bare(raw_qt),
         quarantine_table=_bare(qtn_qt),
         fact_table=_bare(fact_qt),
         state_table=_bare(state_qt),
     )
+    _create_markers_table_for(spark, spec)
     batch_id = _batch_id(1114)
-    # `pipelines.identity.transforms.post_check` admits everything
-    # unconditionally, so a row carrying `payload == "INVALID"` still lands
-    # cleanly on attempt 1 -- it is only `pipelines.identity_violations`'
-    # own (tightened) business rule that would ever flag it.
+    # The `identity` type declares zero checks (§4.2's empty default), so a
+    # row carrying `payload == "INVALID"` still lands cleanly on attempt 1 --
+    # it is only `pipelines.identity_violations`'s own (tightened) checks.yaml
+    # rule that would ever flag it (006.1 §12.2/G-12).
     object_uris = (str(_FIXTURES_DIR / "post_check_drift" / "object_1.csv"),)
     first = run_sequence(
         _make_seed(spec=spec, batch_id=batch_id, object_uris=object_uris), local_runner_fx
     )
     assert first.post_quarantined_count == 0
-    assert first.facts_appended == 2
+    assert _facts_appended_total(first) == 2
 
     qtn_before = snapshot_ids(spark, qtn_qt)
 
-    tightened_spec = PipelineSpecModel(
-        **{**spec.model_dump(), "transforms_module": "pipelines.identity_violations.transforms"}
+    # `model_copy(update=...)`, not `model_dump()` + reconstruction -- see
+    # `test_a08_...`'s own `promoted_spec` note above. `checks` ALSO swaps to
+    # `VIOLATIONS_CHECKS` here (006.1 migration): tightening used to mean
+    # swapping `transforms_module` alone (the old per-pipeline `post_check`);
+    # the rule itself now lives in checks.yaml, so both must move together.
+    tightened_spec = spec.model_copy(
+        update={
+            "transforms_module": "pipelines.identity_violations.transforms",
+            "checks": _VIOLATIONS_CHECKS,
+        }
     )
     second_seed = _make_seed(spec=tightened_spec, batch_id=batch_id, object_uris=object_uris)
     second = run_sequence(second_seed, local_runner_fx)
@@ -1082,7 +1176,7 @@ def test_a07d_post_check_r2_1_door_zero_violation_batch_rerun_after_business_rul
     # (one row -- "id-302" -- recomputes as a violation under the tightened
     # business rule) are the substantive counts this door's drift asserts.
     assert second.post_check_drift is not None
-    assert second.post_check_drift.startswith("post-check drift: durable=0 recomputed=1 ")
+    assert second.post_check_drift.startswith("post_check drift: durable=0 recomputed=1 ")
 
     fact_rows = sorted((r["domain_id"], r["payload"]) for r in spark.table(fact_qt).collect())
     assert fact_rows == [("id-301", "alpha"), ("id-302", "INVALID")]  # unchanged by the recompute
@@ -1105,12 +1199,15 @@ def test_a10_pre_and_post_rows_share_one_quarantine_table_one_projection(
     _create_fact_table(spark, fact_qt)
     _create_state_table(spark, state_qt)
     spec = _make_spec(
+        pipeline=_unique_pipeline("mkspec13"),
         transforms_module="pipelines.identity_violations.transforms",
         raw_table=_bare(raw_qt),
         quarantine_table=_bare(qtn_qt),
         fact_table=_bare(fact_qt),
         state_table=_bare(state_qt),
+        checks=_VIOLATIONS_CHECKS,
     )
+    _create_markers_table_for(spark, spec)
     batch_id = _batch_id(1115)
     object_uris = (str(_FIXTURES_DIR / "violations" / "object_1.csv"),)
     result = run_sequence(
@@ -1141,21 +1238,52 @@ def test_a10_pre_and_post_rows_share_one_quarantine_table_one_projection(
     assert post_row["object_seq"] is None
     assert post_row["row_index"] is None
     assert post_row["reason_code"] == "business/negative-amount"
-    assert post_row["reason_detail"] is None
+    # `reason_detail` is a JSON array naming every failed check (id + its own
+    # version) -- production behavior from the business-checks compilation
+    # (006.1's post-check interpreter), postdating this test's original
+    # `is None` assertion (a stale expectation, unrelated to B10/fold).
+    # Structural, not the incidental exact version hash (this file's own
+    # established convention, e.g. A-7d's drift-message assertion above).
+    detail = json.loads(post_row["reason_detail"])
+    assert [d["id"] for d in detail] == ["no-invalid-payload"]
+    assert len(detail[0]["version"]) == 64
     assert len(post_row["row_hash"]) == 64
 
-    # every row -- either stage -- carries the shared §4.2 lineage/version columns
+    # every row -- either stage -- carries the shared §4.2 lineage columns;
+    # the ONE physical `check_version` column is stage-dependent in its
+    # SOURCE (`frames/quarantine.py`'s own two shapers): pre_check rows
+    # stamp A-11's raw-contract-derived `check_version`, post_check rows
+    # stamp the business-checks-derived `checks_version` -- two different
+    # version concepts sharing one column name by stage, not one shared
+    # value every row must match.
     for row in by_stage.values():
         assert row["batch_id"] == batch_id
         assert row["delivery_id"] == result.delivery_id
         assert row["feed_id"] == result.feed_id
-        assert row["check_version"] == result.check_version
         assert row["quarantined_at"] is not None
+    assert by_stage["pre_check"]["check_version"] == result.check_version
+    assert by_stage["post_check"]["check_version"] == result.checks_version
 
 
 # --- A-10: nonconforming post reason -> named defect, A-14's grammar -------
 
 
+@pytest.mark.skip(
+    reason=(
+        "006.1 §5.4 K6 supersedes A-14a (bead conveyer-6pg.13, B3): a "
+        "pipeline-authored `post_check` producing a free-text `reason` is "
+        "structurally unreachable now -- `Transforms` no longer carries "
+        "`post_check` at all, and the framework's own interpreter sources "
+        "`reason_code`/`reason_detail` from `checks.yaml`'s declared, "
+        "bind-time-validated `RowCheckModel.reason` field (`Field(pattern="
+        "BUSINESS_REASON_RE)`, refused at spec PARSE, long before any batch "
+        "runs) -- there is no code path left for a non-conforming reason to "
+        "reach post_check at runtime. `frames/quarantine.py::shape_post_"
+        "quarantine`'s own docstring states this explicitly: 'no runtime "
+        "grammar check here.' Retained (not deleted) as the historical "
+        "record of A-14a's own runtime mechanism, now fully retired."
+    )
+)
 def test_a10_nonconforming_post_reason_is_a_named_defect_with_a14_grammar(
     spark: SparkSession,
     local_runner_fx: RunnerFx,
@@ -1171,12 +1299,14 @@ def test_a10_nonconforming_post_reason_is_a_named_defect_with_a14_grammar(
     _create_fact_table(spark, fact_qt)
     _create_state_table(spark, state_qt)
     spec = _make_spec(
+        pipeline=_unique_pipeline("mkspec14"),
         transforms_module="pipelines.identity.transforms",
         raw_table=_bare(raw_qt),
         quarantine_table=_bare(qtn_qt),
         fact_table=_bare(fact_qt),
         state_table=_bare(state_qt),
     )
+    _create_markers_table_for(spark, spec)
     batch_id = _batch_id(1116)
     object_uris = (str(_FIXTURES_DIR / "clean" / "object_1.csv"),)
     seed = _make_seed(spec=spec, batch_id=batch_id, object_uris=object_uris)
@@ -1233,12 +1363,14 @@ def test_a16_header_only_delivery_completes_with_zero_counts_rerun_reappends_emp
     _create_fact_table(spark, fact_qt)
     _create_state_table(spark, state_qt)
     spec = _make_spec(
+        pipeline=_unique_pipeline("mkspec15"),
         transforms_module="pipelines.identity.transforms",
         raw_table=_bare(raw_qt),
         quarantine_table=_bare(qtn_qt),
         fact_table=_bare(fact_qt),
         state_table=_bare(state_qt),
     )
+    _create_markers_table_for(spark, spec)
     batch_id = _batch_id(1117)
     object_uris = (str(_FIXTURES_DIR / "header_only" / "object_1.csv"),)
     seed = _make_seed(spec=spec, batch_id=batch_id, object_uris=object_uris)
@@ -1247,10 +1379,11 @@ def test_a16_header_only_delivery_completes_with_zero_counts_rerun_reappends_emp
     assert result.raw_count == 0
     assert result.pre_quarantined_count == 0
     assert result.post_quarantined_count == 0
-    assert result.facts_appended == 0
+    assert _facts_appended_total(result) == 0
     assert result.published is True
-    # fold's own empty-facts skip (§7.5), same as R-09's own empty-batch pin
-    assert result.state_snapshot_id is None
+    # fold's own empty-facts skip (§8.2 step 2), same as R-09's own empty-batch pin
+    assert _rows_merged_total(result) == 0
+    assert result.fold_snapshot_ids == {}
 
     envelopes = [e for e in moto_events_bus.read_events() if e["detail"]["batch_id"] == batch_id]
     assert len(envelopes) == 2
@@ -1259,22 +1392,31 @@ def test_a16_header_only_delivery_completes_with_zero_counts_rerun_reappends_emp
     fact_before = snapshot_ids(spark, fact_qt)
     qtn_before = snapshot_ids(spark, qtn_qt)
 
-    # §9/[DC-12]: `table_has_batch`'s guard predicate reads DATA (I-3) -- a
-    # batch that only ever produced ZERO rows leaves no row for the guard to
-    # find, at either land or commit, on ANY attempt. A deliberate rerun
-    # therefore re-executes both stages fresh every time, each committing
-    # its own new, harmless empty snapshot -- the accepted guard-blind edge.
+    # §9/[DC-12]: `land`'s `table_has_batch` guard predicate reads DATA
+    # (I-3) -- a batch that only ever produced ZERO raw rows leaves no row
+    # for LAND's own guard to find, on ANY attempt, so a rerun re-executes
+    # `land` fresh every time, committing its own new, harmless empty
+    # snapshot -- the accepted guard-blind edge, at `land` grain.
+    # **`commit`'s own guard is NOT equally blind under the N-table design
+    # (B10, bead conveyer-6pg.22): F-4's zero-fact corollary (§4.3 step 5,
+    # `stages/commit.py`'s own docstring) means a ZERO-novel table writes NO
+    # marker row and NO facts at all -- not even an empty append -- so a
+    # rerun of an all-empty batch commits NO new fact-table snapshot,
+    # correcting the OLD v1 comment this test used to carry (v1's `fx.
+    # append` was always called, even with zero rows).**
     second_seed = _make_seed(spec=spec, batch_id=batch_id, object_uris=object_uris)
     second = run_sequence(second_seed, local_runner_fx)
 
     assert second.raw_count == 0
-    assert second.facts_appended == 0
-    assert second.guard_skips == ()  # neither land nor commit could see the prior attempt
+    assert _facts_appended_total(second) == 0
+    assert second.guard_skips == ()  # land could not see the prior attempt (raw guard-blind);
+    # commit has NOTHING to guard-skip either -- its own zero-novel corollary means it never
+    # attempted an append on either attempt, so "commit" never enters `guard_skips` at all.
     raw_after = snapshot_ids(spark, raw_qt)
     fact_after = snapshot_ids(spark, fact_qt)
     qtn_after = snapshot_ids(spark, qtn_qt)
-    assert len(raw_after - raw_before) == 1  # one NEW empty snapshot, re-appended
-    assert len(fact_after - fact_before) == 1  # ditto, commit's own guard is equally blind
+    assert len(raw_after - raw_before) == 1  # one NEW empty snapshot, re-appended (land only)
+    assert fact_after == fact_before  # commit's zero-fact corollary: no append, ever
     assert qtn_after == qtn_before  # zero violations either attempt -- never even attempted
 
 
@@ -1305,15 +1447,15 @@ def test_late_stream_corruption_during_append_is_an_unnamed_loud_failure(
     _create_state_table(spark, state_qt)
     gzip_read = ReadSpecModel(compression="gzip", dialect=DialectModel(format="csv", header=True))
     spec = PipelineSpecModel(
-        pipeline="pipelines/identity",
+        pipeline=_unique_pipeline("core3"),
         transforms_module="pipelines.identity.transforms",
         raw_table=_bare(raw_qt),
         quarantine_table=_bare(qtn_qt),
-        fact_table=_bare(fact_qt),
-        state_table=_bare(state_qt),
+        fact_types=_fact_types(_bare(fact_qt), _bare(state_qt)),
         read=gzip_read,
         raw_contract=_IDENTITY_RAW_CONTRACT,
     )
+    _create_markers_table_for(spark, spec)
     plain = "domain_id,event_time,source_ts,content_hash,payload\n" + "".join(
         f"id-{i:04d},2026-07-01T00:00:{i % 60:02d}Z,2026-07-01T00:00:{i % 60:02d}Z,"
         f"h-{i},payload-{i}\n"

@@ -1,0 +1,101 @@
+[
+  {
+    "check": {
+      "kind": "row",
+      "id": "positive-amount",
+      "fact_type": "vec",
+      "expr": "amount > 0",
+      "reason": "business/negative-amount"
+    },
+    "input": {
+      "row": {
+        "domain_id": "d-basic-1",
+        "amount": {
+          "$decimal": "10.50"
+        }
+      }
+    },
+    "verdict": "pass"
+  },
+  {
+    "check": {
+      "kind": "row",
+      "id": "positive-amount",
+      "fact_type": "vec",
+      "expr": "amount > 0",
+      "reason": "business/negative-amount"
+    },
+    "input": {
+      "row": {
+        "domain_id": "d-basic-2",
+        "amount": {
+          "$decimal": "-5.00"
+        }
+      }
+    },
+    "verdict": "fail"
+  },
+  {
+    "check": {
+      "kind": "row",
+      "id": "decimal-scale-matches",
+      "fact_type": "vec",
+      "expr": "dec = dec2",
+      "reason": "business/decimal-mismatch"
+    },
+    "input": {
+      "row": {
+        "domain_id": "d-basic-3",
+        "dec": {
+          "$decimal": "1.20"
+        },
+        "dec2": {
+          "$decimal": "1.2"
+        }
+      }
+    },
+    "verdict": "pass"
+  },
+  {
+    "check": {
+      "kind": "row",
+      "id": "amount-within-limit",
+      "fact_type": "vec",
+      "expr": "amount <= max_amount",
+      "reason": "business/over-limit"
+    },
+    "input": {
+      "row": {
+        "domain_id": "d-basic-4",
+        "amount": {
+          "$decimal": "10.00"
+        },
+        "max_amount": {
+          "$decimal": "10.50"
+        }
+      }
+    },
+    "verdict": "pass"
+  },
+  {
+    "check": {
+      "kind": "row",
+      "id": "amount-within-limit",
+      "fact_type": "vec",
+      "expr": "amount <= max_amount",
+      "reason": "business/over-limit"
+    },
+    "input": {
+      "row": {
+        "domain_id": "d-basic-5",
+        "amount": {
+          "$decimal": "15.00"
+        },
+        "max_amount": {
+          "$decimal": "10.50"
+        }
+      }
+    },
+    "verdict": "fail"
+  }
+]

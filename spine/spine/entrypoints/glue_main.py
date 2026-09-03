@@ -4,17 +4,27 @@
 the entrypoint is a review defect") — a straight-line sequence of calls to
 small, independently-testable functions defined below; it contains no `if`/
 `try` of its own. Order (normative, §8.3, plus the leading observability
-install below, conveyer-nvh.47): `observability.install_json_handler()` ->
-argv -> `RunnerConfig` -> seed parse + `check_object_uris` (I-22) ->
-fetch/parse `PipelineSpec` (URI allowlist, I-23) -> binding-defect asserts
-(`spec.pipeline == seed.pipeline`, `spec.sla_minutes == config.sla_minutes`
-[H-5]) -> `bind_transforms` (I-10, fail-fast) -> build `SparkSession`
-(explicit catalog conf, §7.6) -> assert Iceberg extensions active [T-16] ->
-`fx = make_runner_fx(spark, config)` -> seed `BatchContext` ->
-`spine.run.run(seed, fx)`. Every fail-fast branch above `_build_session`
-raises before any effect runs (no raw write, no `batch-started`, no ledger
-row — the I-10/I-22 "invisible to the run ledger" class, §9's "Config/
-binding/seed-validation defect" row).
+install below, conveyer-nvh.47; 006.1 P-4's bind step and its K5 gate-2
+call, bead conveyer-6pg.12, added at the end): `observability.install_
+json_handler()` -> argv -> `RunnerConfig` -> seed parse + `check_object_uris`
+(I-22) -> fetch/parse `PipelineSpec` (URI allowlist, I-23) -> binding-defect
+asserts (`spec.pipeline == seed.pipeline`, `spec.sla_minutes == config.
+sla_minutes` [H-5]) -> `bind_transforms` (I-10, fail-fast) -> build
+`SparkSession` (explicit catalog conf, §7.6) -> assert Iceberg extensions
+active [T-16] -> K5's engine-compile gate (`_assert_check_expressions_
+compile`, P-2 gate 2/P-9 rule 2) -> `fx = make_runner_fx(spark, config)` ->
+P-4's bind-time validator inventory (`fx.describe_table` acquisition,
+`validate_bindings`, 007.1 F-10's `table-classes.json` load and [DC-1]'s
+marker-table `committed_tables` probe -- bead conveyer-6pg.18, B7, replacing
+B2's interim stubs) -> seed `BatchContext` -> `spine.run.run(seed, fx)`.
+Every fail-fast branch above
+`session.build_session` raises before any effect runs (no raw write, no
+`batch-started`, no ledger row — the I-10/I-22 "invisible to the run
+ledger" class, §9's "Config/binding/seed-validation defect" row); the bind
+step (K5 and P-4's own asserts) stays in that same pre-land class too —
+`fx.describe_table`/`_assert_bind_checks_pass` raise before `run_sequence`
+is ever called, so no raw write/`batch-started`/ledger row happens there
+either.
 
 `observability.install_json_handler()` runs FIRST, before `from_args` even
 parses argv (conveyer-nvh.47: `install_json_handler` previously had no
@@ -31,7 +41,7 @@ once, is therefore always safe and never accumulates duplicate handlers.
 
 **005.1 §3.2 [DC-4] + §6.1's pinned obligation #1 (bead conveyer-azr.18,
 n3-context-wiring):** two binding-defect asserts land in the §8.3 sequence,
-both AFTER `_build_session`/`_assert_iceberg_extensions_active` (they need a
+both AFTER `session.build_session`/`session.assert_iceberg_extensions_active` (they need a
 live JVM) and BEFORE `fx_factory`/`run_sequence` (still pre-land: no raw
 write, no `batch-started`, no ledger row reaches storage for either).
 
@@ -133,35 +143,68 @@ tests" (`spine.run.run`'s own `stages` parameter; `tests/conftest.py`'s
 
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
+import importlib
+import json
+from collections.abc import Callable, Mapping, Sequence
 from typing import TYPE_CHECKING
 
-import yaml  # type: ignore[import-untyped]
-from pyspark.sql.types import StringType, StructField, StructType
+from pyspark.sql import functions as F
+from pyspark.sql.types import (
+    BooleanType,
+    ByteType,
+    DateType,
+    DecimalType,
+    IntegerType,
+    LongType,
+    ShortType,
+    StringType,
+    StructField,
+    StructType,
+    TimestampType,
+)
 
 from spine import observability
 from spine.binding import Transforms, bind_transforms
 from spine.config import RunConfig, RunnerConfig, from_args
 from spine.context import BatchContext
-from spine.core import naming
+from spine.core import bind_checks, naming
+from spine.core.check_grammar import (
+    CompiledAggregate,
+    Family,
+    ValidatedExpr,
+    compile_aggregate,
+    family_of_kind,
+    validate_expression,
+)
+from spine.core.checks import checks_version
 from spine.core.contract import check_version, parse_column_type, read_spec_version
-from spine.core.model import DeliveryRegisteredV1, PipelineSpecModel
+from spine.core.model import (
+    BatchCheckModel,
+    DeliveryRegisteredV1,
+    FactSchemaModel,
+    FactTypeModel,
+    PipelineSpecModel,
+    RowCheckModel,
+    parse_pipeline_spec_yaml,
+)
 from spine.effects.build import make_runner_fx
-from spine.frames.checks import SESSION_PINS, compile_contract
+from spine.entrypoints import session
+from spine.frames.business_checks import aggregate_column
+from spine.frames.checks import compile_contract
 from spine.run import run as run_sequence
 
 if TYPE_CHECKING:
-    from pyspark.sql import SparkSession
+    from pyspark.sql import DataFrame, SparkSession
+    from pyspark.sql.types import DataType
 
     from spine.core.model import RawContractModel
     from spine.effects.records import RunnerFx
 
-_ICEBERG_EXTENSIONS = "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions"
-
-# §5/I-23 allowlisted specs root, scheme-and-bucket-agnostic (see
-# `check_spec_uri_allowlist`'s own docstring for why): every
-# `pipeline_spec_uri` must resolve under `.../spine/specs/<this job's own
-# pipeline slug>/<name>`.
+# §5/I-23 allowlisted specs root, bucket-pinned for `s3://` (6pg.35 item 4;
+# see `check_spec_uri_allowlist`'s own docstring for why `file://` stays
+# bucket-agnostic): every `pipeline_spec_uri` must resolve under
+# `.../spine/specs/<this job's own pipeline slug>/<name>` IN the pinned
+# `RunnerConfig.artifacts_bucket`.
 _SPECS_ROOT_SEGMENTS: tuple[str, str] = ("spine", "specs")
 _ALLOWED_SPEC_URI_SCHEMES: tuple[str, ...] = ("s3://", "file://")  # file:// — I-14 EMR/local parity
 
@@ -169,22 +212,43 @@ _ALLOWED_SPEC_URI_SCHEMES: tuple[str, ...] = ("s3://", "file://")  # file:// —
 # --- pure: I-23 spec-URI allowlist -------------------------------------------
 
 
-def check_spec_uri_allowlist(uri: str, pipeline_slug: str) -> None:
+def check_spec_uri_allowlist(uri: str, pipeline_slug: str, artifacts_bucket: str) -> None:
     """I-23: `uri` must resolve under `spine/specs/<pipeline_slug>/<name>` for
-    THIS job's own pipeline, checked BEFORE any fetch. Pure, no I/O.
+    THIS job's own pipeline, IN the pinned `artifacts_bucket`, checked BEFORE
+    any fetch. Pure, no I/O.
 
-    Scheme-and-bucket-agnostic by design: which BUCKET is actually reachable
-    is an IAM concern (the job role's own bucket-scoped read grant, §10.3),
-    not something this Python-side check can independently re-verify without
-    a `RunnerConfig` field naming the bucket (none exists — `RunnerConfig`
-    carries `landing_bucket`, a DIFFERENT bucket, not an artifacts-bucket
-    field; recorded assumption, reported at handoff). This function's job is
-    the PATH shape only: reject a spec URI whose path escapes
-    `spine/specs/<pipeline_slug>/` even if it somehow named the right
-    bucket — traversal segments (`..`/`.`), an empty segment, a different
-    pipeline's slug, or a path that never reaches a file under that prefix.
-    `s3://` (production) and `file://` (tests, I-14 EMR/local-file parity)
-    are the only accepted schemes.
+    Bucket-pinned for `s3://` (6pg.35 security-gate LOW item 4, left undone
+    by conveyer-swb.10): a spec/inventory URI is forgeable path-shape-only if
+    the job role ever gains broad S3 read or argv becomes event-derived
+    (today Terraform-pinned + bucket-scoped grant; priced residual) — so this
+    check now ALSO refuses any `s3://` URI whose bucket disagrees with
+    `RunnerConfig.artifacts_bucket` (Terraform-pinned, §6.4), before even
+    looking at path shape. The refusal message is deliberately value-free —
+    it names only the PINNED (expected) bucket, never the offending URI or
+    the bucket found in it, since both are attacker-reachable input the
+    moment this check's precondition (job role has only scoped read) is
+    ever weakened; nothing attacker-controlled is echoed back.
+
+    **Every other refusal branch below is value-free the same way (critique
+    gate wf_78ea4599-a5b M6, bead conveyer-swb.26).** The scheme, traversal,
+    and root-shape messages name only the fixed allowlist, the literal
+    `'..'` grammar, and this job's own PINNED `pipeline_slug` — never the
+    offending `uri` itself: the function's own rationale above ("attacker-
+    reachable the moment the precondition weakens") applies to every branch,
+    not just the bucket one.
+
+    `file://` (tests, I-14 EMR/local-file parity) has no bucket concept — a
+    local filesystem path is not an S3 bucket, and `file://` is never a real
+    production path (only `s3://` reaches this function from a Glue job) —
+    so the bucket check is skipped entirely for that scheme; only the PATH
+    shape below still applies to it.
+
+    Path shape (both schemes, unchanged by this bucket-pin): reject a spec
+    URI whose path escapes `spine/specs/<pipeline_slug>/` even if it somehow
+    named the right bucket — traversal segments (`..`/`.`), an empty
+    segment, a different pipeline's slug, or a path that never reaches a
+    file under that prefix. `s3://` (production) and `file://` (tests) are
+    the only accepted schemes.
 
     Implementation note: segments are found via `segments.index("spine")` —
     the FIRST literal `"spine"` path segment. A coincidental earlier `"spine"`
@@ -198,15 +262,19 @@ def check_spec_uri_allowlist(uri: str, pipeline_slug: str) -> None:
         if uri.startswith(scheme):
             break
     else:
-        raise ValueError(
-            f"pipeline_spec_uri must be one of {_ALLOWED_SPEC_URI_SCHEMES!r} (I-23): {uri!r}"
-        )
+        raise ValueError(f"pipeline_spec_uri must be one of {_ALLOWED_SPEC_URI_SCHEMES!r} (I-23)")
+
+    if uri.startswith("s3://"):
+        bucket = uri[len("s3://") :].split("/", 1)[0]
+        if bucket != artifacts_bucket:
+            raise ValueError(
+                "pipeline_spec_uri must resolve inside the pinned artifacts bucket "
+                f"{artifacts_bucket!r} (I-23)"
+            )
 
     segments = [s for s in uri.split("/") if s not in ("", ".")]
     if ".." in segments:
-        raise ValueError(
-            f"pipeline_spec_uri must not contain '..' traversal segments (I-23): {uri!r}"
-        )
+        raise ValueError("pipeline_spec_uri must not contain '..' traversal segments (I-23)")
     try:
         root_idx = segments.index(_SPECS_ROOT_SEGMENTS[0])
     except ValueError:
@@ -217,7 +285,7 @@ def check_spec_uri_allowlist(uri: str, pipeline_slug: str) -> None:
     if not (matches_root and has_filename):
         raise ValueError(
             f"pipeline_spec_uri must resolve under '.../spine/specs/{pipeline_slug}/' "
-            f"for this job's own pipeline (I-23): {uri!r}"
+            "for this job's own pipeline (I-23)"
         )
 
 
@@ -258,10 +326,11 @@ def _parse_seed(config: RunnerConfig) -> DeliveryRegisteredV1:
 
 
 def _parse_spec(spec_text: str) -> PipelineSpecModel:
-    """`yaml.safe_load` (never the unsafe loader) + full pydantic parse
-    (§6.2). A malformed spec raises here, before `bind_transforms` ever
-    runs."""
-    return PipelineSpecModel(**yaml.safe_load(spec_text))
+    """`core.model.parse_pipeline_spec_yaml` — the strict duplicate-key-
+    rejecting loader (006.1 §4/S1) + full pydantic parse (§6.2). A
+    malformed spec (or one with a duplicate YAML mapping key) raises here,
+    before `bind_transforms` ever runs."""
+    return parse_pipeline_spec_yaml(spec_text)
 
 
 def _assert_binding_matches(
@@ -286,75 +355,12 @@ def _assert_binding_matches(
         )
 
 
-# --- pure: catalog conf; effect: session build + extensions assert ----------
-
-
-def _catalog_conf(config: RunnerConfig) -> dict[str, str]:
-    """§7.6 catalog wiring, as a plain conf dict (pure — no `SparkSession`
-    call): `spine_cat` -> Iceberg `SparkCatalog`, `type=glue` in production
-    or `type=hadoop` (`warehouse=config.warehouse_uri`) in tests, chosen by
-    `config.catalog_kind` (I-2). AQE on (§8.3). `_build_session` is the one
-    caller that turns this into a live session.
-
-    Also carries 005.1 §12.1/§6.2's three cast-semantics session pins
-    (`frames.checks.SESSION_PINS` — the one authored source, `tests/
-    conftest.py::_BASE_CONF` wires the SAME constant so they cannot drift
-    apart, per that module's own docstring)."""
-    conf = {
-        "spark.sql.extensions": _ICEBERG_EXTENSIONS,
-        "spark.sql.catalog.spine_cat": "org.apache.iceberg.spark.SparkCatalog",
-        "spark.sql.adaptive.enabled": "true",
-        **SESSION_PINS,
-    }
-    if config.catalog_kind == "glue":
-        conf["spark.sql.catalog.spine_cat.type"] = "glue"
-        return conf
-    if not config.warehouse_uri:
-        raise ValueError("RunnerConfig.warehouse_uri is required when catalog_kind='hadoop'")
-    conf["spark.sql.catalog.spine_cat.type"] = "hadoop"
-    conf["spark.sql.catalog.spine_cat.warehouse"] = config.warehouse_uri
-    return conf
-
-
-def _build_session(config: RunnerConfig) -> SparkSession:
-    """Builds (or, inside an already-active JVM such as the shared test
-    session, ADOPTS via `getOrCreate()`) the `SparkSession` wired to
-    `_catalog_conf`'s conf. No `.master(...)` is set here deliberately: in
-    production Glue already provides the master via its own bootstrap
-    (no `GlueContext`, I-14, but the JVM's Spark master is already
-    configured by the time this entrypoint runs); in tests, the shared
-    session-scoped `spark` fixture (`tests/conftest.py`) has already set
-    `local[2]` before this function's `getOrCreate()` call ever runs, so it
-    adopts that same live session rather than conflicting with it."""
-    from pyspark.sql import SparkSession  # local import: keeps this module's pure
-
-    # helpers importable without a live JVM even being reachable; matches
-    # `spine.binding`/`spine.context`'s own lazy-pyspark-import convention.
-    builder = SparkSession.builder.appName(f"conveyer-spine-{config.env}")
-    for key, value in _catalog_conf(config).items():
-        builder = builder.config(key, value)
-    return builder.getOrCreate()
-
-
-def _assert_iceberg_extensions_active(spark: SparkSession) -> None:
-    """[T-16]: a cheap conf-only probe (`spark.conf.get("spark.sql.
-    extensions")`), NOT `tests/conftest.py::_assert_iceberg_extensions_live`'s
-    live `CREATE TABLE` + `MERGE INTO` round-trip. Deliberately different
-    depths for different jobs: conftest's round-trip validates the local
-    Iceberg JAR + catalog wiring itself, ONCE per CI session, before any test
-    runs — worth the cost there. Running a real `MERGE INTO` at every Glue
-    job START (this function's own call site) to prove the SAME thing would
-    burn a write against the target catalog on every attempt, for a
-    property (`spark.sql.extensions` being correctly set) that a conf read
-    already proves cheaply. Still fail-fast BEFORE `run()` is ever called
-    (§8.3): a missing extension raises here, not seven stages in at fold."""
-    extensions = spark.conf.get("spark.sql.extensions", "") or ""
-    if _ICEBERG_EXTENSIONS not in extensions:
-        raise AssertionError(
-            "Iceberg SQL extensions are not active on this SparkSession "
-            f"(spark.sql.extensions={extensions!r}) -- MERGE INTO would fail seven stages in "
-            "at fold instead of here [T-16]"
-        )
+# --- session build + extensions assert: `entrypoints/session.py`, the ONE --
+# --- authored source (F2, bead conveyer-swb.25) -- `_catalog_conf`/---------
+# --- `_build_session`/`_assert_iceberg_extensions_active` used to be -------
+# --- duplicated locally here; `rebuild_main.py` imports the identical ------
+# --- functions from `entrypoints/session.py`, so the two entrypoints' own --
+# --- session confs cannot drift apart again. ---------------------------
 
 
 # --- effect (real JVM, driver-side only): 005.1 §3.2 [DC-4] + §6.1's --------
@@ -388,7 +394,7 @@ def _assert_patterns_compile_in_jvm(spark: SparkSession, contract: RawContractMo
     row value -- both are spec-authored, reviewed strings, not payload)."""
     # pyspark types `SparkSession._jvm` as `Optional` (only `None` before a
     # live session/gateway exists) -- this function only ever runs after
-    # `_build_session` has already returned a live session (§8.3 ordering),
+    # `session.build_session` has already returned a live session (§8.3 ordering),
     # so the assert narrows the type for mypy rather than silencing it.
     assert spark._jvm is not None, "SparkSession._jvm is only None before a live session exists"  # noqa: SLF001
     for column in contract.columns:
@@ -522,6 +528,379 @@ def _assert_temporal_bounds_bind(spark: SparkSession, contract: RawContractModel
             )
 
 
+# --- effect (real JVM, driver-side only): K5, the engine compile gate ------
+# --- (P-2 gate 2 / P-9 rule 2's compiled-dtype inspection, [EM-3]) ----------
+
+
+_FACT_COLUMN_SPARK_TYPES: Mapping[str, Callable[[], DataType]] = {
+    "string": StringType,
+    "int": IntegerType,
+    "long": LongType,
+    "bool": BooleanType,
+    "date": DateType,
+    "timestamp": TimestampType,
+}
+
+# P-9 rule 2 [EM-3]: `aggregate`/`control.expr` must compile to an
+# INTEGRAL or decimal type -- the engine-verified DOUBLE producers
+# (`avg(int|long)`, `/` over integrals) are exactly what this excludes.
+_INTEGRAL_OR_DECIMAL_TYPES: tuple[type[DataType], ...] = (
+    ByteType,
+    ShortType,
+    IntegerType,
+    LongType,
+    DecimalType,
+)
+
+
+def _fact_column_spark_type(type_str: str) -> DataType:
+    """006.1 §4.1's `FACT_COLUMN_TYPE_RE`-shaped type string -> its Spark
+    `DataType`, for K5's probe schema -- the six bare kinds via a lookup
+    table, `decimal(p,s)` parsed directly (`type_str` is already
+    `FactColumnSpec.type`-pattern-valid by the time a `PipelineSpecModel`
+    exists)."""
+    kind = type_str.split("(", 1)[0]
+    if kind == "decimal":
+        precision_str, scale_str = type_str[len("decimal(") : -1].split(",")
+        return DecimalType(int(precision_str), int(scale_str))
+    return _FACT_COLUMN_SPARK_TYPES[kind]()
+
+
+def _fact_type_probe_schema(fact_type: FactTypeModel) -> StructType:
+    return StructType(
+        [
+            StructField(column.name, _fact_column_spark_type(column.type), True)
+            for column in fact_type.schema_.columns
+        ]
+    )
+
+
+def _compile_probe(probe_df: DataFrame, text: str, check_id: str, label: str) -> DataType:
+    """P-2 gate 2: engine-compiles `text` -- the raw authored field, byte-
+    exact; gate 1/K9 already accepted it at spec-parse (`core/model.py`) by
+    the time a `PipelineSpecModel` exists, so no re-derivation is needed
+    here -- against `probe_df`'s bound schema. `.select(...)` alone forces
+    full Catalyst analysis (verified this bead: an unresolved column raises
+    `AnalysisException` right here, no `.collect()`/action needed) -- a
+    defensive net K3/K4 should already have made unreachable for a validly-
+    parsed spec, kept because engine-compile failure is its own named §5.4
+    code, never silently assumed impossible."""
+    try:
+        compiled = probe_df.select(F.expr(text).alias("_v"))
+    except Exception as exc:  # noqa: BLE001 -- re-raised as our own binding defect below
+        raise ValueError(
+            f"bind-defect/check-expression-uncompilable: check {check_id!r} {label} "
+            f"rejected by the engine (P-2 gate 2): {exc}"
+        ) from exc
+    return compiled.schema.fields[0].dataType
+
+
+def _assert_row_expr_boolean(probe_df: DataFrame, check_id: str, text: str) -> None:
+    dtype = _compile_probe(probe_df, text, check_id, "expr")
+    if not isinstance(dtype, BooleanType):
+        raise ValueError(
+            f"bind-defect/check-expression-not-boolean: check {check_id!r} expr compiles to "
+            f"{dtype.simpleString()!r}, not boolean (P-9 rule 2 [EM-3])"
+        )
+
+
+def _assert_aggregate_dtype_exact(
+    probe_df: DataFrame, check_id: str, label: str, text: str
+) -> DataType:
+    """Returns the compiled `dtype` on success (conveyer-swb.15/D006-1: the
+    [DC-2] wiring below reuses this SAME oracle compile rather than
+    re-running `_compile_probe` a second time for the identical text) --
+    otherwise unchanged: every existing raise/condition below is exactly as
+    it was before this return-value addition (K5's own behaviour, untouched
+    per this bead's brief)."""
+    dtype = _compile_probe(probe_df, text, check_id, label)
+    if not isinstance(dtype, _INTEGRAL_OR_DECIMAL_TYPES):
+        raise ValueError(
+            f"bind-defect/check-expression-inexact-type: check {check_id!r} {label} compiles "
+            f"to {dtype.simpleString()!r}, not integral or decimal (P-9 rule 2 [EM-3])"
+        )
+    return dtype
+
+
+def _schema_family_map(schema: FactSchemaModel) -> dict[str, Family | None]:
+    """The SAME one-line, grammar-anchored reduction `core/model.py::_fact_
+    schema_family_map`/`frames/business_checks.py::_schema_family_map`
+    already perform -- re-derived here rather than imported (both of those
+    are module-private, and the derivation is mechanical, not business
+    logic that could drift; `business_checks.py`'s own docstring names this
+    exact precedent)."""
+    return {column.name: family_of_kind(column.type.split("(", 1)[0]) for column in schema.columns}
+
+
+def _assert_dtype_agreement(
+    check_id: str, structural_dtype: DataType, oracle_dtype: DataType
+) -> None:
+    """§7.5's [DC-2]: bind additionally asserts equality between the
+    structural Column tree's (`business_checks.aggregate_column`, built
+    from `check_grammar.compile_aggregate`'s pure value tree) engine-
+    analyzed dtype and gate 2's own oracle answer for the SAME authored
+    text (`_assert_aggregate_dtype_exact`'s own `_compile_probe` call,
+    passed in rather than recomputed). Disagreement is a FRAMEWORK defect
+    (the `compile_aggregate` translator disagreeing with the engine's own
+    typing of the authored text) -- never an authored-spec `bind-defect/*`
+    -- a plain `ValueError`, checked at the WHOLE aggregate-expression
+    grain: each individual `sum` node's own coalesce-cast target is
+    independently drawn from a LIVE probe of that exact structural sub-
+    column against the same frame (`aggregate_column`'s own construction),
+    so it cannot itself disagree by construction -- what this assertion
+    actually guards is the translator's ARITHMETIC/DISPATCH composition
+    (e.g. a wrong operator or aggregate-kind mapping), which this bead's
+    own kernel session confirmed a whole-expression dtype comparison does
+    catch (combined aggregate+arithmetic dtypes agree end to end exactly
+    when the composition is correct, verified over `sum(net)+sum(fees)`,
+    `sum(net)/count(1)`, and a decimal-overflow `sum` row)."""
+    if structural_dtype != oracle_dtype:
+        raise ValueError(
+            f"framework-defect/compile-aggregate-dtype-mismatch: check {check_id!r} aggregate "
+            f"structural compile yields {structural_dtype.simpleString()!r}, engine oracle "
+            f"yields {oracle_dtype.simpleString()!r} (sec7.5 [DC-2])"
+        )
+
+
+def _assert_compile_aggregate_dtype_agreement(
+    probe_df: DataFrame,
+    check_id: str,
+    aggregate_text: str,
+    family_map: Mapping[str, Family | None],
+    oracle_dtype: DataType,
+) -> None:
+    """Wires [DC-2] into K5 (§7.5, conveyer-swb.15/D006-1): re-derives the
+    SAME gate-1 `ValidatedExpr` (never a second grammar -- the `_compiled_
+    expr`/`business_checks.py` precedent, re-deriving from raw text since
+    bind already validated it once), compiles it via `check_grammar.
+    compile_aggregate` (the pure, per-sum-coalesce-typed value tree), turns
+    it into a real `Column` via `business_checks.aggregate_column`, engine-
+    probes ITS dtype against the SAME `probe_df` K5 already built, and
+    asserts it against `oracle_dtype`. A gate-1 disagreement between this
+    re-validation and `core/model.py`'s own K4/K9 call (i.e. THIS call
+    rejects text that already passed at spec-parse) is itself a framework
+    defect -- the two call sites must always agree, since both run the
+    identical pure `validate_expression` over the identical text and
+    schema. A construct outside `compile_aggregate`'s own scoped surface
+    (its own docstring) is ALSO a framework defect here: it means a
+    `batch_check` was authored using an aggregate shape this translator
+    does not yet cover, caught pre-land rather than mistranslated."""
+    validated = validate_expression(aggregate_text, "aggregate", family_map)
+    if not isinstance(validated, ValidatedExpr):
+        raise ValueError(
+            f"framework-defect/compile-aggregate-gate1-disagreement: check {check_id!r} "
+            "aggregate failed re-validation at K5 after already passing gate 1 at bind-parse "
+            "(core/model.py) -- the two gate-1 call sites disagree"
+        )
+    compiled = compile_aggregate(validated, family_map)
+    if not isinstance(compiled, CompiledAggregate):
+        raise ValueError(
+            f"framework-defect/compile-aggregate-unsupported-construct: check {check_id!r} "
+            f"aggregate {aggregate_text!r} uses a construct outside compile_aggregate's scoped "
+            f"surface ({compiled.code}: {compiled.detail}) -- sec7.5 [DC-2] cannot be asserted"
+        )
+    structural_col = aggregate_column(compiled.tree, probe_df)
+    structural_dtype = probe_df.agg(structural_col.alias("_v")).schema.fields[0].dataType
+    _assert_dtype_agreement(check_id, structural_dtype, oracle_dtype)
+
+
+def _assert_check_expressions_compile(spark: SparkSession, spec: PipelineSpecModel) -> None:
+    """K5 (P-2 gate 2 + P-9 rule 2's compiled-dtype inspection, [EM-3]),
+    006.1 §5.4 -- deliberately NOT folded into `bind_checks.validate_
+    bindings` (`core/bind_checks.py`'s own module docstring: that function
+    is plain-value-pure; K5 needs a live engine -- "a THIRD, separate
+    bind-time call the entrypoint makes", P-4's own text). Still pre-land,
+    still before `fx_factory`: this function needs only `spark` + `spec`,
+    unlike the F-10/[DC-1] wiring below (which needs `fx.describe_table`).
+
+    The `BatchCheckModel` branch (aggregate/`control.expr`) is currently
+    UNREACHABLE through any validly-parsed `PipelineSpecModel`: `ChecksModel`
+    (`core/model.py`) refuses ANY `batch_check` at spec-PARSE time (K7,
+    P-6's structural wait on 005 v1.x's member grammar) -- a spec
+    containing one never becomes a `PipelineSpecModel` instance in the
+    first place. Implemented anyway, never guarded behind "if batch checks
+    were ever reachable": P-9 rule 2 defines K5 over BOTH check kinds, and
+    005 v1.x landing must not require revisiting this function. Tested at
+    `_assert_aggregate_dtype_exact`'s own grain, against a hand-built
+    `BatchCheckModel` (which carries no refusal of its own -- only
+    `ChecksModel` does), since a real spec cannot exercise it.
+
+    **[DC-2] (conveyer-swb.15/D006-1), wired into the `aggregate` branch
+    only.** `control.expr` is a SCALAR-position expression over one already-
+    extracted row (§9), not an aggregate -- `compile_aggregate` does not
+    apply to it, so only `_assert_aggregate_dtype_exact(..., "aggregate",
+    ...)`'s own oracle dtype feeds `_assert_compile_aggregate_dtype_
+    agreement` below; K5's `control.expr` check is otherwise unchanged."""
+    for type_name, fact_type in spec.fact_types.items():
+        probe_df = spark.createDataFrame([], schema=_fact_type_probe_schema(fact_type))
+        for check in spec.checks.checks:
+            if check.fact_type != type_name:
+                continue
+            if isinstance(check, RowCheckModel):
+                _assert_row_expr_boolean(probe_df, check.id, check.expr)
+            elif isinstance(check, BatchCheckModel):
+                aggregate_dtype = _assert_aggregate_dtype_exact(
+                    probe_df, check.id, "aggregate", check.aggregate
+                )
+                family_map = _schema_family_map(fact_type.schema_)
+                _assert_compile_aggregate_dtype_agreement(
+                    probe_df, check.id, check.aggregate, family_map, aggregate_dtype
+                )
+                _assert_aggregate_dtype_exact(
+                    probe_df, check.id, "control.expr", check.control.expr
+                )
+
+
+# --- effect: P-4's CatalogFacts acquisition + the F-10/[DC-1] bind step ----
+# --- (006.1 §5/P-4; 007.1 F-10/[DC-1], the B2<->B7 seam) --------------------
+
+
+def _referenced_tables(spec: PipelineSpecModel) -> tuple[str, ...]:
+    """P-4's `CatalogFacts` population set (`core/bind_checks.py::
+    CatalogFacts`'s own docstring): every declared co-effect's table,
+    (existence-only) every declared fact type's `fact_table`/`state_table`,
+    plus (existence-only, critique gate wf_78ea4599-a5b F3, bead
+    conveyer-swb.26) this pipeline's own marker table (`naming.markers_
+    table`'s own derivation — the SAME one `_committed_tables`'s call site
+    below and `bootstrap/create_record_tables.py` already use, never a
+    second, independent naming rule). Folding the marker table into this
+    ONE `fx.describe_table`-per-table acquisition (rather than a bespoke
+    existence probe) means P-4's own bind-defect matrix (`core/bind_checks.
+    py::validate_bindings`'s new `marker-table-missing` row) discovers an
+    un-bootstrapped marker table PRE-LAND — before any raw write or
+    `batch-started` event — instead of only at commit, where `effects/
+    spark.py::_require_marker_table` raises a retry-class `TransientError`
+    on every SFN attempt until a redeploy (006.1 P-4's own "the pre-land
+    class exists precisely so misconfiguration never half-starts a batch")."""
+    tables = {decl.table for decl in spec.co_effects.values()}
+    for fact_type in spec.fact_types.values():
+        tables.add(fact_type.fact_table)
+        tables.add(fact_type.state_table)
+    tables.add(naming.markers_table(spec.raw_table, spec.pipeline))
+    return tuple(sorted(tables))
+
+
+def _acquire_catalog_facts(fx: RunnerFx, tables: tuple[str, ...]) -> bind_checks.CatalogFacts:
+    """P-4's effectful acquisition step: one `fx.describe_table` call per
+    referenced table (004.1-erratum class, §16.4 item 3)."""
+    return {table: fx.describe_table(table) for table in tables}
+
+
+def _acquire_transforms_meta(spec: PipelineSpecModel) -> bind_checks.TransformsMeta:
+    """S4's raw-module inspection (006.1 §4.4/§5.1), plus its sibling
+    `stale-fold-export` check (critique gate wf_24a3125f-ecc F2, bead
+    conveyer-6pg.31). `importlib.import_module` is a cache HIT here --
+    `bind_transforms` (earlier in this same `main()` sequence) already
+    imported this exact module, so `sys.modules` already holds it; this is
+    a dict lookup, not a re-execution. Kept deliberately independent of
+    `binding.py::bind_transforms`'s OWN contract (`Transforms` still
+    required `post_check`, pre-B3's stage-rewrite migration, `conveyer-
+    6pg.13`; it still required `fold`, pre-F2's fold-defaulting-wiring
+    removal) -- this reads the raw module's own `post_check`/`fold`
+    attributes directly, so S4 and its sibling are wireable independent of
+    what `bind_transforms` itself currently requires or ignores."""
+    module = importlib.import_module(spec.transforms_module)
+    return bind_checks.TransformsMeta(
+        has_post_check_export=hasattr(module, "post_check"),
+        has_fold_export=hasattr(module, "fold"),
+    )
+
+
+def _load_table_class_inventory(
+    fetch_spec: Callable[[str], str], pipeline_spec_uri: str
+) -> Mapping[str, str]:
+    """F-10 (007.1 §6.5 step 6, `core/bind_checks.py`'s own "F-10 / [DC-1]"
+    docstring section): loads the content-pinned `table-classes.json` the
+    deploy step (`bootstrap.create_record_tables.py::main`) emits beside the
+    deployed spec (the I-23 idiom) -- reuses the SAME `fetch_spec` DI seam
+    `main()` already threads through for the spec fetch itself (`s3://`
+    boto3 / `file://` local, zero new seams), at the sibling URI `naming.
+    table_class_inventory_uri(pipeline_spec_uri)` derives. `core/naming.py`
+    is the single source both the writer (bootstrap) and this reader import
+    the URI-derivation rule from (that module's own docstring), so the two
+    can never disagree on where the inventory lives. `json.loads` -> the
+    bind-time AUTHORITY `validate_bindings`'s C4 check reads."""
+    inventory_uri = naming.table_class_inventory_uri(pipeline_spec_uri)
+    inventory: Mapping[str, str] = json.loads(fetch_spec(inventory_uri))
+    return inventory
+
+
+def _committed_tables(spark: SparkSession, markers_table: str, batch_id: str) -> tuple[str, ...]:
+    """[DC-1] discharge (007.1 §4.3, `core/bind_checks.py`'s own "F-10 /
+    [DC-1]" docstring section): bind's ONE ruled data-read -- the DISTINCT
+    guard-twin `table_name` for `(batch_id, stage='commit')`, sentinel
+    excluded (`naming.COMMIT_COMPLETION_SENTINEL`). `markers_table` is the
+    BARE `<db>.<slug>__markers` name (`naming.markers_table`'s own output);
+    `naming.qualified` adds the catalog prefix here, matching `effects/
+    spark.py`'s own convention (bare names flow through business logic,
+    catalog-qualification happens at the effect that actually touches
+    Spark). Returns `()` when the marker table does not exist yet --
+    `spark.catalog.tableExists` first, mirroring `bootstrap/create_record_
+    tables.py`'s own idempotent-creation precedent; an empty set is a subset
+    of every deployed fact-table set by construction, so `fact-type-removed-
+    in-flight` correctly stays silent in that case too. DataFrame-API
+    predicate, not string-interpolated SQL (I-3's own `table_has_batch`
+    precedent, 004.1 §5) -- `batch_id`/the sentinel never touch a raw SQL
+    string.
+
+    **This function's own missing-table tolerance is now unreachable-after-
+    bind (critique gate wf_78ea4599-a5b F3, bead conveyer-swb.26).** `main()`
+    calls this BEFORE `_assert_bind_checks_pass`, so the `return ()` branch
+    above still executes when the marker table is absent -- but by
+    construction its result can never reach `run_sequence`: `_referenced_
+    tables` now includes this pipeline's own marker table in `CatalogFacts`,
+    so the SAME absence `validate_bindings`'s `marker-table-missing` row
+    refuses at bind, right after this call returns, before this function's
+    `()` result (or anything downstream of it) has any observable effect.
+    Left in place, not removed: `spark.catalog.tableExists` here is a real,
+    independently-tested Spark-catalog read (`test_committed_tables_returns_
+    empty_when_marker_table_absent`) that this docstring note, not a code
+    change, is the lower-risk way to record the new fact about."""
+    qt = naming.qualified(markers_table)
+    if not spark.catalog.tableExists(qt):
+        return ()
+    rows = (
+        spark.table(qt)
+        .where(
+            (F.col("stage") == "commit")
+            & (F.col("batch_id") == F.lit(batch_id))
+            & (F.col("table_name") != F.lit(naming.COMMIT_COMPLETION_SENTINEL))
+        )
+        .select("table_name")
+        .distinct()
+        .collect()
+    )
+    return tuple(sorted(r["table_name"] for r in rows))
+
+
+def _assert_bind_checks_pass(
+    spec: PipelineSpecModel,
+    catalog_facts: bind_checks.CatalogFacts,
+    transforms_meta: bind_checks.TransformsMeta,
+    table_class_inventory: Mapping[str, str],
+    committed_tables: tuple[str, ...],
+    markers_table: str,
+) -> None:
+    """P-4's pure half, called: any defect -> one plain `ValueError` naming
+    every `bind-defect/<code>: <detail>` found (A-10's grammar; every
+    finding named, not just the first -- the `describe_raw_diff` precedent,
+    `bootstrap/create_admission_tables.py`).
+
+    `markers_table` (critique gate wf_78ea4599-a5b F3, bead conveyer-swb.26):
+    this pipeline's own bare marker-table identifier -- the SAME value
+    `_committed_tables` above already reads with, threaded through so
+    `validate_bindings` can look it up in `catalog_facts` (already populated
+    by `_referenced_tables`/`_acquire_catalog_facts`, never a second read
+    here) and refuse `marker-table-missing` pre-land."""
+    defects = bind_checks.validate_bindings(
+        spec, catalog_facts, transforms_meta, table_class_inventory, committed_tables, markers_table
+    )
+    if not defects:
+        return
+    detail = "; ".join(f"bind-defect/{d.code}: {d.detail}" for d in defects)
+    raise ValueError(detail)
+
+
 # --- pure: seed `BatchContext` -----------------------------------------------
 
 
@@ -545,7 +924,12 @@ def _seed_batch_context(
     seed context unchanged for the rest of the run -- this function is
     called exactly once per `main()` invocation, so "computed once" falls
     out of that, the same way `RunConfig.model_validate_json` above already
-    relies on being called from exactly one call site."""
+    relies on being called from exactly one call site.
+
+    006.1 P-3/§4.5 (bead conveyer-6pg.13, B3): `checks_version` joins the
+    same seed-adjacent class, computed once here via `core.checks.
+    checks_version(spec.checks)` -- a pure function of the already-parsed
+    `spec.checks` -- and carried unchanged for the rest of the run."""
     return BatchContext(
         pipeline=seed.pipeline,
         feed_id=seed.feed_id,
@@ -563,6 +947,7 @@ def _seed_batch_context(
         sfn_redrive_count=config.sfn_redrive_count,
         read_spec_version=read_spec_version(spec.read),
         check_version=check_version(spec.raw_contract, spec.read),
+        checks_version=checks_version(spec.checks),
     )
 
 
@@ -580,25 +965,39 @@ def main(
     (§8.3 plus the leading observability install, conveyer-nvh.47), plus
     three more binding-defect asserts (005.1 §3.2 [DC-4], §6.1's pinned
     obligation #1 -- bead conveyer-azr.18; the fmt-SEQUENCE probe for every
-    temporal column -- bead conveyer-azr.26) right after the session/
-    extensions asserts, still strictly before `fx_factory`/`run_sequence`:
-    every step below is a named call to a function defined above (or
-    imported) — no branching in this function itself."""
+    temporal column -- bead conveyer-azr.26), K5's engine-compile gate
+    (P-2 gate 2/P-9 rule 2, bead conveyer-6pg.12) right after the session/
+    extensions asserts, still strictly before `fx_factory`, and P-4's bind-
+    time validator inventory (006.1 §5, 007.1 F-10/[DC-1]) right after
+    `fx_factory` (needs `fx.describe_table`) but still strictly before
+    `run_sequence`: every step below is a named call to a function defined
+    above (or imported) — no branching in this function itself."""
     observability.install_json_handler()
     config = from_args(argv)
     seed = _parse_seed(config)
     naming.check_object_uris(
         seed.feed_id, seed.delivery_id, seed.received_at, seed.object_uris, config.landing_bucket
     )
-    check_spec_uri_allowlist(config.pipeline_spec_uri, naming.slug(seed.pipeline))
+    check_spec_uri_allowlist(
+        config.pipeline_spec_uri, naming.slug(seed.pipeline), config.artifacts_bucket
+    )
     spec = _parse_spec(fetch_spec(config.pipeline_spec_uri))
     _assert_binding_matches(spec, seed, config)
     transforms = bind_transforms(spec)
-    spark = _build_session(config)
-    _assert_iceberg_extensions_active(spark)
+    spark = session.build_session(config, app_name=f"conveyer-spine-{config.env}")
+    session.assert_iceberg_extensions_active(spark)
     _assert_patterns_compile_in_jvm(spark, spec.raw_contract)
     _assert_temporal_fmt_compiles_in_jvm(spark, spec.raw_contract)
     _assert_temporal_bounds_bind(spark, spec.raw_contract)
+    _assert_check_expressions_compile(spark, spec)
     fx = fx_factory(spark, config)
+    markers_table = naming.markers_table(spec.raw_table, spec.pipeline)
+    catalog_facts = _acquire_catalog_facts(fx, _referenced_tables(spec))
+    transforms_meta = _acquire_transforms_meta(spec)
+    table_class_inventory = _load_table_class_inventory(fetch_spec, config.pipeline_spec_uri)
+    committed_tables = _committed_tables(spark, markers_table, seed.batch_id)
+    _assert_bind_checks_pass(
+        spec, catalog_facts, transforms_meta, table_class_inventory, committed_tables, markers_table
+    )
     seed_ctx = _seed_batch_context(seed, spec, config, transforms)
     return run_sequence(seed_ctx, fx)

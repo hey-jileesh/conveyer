@@ -1,0 +1,70 @@
+# Identity-violations exemplar — deployed-shape PipelineSpec (LLD 006.1
+# §12.2/G-12, bead conveyer-swb.14/A006-10).
+#
+# The VIOLATIONS variant of the base identity exemplar
+# (tests/exemplar/identity/pipeline.yaml's own docstring explains the clean
+# shape): the SAME candidate/fact shape (`pipelines.identity_violations.
+# transforms` re-exports `pipelines.identity.transforms.apply`/`FACT_TYPE`
+# unchanged, its own module docstring), but this file's own `checks:`
+# section carries the ONE business rule the violations scenario suite
+# exercises — G-12's own words, "the violations variant's rules live in
+# checks.yaml (business/negative-amount)" — as AUTHORED DATA, not a
+# hand-built Python `ChecksModel` constant
+# (`tests/integration/scenario_helpers.py::VIOLATIONS_CHECKS` now loads
+# THIS file via `parse_pipeline_spec_yaml` rather than constructing the rule
+# in Python).
+#
+# Deployed-shape-parses-cleanly note (mirrors the base identity yaml's own):
+# scenario tests build their own per-test `PipelineSpecModel` with unique
+# table names; this file's only job is to prove the deployed shape itself
+# parses cleanly through the strict `parse_pipeline_spec_yaml` loader
+# (`tests/unit/test_model.py::test_identity_violations_exemplar_yaml_parses`).
+pipeline: pipelines/identity-violations
+transforms_module: pipelines.identity_violations.transforms
+raw_table: conveyer_dev_lake.identity_violations__raw
+quarantine_table: conveyer_dev_lake.identity_violations__quarantine
+fact_types:
+  identity:
+    fact_table: conveyer_dev_lake.identity_violations__facts
+    state_table: conveyer_dev_lake.identity_violations__state
+    schema:
+      columns:
+        - name: domain_id
+          type: string
+        - name: event_time
+          type: string
+        - name: payload
+          type: string
+      domain_id_col: domain_id
+      record_key: [domain_id]
+checks:
+  checks:
+    - kind: row
+      id: no-invalid-payload
+      fact_type: identity
+      expr: "payload != 'INVALID'"
+      reason: business/negative-amount
+fold: default-lww
+domain_id_col: domain_id
+co_effects: {}
+serialize: false
+read:
+  compression: none
+  dialect:
+    format: csv
+    header: true
+raw_contract:
+  columns:
+    - name: domain_id
+      type: string
+      required: true
+      nullable: false
+    - name: event_time
+      type: string
+    - name: source_ts
+      type: string
+    - name: content_hash
+      type: string
+    - name: payload
+      type: string
+sla_minutes: 480

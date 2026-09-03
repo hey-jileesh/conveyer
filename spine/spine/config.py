@@ -8,11 +8,12 @@ config` / `--conveyer-pipeline-spec-uri` / `--conveyer-sla-minutes` (§10.4),
 `--conveyer-attempt-id` / `--JOB_RUN_ID` (I-5). The doc does not enumerate a
 key name for every other `RunnerConfig` field (`env`, `aws_region`,
 `catalog_kind`, `warehouse_uri`, `ledger_catalog_kind`, `ledger_sql_uri`,
-`spine_db`, `run_ledger_table`, `event_bus`, `landing_bucket`) -- those are
-Terraform-authored default job arguments (009/010 territory). This module
-extends the same `--conveyer-<kebab-field-name>` convention the pinned flags
-already follow; `_ARGV_KEYS` below is the single place that convention lives,
-so a future LLD errata pinning the real names is a one-table edit here.
+`spine_db`, `run_ledger_table`, `event_bus`, `landing_bucket`,
+`artifacts_bucket`) -- those are Terraform-authored default job arguments
+(009/010 territory). This module extends the same `--conveyer-<kebab-
+field-name>` convention the pinned flags already follow; `_ARGV_KEYS` below
+is the single place that convention lives, so a future LLD errata pinning
+the real names is a one-table edit here.
 """
 
 from collections.abc import Sequence
@@ -34,6 +35,7 @@ _ARGV_KEYS: Final[dict[str, str]] = {
     "run_ledger_table": "conveyer-run-ledger-table",
     "event_bus": "conveyer-event-bus",
     "landing_bucket": "conveyer-landing-bucket",
+    "artifacts_bucket": "conveyer-artifacts-bucket",  # 6pg.35 item 4: I-23 bucket pin
     "pipeline_spec_uri": "conveyer-pipeline-spec-uri",
     "delivery_json": "conveyer-delivery",  # §8.2, SFN-injected (irregular vs. the
     # kebab-field-name convention -- pinned verbatim by the doc)
@@ -56,7 +58,8 @@ class RunnerConfig:  # effect-side wiring; spine/config.py
     run_ledger_table: str
     event_bus: str
     landing_bucket: str  # for the I-22 object-URI shape check
-    pipeline_spec_uri: str  # validated against the specs root (I-23)
+    artifacts_bucket: str  # 6pg.35 item 4: I-23's `check_spec_uri_allowlist` bucket pin
+    pipeline_spec_uri: str  # validated against the specs root and artifacts_bucket (I-23)
     delivery_json: str  # allowlisted detail passed by SFN
     attempt_id: str
     sfn_retry_count: int
@@ -120,6 +123,7 @@ def from_args(argv: Sequence[str]) -> RunnerConfig:
         run_ledger_table=required("run_ledger_table"),
         event_bus=required("event_bus"),
         landing_bucket=required("landing_bucket"),
+        artifacts_bucket=required("artifacts_bucket"),
         pipeline_spec_uri=required("pipeline_spec_uri"),
         delivery_json=required("delivery_json"),
         attempt_id=attempt_id,

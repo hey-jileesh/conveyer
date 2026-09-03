@@ -1,0 +1,67 @@
+[
+  {
+    "value": {
+      "status": "ACTIVE",
+      "domain_id": "POL-0042",
+      "amount": {
+        "$decimal": "1250.75"
+      },
+      "period": {
+        "$date": "2026-06-30"
+      }
+    },
+    "canonical": "{\"amount\":\"1250.75\",\"domain_id\":\"POL-0042\",\"period\":\"2026-06-30\",\"status\":\"ACTIVE\"}",
+    "sha256": "f6e68311582bab5f5791b321ae37cee82a9c1831137b3f51f06fc682c6b78330"
+  },
+  {
+    "value": {
+      "amount": {
+        "$decimal": "42.00"
+      }
+    },
+    "canonical": "{\"amount\":\"42.00\"}",
+    "sha256": "d3f8db1d9ee001d25bd49a713c43f4582782659e87900d177b9bc75c8aade864"
+  },
+  {
+    "value": {
+      "row_no": 7
+    },
+    "canonical": "{\"row_no\":7}",
+    "sha256": "8b32831cab3b820a2c743ae0b042ae7a72b4016d36e008c33b15bea61330671e"
+  },
+  {
+    "value": {
+      "row_no": "7"
+    },
+    "canonical": "{\"row_no\":\"7\"}",
+    "sha256": "8b6ed136b5fb764df4adfab8983b861e4d444ddc72ba8d911c6197c8b58ae1fa"
+  },
+  {
+    "value": {
+      "is_active": true
+    },
+    "canonical": "{\"is_active\":true}",
+    "sha256": "2cad1726fbc5d14edd742039952837fb0029dba792f7d85df7ff5b382bb91978"
+  },
+  {
+    "value": {
+      "is_active": "true"
+    },
+    "canonical": "{\"is_active\":\"true\"}",
+    "sha256": "15ee3f49bfa0340fd7ab1be7660a2a975b7dad8575a3ad6e2b3c4e2dc84e486b"
+  },
+  {
+    "value": {
+      "carrier_code": "x"
+    },
+    "canonical": "{\"carrier_code\":\"x\"}",
+    "sha256": "053963ba4d88a50ac2e16ca3dc2680ebea9b9c544c94fb237276266b6dc268c8"
+  },
+  {
+    "value": {
+      "carrier_id": "x"
+    },
+    "canonical": "{\"carrier_id\":\"x\"}",
+    "sha256": "6267fc48e1bf3446f69a2a1bd09410a718b6b48d81be1d3d076972c2ac3abcda"
+  }
+]

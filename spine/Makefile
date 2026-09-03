@@ -7,7 +7,8 @@ UV := uv run -p 3.11 --package conveyer-spine
 
 .PHONY: setup lint schemas test-unit test-frames test-integration test-contracts test \
         coverage registry test-golden package package-router push-wheel \
-        bootstrap-ledger bootstrap-admission plan apply smoke
+        bootstrap-ledger bootstrap-admission bootstrap-record-tables plan apply smoke \
+        glue-parity
 
 setup:
 	uv sync --all-packages
@@ -107,6 +108,11 @@ bootstrap-admission:  ## idempotent per-pipeline raw/quarantine Iceberg table cr
 	@test -n "$(SPEC)" || { echo "SPEC is required (pipeline spec URI, s3:// or file://)"; exit 1; }
 	$(UV) python -m spine.bootstrap.create_admission_tables --spec-uri $(SPEC) --env $(ENV)
 
+bootstrap-record-tables:  ## idempotent per-pipeline fact/state/marker Iceberg table creation + table-classes.json (007.1 LLD §6.5)
+	@test -n "$(ENV)" || { echo "ENV is required"; exit 1; }
+	@test -n "$(SPEC)" || { echo "SPEC is required (pipeline spec URI, s3:// or file://)"; exit 1; }
+	$(UV) python -m spine.bootstrap.create_record_tables --spec-uri $(SPEC) --env $(ENV)
+
 # D-1: spine has no terraform env root of its own -- `modules/spine-platform`
 # and `modules/spine-pipeline` are consumed from the existing ingestion env
 # root (LLD §10.1: "extend the existing terraform/envs/dev root").
@@ -121,3 +127,17 @@ apply:
 smoke:  ## post-deploy end-to-end probe against real dev AWS (LLD §12.1) -- M6
 	@test -n "$(ENV)" || { echo "ENV is required"; exit 1; }
 	$(UV) pytest tests/smoke --env $(ENV)
+
+# G-08 discriminator-row engine-parity probe (LLD 006.1 §13.1/§14 B5, the
+# 005.1 N5 idiom -- `conveyer-azr.22`'s "probe job re-runs A-15 discriminator
+# rows" -- applied to G-08). No `--env`/AWS access of its own: it builds its
+# own SparkSession (`spine.probes.g08_parity._build_session`, no `.master`
+# set) and evaluates every discriminator row in-process, so `make -C spine
+# glue-parity` run on a plain dev laptop is a LOCAL rehearsal (proves the
+# probe and its vectors are self-consistent, `tests/unit/
+# test_g08_parity_probe.py`'s own job); the real cross-engine claim only
+# exists once this exact command is `spark-submit`'d against a live Glue 5.0
+# job (B5-gate, `conveyer-6pg.16`, LEAVE OPEN, human-supervised) -- same
+# command, different engine underneath, by construction.
+glue-parity:
+	$(UV) python -m spine.probes.g08_parity

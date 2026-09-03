@@ -1,44 +1,34 @@
-"""`apply`/`post_check` for the identity exemplar's violations variant. LLD §12.2, R-04, A-14.
+"""`apply` for the identity exemplar's violations variant. LLD 006.1 §12.2/G-12, R-04.
 
 `apply` is `pipelines.identity.transforms.apply`, re-exported (not
-re-implemented — a single source of truth for the column projection).
-`post_check` flags every candidate row whose `payload` carries the fixture's
-own violation marker (`_VIOLATION_MARKER`) — a real, if provisional, DQ rule
-over the transform's OWN output (I-12: `Quarantined = tuple[Record, str]`,
-one `reason` per flagged row), letting R-04's violations fixture exercise
-`post_check`'s quarantine path without inventing a second co-effect.
+re-implemented — a single source of truth for the column projection and the
+one-entry candidate mapping, 006.1 §4.4).
 
-**Reason migrated to the A-14 `business/…` grammar (bead conveyer-azr.19,
-n3-admission-cut)**: `shape_post_quarantine`'s own `_assert_business_reason_
-grammar` (§8.2.1) fails fast on any `reason` not fullmatching
-`^business/[a-z0-9][a-z0-9-]*$` — the exemplar's own violations variant
-migrates its free-text reason to the fixed code `business/negative-amount`
-(005.1 §12.2's own named example), never surfaced to the pipeline author to
-choose a message.
+**006.1 migration (bead conveyer-6pg.13, B3): `post_check` is GONE.** The
+005.1-era `post_check` flagged every candidate row whose `payload` carried
+the fixture's own violation marker (`_VIOLATION_MARKER = "INVALID"`) under
+the free-text-then-A-14-grammar-checked reason `business/negative-amount`.
+Under the framework's own interpreter (§7) that rule is now DECLARED DATA —
+a `row` check in `checks.yaml` (G-12: "violations variant's rules live in
+checks.yaml (`business/negative-amount`)"), bind-time validated (K1-K9,
+006.1 §5.4) rather than pipeline-Python-authored and runtime-grammar-
+checked (A-14's runtime check is superseded, §5.4 K6). This module
+therefore contributes zero check code — `_VIOLATION_MARKER` stays here only
+as the one shared literal the fixture's own CSV rows and the checks
+declaration must agree on (fixtures live in `tests/exemplar/identity/
+fixtures/violations/*.csv`; the checks declaration lives with each test's
+own `PipelineSpecModel` construction — `tests/integration/
+scenario_helpers.py::VIOLATIONS_CHECKS`).
 """
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from pipelines.identity.transforms import FACT_TYPE, apply  # noqa: F401 -- re-exported
 
-from pyspark.sql import functions as F
-
-from pipelines.identity.transforms import apply  # noqa: F401 -- re-exported, required export
-
-if TYPE_CHECKING:
-    from collections.abc import Mapping
-
-    from pyspark.sql import DataFrame
-
-# The fixture's own marker for a row `post_check` must flag -- see
-# tests/exemplar/identity/fixtures/violations/*.csv.
-_VIOLATION_MARKER = "INVALID"
-# A-14/§8.2.1: the governed business reason code this fixture's violation quarantines under.
-_VIOLATION_REASON = "business/negative-amount"
-
-
-def post_check(candidate_facts_df: DataFrame, co_effects: Mapping[str, DataFrame]) -> DataFrame:
-    del co_effects
-    return candidate_facts_df.filter(F.col("payload") == F.lit(_VIOLATION_MARKER)).withColumn(
-        "reason", F.lit(_VIOLATION_REASON)
-    )
+# The fixture's own marker for a row the `business/negative-amount` checks.yaml
+# rule must flag -- see tests/exemplar/identity/fixtures/violations/*.csv and
+# tests/integration/scenario_helpers.py::VIOLATIONS_CHECKS's authored `expr`.
+VIOLATION_MARKER = "INVALID"
+# 006.1 §5.4 K6/A-14: the governed business reason code this fixture's
+# violation quarantines under -- now declared in checks.yaml, not minted here.
+VIOLATION_REASON = "business/negative-amount"

@@ -1,19 +1,56 @@
 """`bind_transforms(spec) -> Transforms` — importlib binding, namespace-constrained. LLD §7.4.
 
-`Transforms` is the frozen record of a pipeline's three pure functions
-(`apply`, `post_check`, `fold`) that rides `BatchContext.transforms` (I-10).
+`Transforms` is the frozen record of a pipeline's ONE pure function
+(`apply`) that rides `BatchContext.transforms` (I-10). **006.1 §4.4 (bead
+conveyer-6pg.13, B3): `Transforms` DROPS `post_check`** (errata row 19's
+completion) -- `apply` is now the interpreter's own boundary
+(`(valid_df, co_effects) -> Mapping[str, DataFrame]`, one candidate frame
+per declared fact type); business-rule evaluation moved entirely into the
+framework's `post_check` STAGE (`frames/business_checks.py` +
+`checks.yaml`'s declared checks, 006.1 §7) -- pipelines contribute zero
+check code (D-1/D-6). A transforms module still exporting `post_check` is
+therefore a STALE export, not a binding requirement any more: `bind_
+transforms` itself no longer looks for it at all (a stale export is caught
+elsewhere -- `core/bind_checks.py`'s S4 check, fed by `entrypoints/
+glue_main.py::_acquire_transforms_meta`'s OWN independent `hasattr` read of
+the raw imported module, deliberately kept separate from this function's
+contract, per that module's own docstring) -- so this function's own
+requirement is simply "no longer checks for it," never "refuses it."
+
+**`Transforms` DROPS `fold` too (critique gate wf_24a3125f-ecc F2, bead
+conveyer-6pg.31).** 007.1 B10 (bead conveyer-6pg.22) rewrote `stages/
+fold.py` into a purely mechanical, per-declared-fact-type reduce
+(`frames/fold.py::reduce_batch_winners`, driven by `MergeSpec.ordering_cols`
+alone) that never calls `ctx.transforms.fold` at all -- so this module's OWN
+fold-defaulting wiring (`fold` optional, absent ⇒ `frames.default_lww_fold`
+partial-applied with `spec.domain_id_col`) was binding a member `stages/
+fold.py` never read: a pipeline exporting `fold` bound cleanly and was
+silently ignored, the fail-silent asymmetry against S4's own loud stale-
+`post_check`-export refusal above. Fixed by dropping the member outright,
+the same "hard cut, not a silent no-op" shape B3 already applied to
+`post_check`: a transforms module still exporting `fold` is now a STALE
+export too, refused at bind by `core/bind_checks.py`'s own new
+`stale-fold-export` check (`TransformsMeta.has_fold_export`, `entrypoints/
+glue_main.py::_acquire_transforms_meta`'s own `hasattr` read, mirroring S4
+exactly). **The reserved custom-fold seam is NOT removed by this fix** --
+`PipelineSpecModel.fold`'s `Literal["default-lww", "custom"]` field and its
+`_check_fold_not_custom` bind-time refusal (007 D-3(e)) both stay untouched;
+only the dead, silently-ignored WIRING that used to sit between a bound
+`Transforms.fold` and a stage that never called it is gone. `frames/
+folds.py` (the v1-era `default_lww_fold`/`winners_per_domain`/
+`ordering_struct_gt` machinery this wiring was the sole production consumer
+of) is deleted outright too -- see that module's own former docstring,
+retained in `git log`, not here.
+
 `bind_transforms` is the ONE place `importlib` is called in the whole
 package: `importlib.import_module(spec.transforms_module)`, required
-exports present (`apply`, `post_check` -- `fold` optional), arity-checked
-via `inspect.signature` (2 positional parameters each), `fold` absent ⇒
-`frames.default_lww_fold` partial-applied with `spec.domain_id_col`. Any
-failure raises **before** `run()` is called (I-10) -- these are plain
-built-in exceptions (`AttributeError`/`TypeError`/`ValueError`/
-`ImportError`), not `TransientError`: a binding defect is a permanent
-config/code error, not an infra hiccup an SFN retry could resolve (§7.6's
-`TransientError` is reserved for `effects/*.py`); this matches 002.1 §7.0's
-carve-out that boundary parses in `config.py`/`binding.py`/entrypoints may
-raise plain exceptions (7.0 delta note).
+export present (`apply`, arity 2). Any failure raises **before** `run()` is
+called (I-10) -- these are plain built-in exceptions (`AttributeError`/
+`TypeError`/`ValueError`/`ImportError`), not `TransientError`: a binding
+defect is a permanent config/code error, not an infra hiccup an SFN retry
+could resolve (§7.6's `TransientError` is reserved for `effects/*.py`);
+this matches 002.1 §7.0's carve-out that boundary parses in `config.py`/
+`binding.py`/entrypoints may raise plain exceptions (7.0 delta note).
 
 `spec.transforms_module` is pydantic-pattern-guarded to `^pipelines\\.
 [a-z0-9_]+(\\.[a-z0-9_]+)*$` at the `PipelineSpecModel` boundary (I-10,
@@ -24,53 +61,36 @@ This does not add meaningful new coverage against a *validated* spec (the
 model already guarantees it) but keeps `bind_transforms` fail-safe on its
 own, independent of the model's own validators ever being bypassed.
 
-`frames.folds` (needed only for the fold-defaulting branch) is imported
-LAZILY, inside `bind_transforms`, not at module top -- it pulls in pyspark
-(`pyspark.sql.Window`/`functions`), and this module must stay importable
-(and its own failure-path branches testable) with zero pyspark/SparkSession
-requirement, matching `context.py`'s and this module's own prior
-docstring's convention. `default_lww_fold` itself is a plan builder (a
-`DataFrame -> DataFrame` function definition), so importing `frames.folds`
-and partial-applying it needs pyspark installed but no live `SparkSession` --
-only the "no fold export" success branch pays that import cost; every
-failure-path branch below (missing export, non-callable, bad arity,
-out-of-namespace, broken import) returns before ever touching `frames`.
-
 `from __future__ import annotations` postpones evaluation of the
 `Callable[[DataFrame, ...], DataFrame]` annotations to strings, so this
 module does not require a real pyspark import (or a SparkSession) merely to
 be imported -- `DataFrame` is only ever needed under `TYPE_CHECKING`,
 matching `context.py`'s convention for the same reason.
 
-**Two spec-shape WARNINGs fire here, once per `bind_transforms` call
-(critique F4/F12-guard, bead conveyer-nvh.43)** — `bind_transforms` runs
-exactly ONCE per run, pre-land, so it is the natural place for a diagnostic
-that is pure spec inspection and would otherwise have to re-fire on every
-attempt (or every stage) of the same run:
+**One spec-shape WARNING fires here, once per `bind_transforms` call
+(critique F4, bead conveyer-nvh.43)** — `bind_transforms` runs exactly ONCE
+per run, pre-land, so it is the natural place for a diagnostic that is pure
+spec inspection and would otherwise have to re-fire on every attempt (or
+every stage) of the same run: `decl.own_state and not spec.serialize` for
+any declared co-effect — Phase 1 does not honor `serialize` (004 §16.2) —
+logs one WARNING naming the co-effect and its table. **The second, F12-guard
+WARNING this section used to also document (`spec.fold == "custom"`) is
+gone, along with the dead default-lww fold-defaulting wiring it was
+warning ABOUT** (critique gate wf_24a3125f-ecc F2, bead conveyer-6pg.31,
+this module's own docstring above has the account) -- it is UNREACHABLE
+regardless: `spec.fold == "custom"` already raises at `PipelineSpecModel`
+parse (S3, `core/model.py::_check_fold_not_custom`), so no spec reaching
+this function could ever have carried it.
 
-* **F4** (moved from `stages/pull.py`, which used to log this on every
-  `pull` invocation, i.e. once per ATTEMPT rather than once per run):
-  `decl.own_state and not spec.serialize` for any declared co-effect — Phase
-  1 does not honor `serialize` (004 §16.2) — logs one WARNING naming the
-  co-effect and its table.
-* **F12-guard** (critique deviation-12): `spec.fold == "custom"` — `stages/
-  fold.py`'s own documented gap is that it always falls back to the
-  default-lww ordering key (`frames.folds.LWW_ORDERING_COLUMNS`) regardless
-  of `spec.fold`, which is only correct by accident for a genuinely custom
-  fold (there is no Phase 1 contract for a custom fold to declare its own
-  ordering columns; 007 owns the real resolution) — logs one WARNING naming
-  the pipeline.
-
-Both checks are pure spec inspection, independent of whether
-`transforms_module` even imports successfully, so they run FIRST, before
+This check is pure spec inspection, independent of whether
+`transforms_module` even imports successfully, so it runs FIRST, before
 `_assert_in_namespace`/`importlib.import_module` — a spec whose binding
-later fails still gets these two diagnostics logged (harmless: the run is
+later fails still gets this diagnostic logged (harmless: the run is
 aborting either way, pre-land, so no effect has run yet regardless).
 """
 
 from __future__ import annotations
 
-import functools
 import importlib
 import inspect
 import logging
@@ -94,9 +114,13 @@ _POSITIONAL_KINDS = (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITI
 
 @dataclass(frozen=True)
 class Transforms:
-    apply: Callable[[DataFrame, Mapping[str, DataFrame]], DataFrame]
-    post_check: Callable[[DataFrame, Mapping[str, DataFrame]], DataFrame]
-    fold: Callable[[DataFrame, DataFrame], DataFrame]
+    # 006.1 §4.4: `apply` now returns a MAPPING -- one candidate frame per
+    # declared fact type (P-1); `post_check` is gone (the framework's own
+    # interpreter stage now owns business-rule evaluation, §7). Critique
+    # gate wf_24a3125f-ecc F2 (bead conveyer-6pg.31): `fold` is gone too --
+    # `stages/fold.py`'s own mechanical §8.2 reduce never called it (module
+    # docstring above has the account).
+    apply: Callable[[DataFrame, Mapping[str, DataFrame]], Mapping[str, DataFrame]]
 
 
 def _warn_own_state_without_serialize(spec: PipelineSpecModel) -> None:
@@ -116,24 +140,6 @@ def _warn_own_state_without_serialize(spec: PipelineSpecModel) -> None:
                 decl.table,
                 extra={"pipeline": spec.pipeline, "stage": "bind_transforms"},
             )
-
-
-def _warn_custom_fold_ordering_gap(spec: PipelineSpecModel) -> None:
-    """F12-guard (critique deviation-12, bead conveyer-nvh.43): `stages/
-    fold.py` always resolves the MERGE ordering columns to the default-lww
-    key (`frames.folds.LWW_ORDERING_COLUMNS`) regardless of `spec.fold` --
-    correct only by accident for a genuinely custom fold, since Phase 1 has
-    no contract for a custom fold to declare its own ordering columns (007
-    owns that resolution). One WARNING per bind, naming the pipeline."""
-    if spec.fold == "custom":
-        logger = logging.getLogger(_LOGGER_NAME)
-        logger.warning(
-            "spec.fold == 'custom' for pipeline %r -- stages/fold.py still resolves "
-            "MERGE ordering columns to the default-lww key regardless (007 owns real "
-            "custom-fold ordering-key resolution)",
-            spec.pipeline,
-            extra={"pipeline": spec.pipeline, "stage": "bind_transforms"},
-        )
 
 
 def _assert_in_namespace(transforms_module: str) -> None:
@@ -171,12 +177,15 @@ def _check_arity(fn: Callable[..., Any], expected: int, name: str, module_name: 
 
 def bind_transforms(spec: PipelineSpecModel) -> Transforms:
     """`importlib.import_module(spec.transforms_module)` (namespace-
-    constrained, I-10); require callables `apply`, `post_check`; `fold`
-    optional -- absent ⇒ `frames.default_lww_fold` partial-applied with
-    `spec.domain_id_col`; arity-checked via `inspect.signature` (2, 2, 2
-    positional). Any failure raises before `run()` is called (I-10)."""
+    constrained, I-10); require callable `apply`, arity-checked via
+    `inspect.signature` (2 positional). Any failure raises before `run()` is
+    called (I-10). **006.1 §4.4: no longer looks for `post_check` at all**
+    -- a stale `post_check` export is a different function's concern (S4,
+    this module's own docstring). **Critique gate wf_24a3125f-ecc F2 (bead
+    conveyer-6pg.31): no longer looks for `fold` either** -- a stale `fold`
+    export is that same function's concern too now (S4's own sibling
+    `stale-fold-export` check, this module's own docstring)."""
     _warn_own_state_without_serialize(spec)
-    _warn_custom_fold_ordering_gap(spec)
     _assert_in_namespace(spec.transforms_module)
     try:
         module = importlib.import_module(spec.transforms_module)
@@ -186,21 +195,6 @@ def bind_transforms(spec: PipelineSpecModel) -> Transforms:
         ) from exc
 
     apply_fn = _require_callable(module, "apply", spec.transforms_module)
-    post_check_fn = _require_callable(module, "post_check", spec.transforms_module)
     _check_arity(apply_fn, 2, "apply", spec.transforms_module)
-    _check_arity(post_check_fn, 2, "post_check", spec.transforms_module)
 
-    fold_fn = getattr(module, "fold", None)
-    if fold_fn is None:
-        from spine.frames import folds  # lazy: pulls in pyspark, see module docstring
-
-        fold_fn = functools.partial(folds.default_lww_fold, domain_id_col=spec.domain_id_col)
-    else:
-        if not callable(fold_fn):
-            raise TypeError(
-                f"bind_transforms: {spec.transforms_module}.fold is not callable "
-                f"(got {type(fold_fn).__name__})"
-            )
-        _check_arity(fold_fn, 2, "fold", spec.transforms_module)
-
-    return Transforms(apply=apply_fn, post_check=post_check_fn, fold=fold_fn)
+    return Transforms(apply=apply_fn)

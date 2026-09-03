@@ -1,0 +1,26 @@
+[
+  {
+    "value": {
+      "domain_id": "POL-0042",
+      "note": null
+    },
+    "canonical": "{\"domain_id\":\"POL-0042\",\"note\":null}",
+    "sha256": "1178f89ea18bf590364117172afc7aa04ea4e01829054d699b6c4c8e09d1a026"
+  },
+  {
+    "value": {
+      "domain_id": "POL-0042",
+      "note": ""
+    },
+    "canonical": "{\"domain_id\":\"POL-0042\",\"note\":\"\"}",
+    "sha256": "181cc5cca39f991b840d22c0b9d8ae0700219776bdb792274eaaa927c2705708"
+  },
+  {
+    "value": {
+      "domain_id": "POL-0042",
+      "note": "null"
+    },
+    "canonical": "{\"domain_id\":\"POL-0042\",\"note\":\"null\"}",
+    "sha256": "05348b96cd8cc76416b783e1c54dac3285285b4f04773e7b39aa8bef5306455c"
+  }
+]

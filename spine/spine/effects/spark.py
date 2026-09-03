@@ -269,15 +269,27 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from datetime import UTC
 from typing import TYPE_CHECKING, Any
 
+from pyspark.sql import Row
 from pyspark.sql import functions as F
-from pyspark.sql.types import IntegerType, LongType, MapType, StringType, StructField, StructType
+from pyspark.sql.types import (
+    IntegerType,
+    LongType,
+    MapType,
+    StringType,
+    StructField,
+    StructType,
+    TimestampType,
+)
 
 from spine.config import RunConfig, RunnerConfig
 from spine.core import reading
-from spine.core.merge import MergeSpec, quote_identifier
-from spine.core.naming import qualified
+from spine.core.bind_checks import TableFacts
+from spine.core.delta import MarkerRow, MarkerRowWrite
+from spine.core.merge import MergeSpec, ordering_predicate, quote_identifier
+from spine.core.naming import COMMIT_COMPLETION_SENTINEL, qualified
 from spine.effects.records import MergeResult, TransientError
 
 if TYPE_CHECKING:
@@ -319,7 +331,16 @@ _TRANSIENT_JAVA_EXCEPTION_MARKERS: tuple[str, ...] = (
 _MERGE_CARDINALITY_VIOLATION_MARKER = "MERGE_CARDINALITY_VIOLATION"
 
 
-def _java_exception_class_name(exc: BaseException) -> str:
+def java_exception_class_name(exc: BaseException) -> str:
+    """The wrapped Java exception's own class name (I-11 [T-10]'s existing
+    safe identifier). Public (bead conveyer-swb.25, M1): `effects/rebuild.py`
+    used to duplicate this exact extraction locally (`_java_exception_class_
+    name`, byte-identical body) under this module's own "duplicate narrow,
+    versionless shapes rather than reach into another module's private
+    surface" precedent -- now a second real cross-module caller exists
+    (`attempt_state_swap`'s A007-9 refusal-class recording), so promoted to
+    public and imported directly instead, matching `is_transient_iceberg_
+    failure`'s own already-public precedent."""
     java_exception = getattr(exc, "java_exception", None)
     if java_exception is None:
         return ""
@@ -345,7 +366,7 @@ def is_transient_iceberg_failure(exc: BaseException) -> bool:
     `TransientError` vs. re-raising the original defect untouched. Exported
     (not private) so it is directly unit-testable against a constructed
     `Py4JJavaError` without a live Spark session."""
-    class_name = _java_exception_class_name(exc)
+    class_name = java_exception_class_name(exc)
     return any(marker in class_name for marker in _TRANSIENT_JAVA_EXCEPTION_MARKERS)
 
 
@@ -365,6 +386,26 @@ def is_merge_cardinality_violation(exc: BaseException) -> bool:
     return _MERGE_CARDINALITY_VIOLATION_MARKER in _java_exception_message(exc)
 
 
+def _transient_commit_message(action: str, qt: str, exc: BaseException) -> str:
+    """`TransientError` message composition for `append_marker_row`/`append`/
+    `merge`'s three caught-and-mapped commit failures (conveyer-6pg.35 item
+    1) -- the wrapped Java exception's CLASS NAME only (`java_exception_
+    class_name`, I-11 [T-10]'s existing safe identifier; non-empty by
+    construction at every call site, since each is only reached after
+    `is_transient_iceberg_failure(exc)` already matched one of the three
+    named FQCNs), never `str(exc)` (this module's own :319-326 rule): a
+    `Py4JJavaError`'s `str()` round-trips the JVM gateway for the FULL Java
+    stack trace, which would otherwise reach the ledger's `error_message`
+    column (its first line, truncated to 256 chars) plus CloudWatch. A
+    private helper (not exported like the two predicates above) -- directly
+    unit-testable without a live gateway the same way `test_spark_fx.py`
+    already tests other private module functions directly, while the three
+    call sites' own `except` branches stay `pragma: no cover` (module
+    docstring: a genuine local commit conflict needs a second live writer,
+    impractical from one local[2] JVM)."""
+    return f"{action} {qt} failed: {java_exception_class_name(exc)}"
+
+
 def _qualified_snapshots(spark: SparkSession, qt: str) -> DataFrame:
     return spark.read.format("iceberg").load(f"{qt}.snapshots")
 
@@ -373,9 +414,15 @@ def _qualified_refs(spark: SparkSession, qt: str) -> DataFrame:
     return spark.read.format("iceberg").load(f"{qt}.refs")
 
 
-def _current_snapshot_id(spark: SparkSession, qt: str) -> int | None:
+def current_snapshot_id(spark: SparkSession, qt: str) -> int | None:
     """The `main` branch head via `<table>.refs` (I-6) -- `None` for a
-    zero-snapshot table."""
+    zero-snapshot table. Public (bead conveyer-swb.25, M1): `effects/
+    rebuild.py` used to duplicate this exact rendering locally (`_current_
+    state_snapshot_id`, byte-identical body) under this module's own
+    "duplicate narrow, versionless shapes rather than reach into another
+    module's private surface" precedent -- now a second real cross-module
+    caller exists (rebuild's own `before_id`/fact-snapshot pins, §9.2),
+    so promoted to public and imported directly instead."""
     rows = (
         _qualified_refs(spark, qt)
         .where(F.col("name") == F.lit("main"))
@@ -458,21 +505,32 @@ def render_merge(spec: MergeSpec) -> str:
     Every identifier is already validated (`core.merge.merge_spec`/
     `_check_identifier`, §6.7 [S-10]) before it ever reaches `spec` -- this
     function only quotes (`core.merge.quote_identifier`) and assembles.
-    Ordering-struct comparison (`struct(s.col, ...) > struct(t.col, ...)`)
-    reproduces I-11's null-ranks-lowest, field-wise, strict-`>` semantics
-    natively in Spark SQL -- verified empirically (this bead) against
-    `frames.folds.ordering_struct_gt`'s independent pure-Python reference
-    over a battery of null/tie/lexicographic cases; native struct comparison
-    requires both sides' structs to share field names, which `struct(s.col)`/
-    `struct(t.col)` do (Spark derives the field name from the referenced
-    column's own simple name, not its table-alias qualifier).
+
+    **007.1 §8.2's rendering decision, normative (bead conveyer-6pg.22,
+    B10): the ordering comparison is `core.merge.ordering_predicate(spec)`
+    -- an explicit, generated field-wise boolean -- NEVER native
+    `struct(s.col, ...) > struct(t.col, ...)` comparison.** §8.2's own
+    words: native struct/tuple comparison's null ordering is "engine
+    implementation behavior, not documented contract" -- a Spark version
+    bump could silently flip fold winners with no change here to catch it,
+    the forbidden silent-wrong-state direction. K-14 (differentially
+    verified, this bead, over `conveyer-hpp.13.4`'s own 9219-case null-
+    bearing generator lineage): `ordering_predicate`'s rendering agrees with
+    `tests/integration/ordering_reference.py`'s plain-Python reference on
+    every case, 0 SQL-`NULL` results (the predicate is three-valued-total by
+    construction, `ordering_predicate`'s own docstring) -- confirmed on THIS
+    pinned engine, which is exactly the claim native struct comparison
+    cannot make for any future engine/version. (§8.2's own recorded finding:
+    native struct comparison ALSO agreed on this differential, on this one
+    pinned Spark version -- weakens, but does not overturn, the rejection;
+    the rejection's ground is the absence of a documented contract, not an
+    observed disagreement.)
     """
     target = qualified(spec.target_table)
     key_predicate = " AND ".join(
         f"t.{quote_identifier(c)} = s.{quote_identifier(c)}" for c in spec.key_cols
     )
-    src_struct = "struct(" + ", ".join(f"s.{quote_identifier(c)}" for c in spec.ordering_cols) + ")"
-    tgt_struct = "struct(" + ", ".join(f"t.{quote_identifier(c)}" for c in spec.ordering_cols) + ")"
+    condition = ordering_predicate(spec)
     update_set = ", ".join(
         f"t.{quote_identifier(c)} = s.{quote_identifier(c)}" for c in spec.update_cols
     )
@@ -483,7 +541,7 @@ def render_merge(spec: MergeSpec) -> str:
         f"MERGE INTO {target} t "
         f"USING {_MERGE_SRC_VIEW} s "
         f"ON {key_predicate} "
-        f"WHEN MATCHED AND {src_struct} > {tgt_struct} THEN UPDATE SET {update_set} "
+        f"WHEN MATCHED AND {condition} THEN UPDATE SET {update_set} "
         f"WHEN NOT MATCHED THEN INSERT ({insert_col_list}) VALUES ({insert_val_list})"
     )
 
@@ -796,13 +854,29 @@ def _build_read_objects_admission(
     return read_objects
 
 
+def pinned_read(spark: SparkSession, qt: str) -> tuple[DataFrame, int]:
+    """The current-snapshot-pinned read (I-6 [T-19]): resolves `qt`'s CURRENT
+    `main` branch snapshot first, THEN reads AT that pinned snapshot id --
+    `sid = -1` sentinel for a zero-snapshot table. Public (bead conveyer-
+    swb.25, M1): `effects/rebuild.py`'s own production `rebuild_state_table`
+    closure needs this IDENTICAL rendering for its own fact-table pin
+    (§9.5) -- previously duplicated locally there (`_pinned_read`, the
+    `_build_read_table` closure's own body, byte-identical) under this
+    module's "duplicate narrow, versionless shapes rather than reach into
+    another module's private surface" precedent; now that a second real
+    cross-module caller exists, promoted to public instead (M1's own
+    resolution: a helper reused by more than one module belongs public,
+    not duplicated). `_build_read_table`'s own `read_table` closure now
+    delegates to this function too, so there is exactly ONE rendering."""
+    sid = current_snapshot_id(spark, qt)
+    if sid is None:  # I-6 [T-19]: zero-snapshot table, explicit branch
+        return spark.table(qt), -1
+    return spark.read.option("snapshot-id", sid).table(qt), sid
+
+
 def _build_read_table(spark: SparkSession) -> Callable[[str], tuple[DataFrame, int]]:
     def read_table(table: str) -> tuple[DataFrame, int]:
-        qt = qualified(table)
-        sid = _current_snapshot_id(spark, qt)
-        if sid is None:  # I-6 [T-19]: zero-snapshot table, explicit branch
-            return spark.table(qt), -1
-        return spark.read.option("snapshot-id", sid).table(qt), sid
+        return pinned_read(spark, qualified(table))
 
     return read_table
 
@@ -828,6 +902,264 @@ def _build_table_has_batch(
         return not spark.table(qualified(table)).where(predicate).limit(1).isEmpty()
 
     return table_has_batch
+
+
+# --- 007.1 §4.3/§6.3 (F-9, B9b): the marker table's own read/write effects --
+
+# §6.3's DDL, restated only where this module needs the physical column
+# names/types to build predicates and construct write rows -- the ONE
+# normative DDL is `bootstrap/create_record_tables.py::MARKER_COLUMNS`
+# (versionless, framework-owned); this module does not import it (an
+# effects-module -> bootstrap-CLI-module dependency direction this codebase
+# does not otherwise take, `bootstrap/` being a deploy-time script, not a
+# runtime library) -- the shape is fixed and versionless by design (that
+# module's own docstring), so a second, narrow rendering here carries no
+# real drift risk, matching `_admission_raw_row_schema`'s own precedent of
+# building its fixed output schema locally rather than importing one.
+_MARKER_BATCH_ID_COL = "batch_id"
+_MARKER_FEED_ID_COL = "feed_id"
+_MARKER_STAGE_COL = "stage"
+_MARKER_TABLE_NAME_COL = "table_name"
+_MARKER_DELIVERY_KEY_COL = "delivery_key"
+_MARKER_DELIVERY_CONTENT_HASH_COL = "delivery_content_hash"
+_MARKER_RECEIVED_AT_COL = "received_at"
+_MARKER_COMMITTED_AT_COL = "committed_at"
+
+_MARKER_ROW_SCHEMA = StructType(
+    [
+        StructField(_MARKER_BATCH_ID_COL, StringType(), nullable=False),
+        StructField(_MARKER_FEED_ID_COL, StringType(), nullable=False),
+        StructField(_MARKER_STAGE_COL, StringType(), nullable=False),
+        StructField(_MARKER_TABLE_NAME_COL, StringType(), nullable=False),
+        StructField("snapshot_id", LongType(), nullable=True),  # NULL on every Phase-1 row, §6.3
+        StructField(_MARKER_DELIVERY_KEY_COL, StringType(), nullable=False),
+        StructField(_MARKER_DELIVERY_CONTENT_HASH_COL, StringType(), nullable=False),
+        StructField(_MARKER_RECEIVED_AT_COL, TimestampType(), nullable=False),
+        StructField(_MARKER_COMMITTED_AT_COL, TimestampType(), nullable=False),
+    ]
+)
+
+
+def _build_marker_row_present(
+    spark: SparkSession,
+) -> Callable[[str, str, str, str], bool]:
+    def marker_row_present(table: str, batch_id: str, stage: str, table_name: str) -> bool:
+        # I-3-style guard (reads DATA, never snapshot metadata): the marker
+        # table's own compound idempotency key, `(batch_id, stage,
+        # table_name)` (§6.3) -- `table_has_batch` cannot be reused as-is,
+        # see `RunnerFx.marker_row_present`'s own docstring.
+        # conveyer-swb.22 F-2: a MISSING marker table is the same stage
+        # failure `_require_marker_table` already raises for `read_marker_
+        # completions`/`read_marker_presence` -- this guard-then-read call
+        # is a decide-time read too (§4.3's decide-then-do order), so it
+        # gets the same `TransientError` contract, never a raw AnalysisException.
+        qt = _require_marker_table(spark, table)
+        predicate = (
+            (F.col(_MARKER_BATCH_ID_COL) == F.lit(batch_id))
+            & (F.col(_MARKER_STAGE_COL) == F.lit(stage))
+            & (F.col(_MARKER_TABLE_NAME_COL) == F.lit(table_name))
+        )
+        return not spark.table(qt).where(predicate).limit(1).isEmpty()
+
+    return marker_row_present
+
+
+def _build_append_marker_row(spark: SparkSession) -> Callable[[str, MarkerRowWrite], None]:
+    def append_marker_row(table: str, write: MarkerRowWrite) -> None:
+        # conveyer-swb.22 F-2: same missing-table guard as `marker_row_
+        # present` above -- a write against a never-bootstrapped marker
+        # table is a deploy defect (stage failure), not a raw
+        # AnalysisException from `writeTo`.
+        qt = _require_marker_table(spark, table)
+        row = Row(
+            **{
+                _MARKER_BATCH_ID_COL: write.batch_id,
+                _MARKER_FEED_ID_COL: write.feed_id,
+                _MARKER_STAGE_COL: write.stage,
+                _MARKER_TABLE_NAME_COL: write.table_name,
+                "snapshot_id": None,  # §6.3's own write-order-necessity resolution
+                _MARKER_DELIVERY_KEY_COL: write.delivery_key,
+                _MARKER_DELIVERY_CONTENT_HASH_COL: write.delivery_content_hash,
+                _MARKER_RECEIVED_AT_COL: write.received_at,
+                _MARKER_COMMITTED_AT_COL: write.committed_at,
+            }
+        )
+        to_write = spark.createDataFrame([row], _MARKER_ROW_SCHEMA)
+        try:
+            to_write.writeTo(qt).append()  # I-4: exactly one commit
+        except Exception as exc:  # noqa: BLE001 -- mapped below or re-raised untouched
+            if is_transient_iceberg_failure(exc):  # pragma: no cover -- see `append`'s identical
+                # note: a genuine local commit conflict needs a second live
+                # writer, impractical from one local[2] JVM.
+                # conveyer-6pg.35 item 1: `_transient_commit_message`, never
+                # `str(exc)` -- see that helper's own docstring.
+                raise TransientError(
+                    _transient_commit_message("append_marker_row to", qt, exc)
+                ) from exc
+            raise
+
+    return append_marker_row
+
+
+def _row_to_marker_row(row: Row) -> MarkerRow:
+    # [DC-3]-adjacent hazard, reconfirmed here (see `frames/facts.py`'s own
+    # module docstring / [[spine-quarantine-udf-and-timestamp-hazard]]):
+    # `.collect()`'s driver-side TimestampType -> Python-datetime marshaling
+    # uses the OS-local zone REGARDLESS of `spark.sql.session.timeZone` --
+    # verified empirically this bead. The naive value IS the correct
+    # instant, expressed in local wall-clock time with `tzinfo` stripped;
+    # `.astimezone(UTC)` on a NAIVE datetime treats it as system-local (the
+    # stdlib's own documented behavior) and recovers the aware UTC instant
+    # -- restoring `MarkerRow.received_at`'s own documented "aware" contract
+    # (§7.2's ordering comparisons, `resolve_predecessors`, would otherwise
+    # silently receive naive values that only happen to compare correctly
+    # among themselves, never mixable with a hand-built aware fixture).
+    return MarkerRow(
+        batch_id=row[_MARKER_BATCH_ID_COL],
+        delivery_key=row[_MARKER_DELIVERY_KEY_COL],
+        delivery_content_hash=row[_MARKER_DELIVERY_CONTENT_HASH_COL],
+        received_at=row[_MARKER_RECEIVED_AT_COL].astimezone(UTC),
+    )
+
+
+def _require_marker_table(spark: SparkSession, table: str) -> str:
+    """U-2 (007.1 §7.2 path 10, coordinator wave 1c): a commit-stage marker
+    read against a MISSING marker table is a STAGE FAILURE (retry), never a
+    silent degrade -- "there is deliberately no fifth reason code for
+    infrastructure" (§4's own resolution-and-probe paragraph). `read_marker_
+    completions`/`read_marker_presence` both require this; bootstrap absence
+    of this table is a deploy defect, not a "pipeline not bootstrapped yet"
+    signal at commit time.
+
+    This is commit's own twin of bind's PRE-LAND `marker-table-missing` row
+    (critique gate wf_78ea4599-a5b F3, bead conveyer-swb.26: `core/bind_
+    checks.py::validate_bindings`, wired through `entrypoints/glue_main.py::
+    _assert_bind_checks_pass`) -- bind now raises a hard `ValueError` for the
+    identical absence BEFORE commit ever runs, so this `TransientError` is
+    reachable only for a table dropped between bind and commit (a real, if
+    narrow, race), never for a still-unbootstrapped pipeline (that case fails
+    at bind, before `run_sequence` is ever called). `read_marker_target`'s
+    own tolerant `return ()` below stays deliberately UNCHANGED (unreachable
+    in Phase 1, no caller supplies a target batch_id yet)."""
+    qt = qualified(table)
+    if not spark.catalog.tableExists(qt):
+        raise TransientError(
+            f"marker table {qt} does not exist -- a commit-stage marker read "
+            f"is a stage failure (007.1 §7.2 path 10), never a silent degrade; "
+            f"bootstrap absence of this table is a deploy defect"
+        )
+    return qt
+
+
+def _build_read_marker_completions(
+    spark: SparkSession,
+) -> Callable[[str, str], tuple[MarkerRow, ...]]:
+    def read_marker_completions(table: str, feed_id: str) -> tuple[MarkerRow, ...]:
+        # §7.2 read 1's own input -- every commit-completion row (the
+        # sentinel `table_name`) for this feed, ANY batch_id: a feed-wide
+        # scan, not batch-keyed (§6.3's "one priced read" economics,
+        # extended to this read too, [AE2-9] -- no shared snapshot pin
+        # needed, every split-read interleaving degenerates to either the
+        # named completion-after-resolution residual or an over-refusal).
+        qt = _require_marker_table(spark, table)
+        predicate = (F.col(_MARKER_FEED_ID_COL) == F.lit(feed_id)) & (
+            F.col(_MARKER_TABLE_NAME_COL) == F.lit(COMMIT_COMPLETION_SENTINEL)
+        )
+        rows = spark.table(qt).where(predicate).collect()
+        return tuple(_row_to_marker_row(r) for r in rows)
+
+    return read_marker_completions
+
+
+def _build_read_marker_presence(
+    spark: SparkSession,
+) -> Callable[[str, str], tuple[MarkerRow, ...]]:
+    def read_marker_presence(table: str, feed_id: str) -> tuple[MarkerRow, ...]:
+        # §7.2 read 1's coherence clause AND read 2's field-absent key-match
+        # scan both consume this -- every guard-twin row (table_name != the
+        # sentinel) for this feed, ANY batch_id.
+        qt = _require_marker_table(spark, table)
+        predicate = (F.col(_MARKER_FEED_ID_COL) == F.lit(feed_id)) & (
+            F.col(_MARKER_TABLE_NAME_COL) != F.lit(COMMIT_COMPLETION_SENTINEL)
+        )
+        rows = spark.table(qt).where(predicate).collect()
+        return tuple(_row_to_marker_row(r) for r in rows)
+
+    return read_marker_presence
+
+
+def _build_read_marker_target(
+    spark: SparkSession,
+) -> Callable[[str, str], tuple[MarkerRow, ...]]:
+    def read_marker_target(table: str, target_batch_id: str) -> tuple[MarkerRow, ...]:
+        # §7.2 read 2's named-target read: every row (any table_name, both
+        # row kinds) for ONE batch_id -- single-partition under §6.4's
+        # identity(batch_id), metadata-only-miss economics. Unreachable in
+        # Phase 1 (the `conveyer-kof` named wait, §16: no seed carries
+        # `supersedes_batch_id` yet) -- implemented now so F-5 needs no
+        # edit once it lands (§7.2: "design against the pinned interface").
+        if not spark.catalog.tableExists(qualified(table)):  # pragma: no cover -- unreachable, see
+            # module docstring's Phase-1 note: no caller supplies a target
+            # batch_id today.
+            return ()
+        rows = (
+            spark.table(qualified(table))
+            .where(F.col(_MARKER_BATCH_ID_COL) == F.lit(target_batch_id))
+            .collect()
+        )
+        return tuple(_row_to_marker_row(r) for r in rows)
+
+    return read_marker_target
+
+
+def _render_show_tblproperties_sql(qualified_table: str) -> str:
+    """Plain-value rendering, kept in its OWN function -- the `render_merge`
+    idiom (§7.6's implementation notes): the linter's string-SQL sink rule
+    (`idiom-string-sql:sql`, `tools/linter_configs/spine.py`) only flags an
+    f-string/`.format()`/`%`-built argument AT the sink call site itself;
+    `describe_table` below passes this function's plain RETURN VALUE into
+    `spark.sql(...)`, matching `build_merge`'s own `sql_text = render_merge
+    (spec)` -> `spark.sql(sql_text)` shape rather than inlining the f-string
+    at the call site."""
+    return f"SHOW TBLPROPERTIES {qualified_table}"
+
+
+def _build_describe_table(spark: SparkSession) -> Callable[[str], TableFacts | None]:
+    """P-4's additive effect (006.1 §16.4 item 3, 004.1-erratum class):
+    `(table) -> TableFacts | None` -- `None` iff the table does not exist
+    (C3's own existence signal); otherwise the live `conveyer.table-class`
+    property (F-10/[DS-2]: provenance, never protection -- the bind-time
+    AUTHORITY is `core/bind_checks.py`'s separately-acquired
+    `table_class_inventory`, not this value alone) and the catalog's own
+    column-name -> type map (C5's own comparison ground).
+
+    **[DS-6] least-privilege pin, normative:** this function needs NO new
+    IAM objects -- `SHOW TBLPROPERTIES`/`spark.table(...).schema` are
+    `Get*`-class catalog reads, already covered by I-21's existing
+    per-table grants (own `<slug>__*` tables; declared co-effects via the
+    S-15-generated read-only grants, 006.1 P-4/§16.4 item 3). A bind-time
+    `AccessDenied` on a declared co-effect is the S-15 provisioning signal
+    (grant generation has not run for that spec yet) -- never cause to
+    widen catalog read; this function does not, and must never, request a
+    database-wide `Get*` grant to work around one.
+
+    `SHOW TBLPROPERTIES` is (deliberately, like `render_merge`) string SQL:
+    Iceberg exposes no plan-native/metadata-table read for table
+    properties (unlike snapshot resolution's `<table>.refs`/`<table>.
+    snapshots`, [S-6]) -- `effects/spark.py` already has one precedented
+    string-SQL escape hatch (`render_merge`'s rendered `MERGE INTO`); this
+    is the second, same class, same file."""
+
+    def describe_table(table: str) -> TableFacts | None:
+        qt = qualified(table)
+        if not spark.catalog.tableExists(qt):
+            return None
+        sql_text = _render_show_tblproperties_sql(qt)
+        properties = {row["key"]: row["value"] for row in spark.sql(sql_text).collect()}
+        columns = {f.name: f.dataType.simpleString() for f in spark.table(qt).schema.fields}
+        return TableFacts(table_class=properties.get("conveyer.table-class"), columns=columns)
+
+    return describe_table
 
 
 def _build_resolve_batch_snapshot(
@@ -863,6 +1195,29 @@ def _build_append(
             to_write.writeTo(qt)
             .tableProperty("write.target-file-size-bytes", target_file_size_bytes)
             .option(f"snapshot-property.{_BATCH_ID_PROPERTY}", batch_id)
+            # B9b, empirically verified (this bead): Iceberg's write-time
+            # schema-compatibility check reads the CATALYST-ANALYZED
+            # nullability of `to_write`'s columns, which can diverge from
+            # the pre-analysis `.schema` a caller inspected earlier --
+            # `stages/commit.py`'s own UDF-derived (`frames/facts.py`) and
+            # join-derived (`frames/delta.py`) columns are a real,
+            # reproduced case: `content_hash`/`record_key` (a Python UDF's
+            # output; Spark cannot prove a UDF never returns NULL) and the
+            # framework lineage stamps (widened NOT-NULL-losing through
+            # `delta_filter`'s own joins) both land here NULLABLE at
+            # Iceberg's own analysis point even though every actual VALUE
+            # is non-null and the DDL declares them NOT NULL. `check-
+            # nullability=false` (a real Iceberg Spark write option,
+            # `SparkWriteOptions`) disables only this STRUCTURAL schema
+            # check -- it does not relax any PER-ROW value constraint,
+            # and Iceberg itself does not enforce NOT NULL on row values at
+            # write time in the first place (the DDL's non-null is a
+            # declared invariant the framework itself upholds, e.g. F-1/F-2
+            # deriving `content_hash`/`record_key` unconditionally, I-24's
+            # `domain_id` backstop) -- applied to every append (not just
+            # commit's own), since it can only ever relax a check no
+            # existing writer needed passing, never mask a genuine defect.
+            .option("check-nullability", "false")
         )
         if stage_key is not None:
             writer = writer.option(f"snapshot-property.{_STAGE_PROPERTY}", stage_key)
@@ -873,7 +1228,9 @@ def _build_append(
                 # a genuine local commit conflict needs a second live writer,
                 # impractical from one local[2] JVM; covered at the predicate
                 # level (`test_is_transient_iceberg_failure_*`) instead.
-                raise TransientError(f"append to {qt} failed: {exc}") from exc
+                # conveyer-6pg.35 item 1: `_transient_commit_message`, never
+                # `str(exc)` -- see that helper's own docstring.
+                raise TransientError(_transient_commit_message("append to", qt, exc)) from exc
             raise
         found = _find_stamped_snapshot(spark, qt, batch_id, stage_key)
         if found is None:  # pragma: no cover -- defensive: should be unreachable
@@ -889,10 +1246,19 @@ def _build_append(
     return append
 
 
-def _build_merge(spark: SparkSession) -> Callable[[MergeSpec, DataFrame], MergeResult]:
+def build_merge(spark: SparkSession) -> Callable[[MergeSpec, DataFrame], MergeResult]:
+    """Builds the ONE rendered-`MERGE INTO` closure (§6.7/§8.2's normative
+    plan) -- production `RunnerFx.merge`'s own construction. Public (bead
+    conveyer-swb.25, M4): `effects/rebuild.py`'s own production genesis-seed
+    path (a never-folded state table's FIRST real snapshot, pushed through
+    an EMPTY source frame) reuses this EXACT closure rather than rendering a
+    second `MERGE INTO` call site of its own -- the 007.1 writer-set
+    accounting (2 appends + 1 rendered MERGE + 1 blessed overwrite + ledger
+    append) stays exactly one rendered-MERGE site."""
+
     def merge(spec: MergeSpec, source_df: DataFrame) -> MergeResult:
         qt = qualified(spec.target_table)
-        before_id = _current_snapshot_id(spark, qt)
+        before_id = current_snapshot_id(spark, qt)
         source_df.createOrReplaceTempView(_MERGE_SRC_VIEW)
         sql_text = render_merge(spec)
         _merge_race_probe(spark, qt, _MERGE_PRE_COMMIT)
@@ -902,24 +1268,39 @@ def _build_merge(spark: SparkSession) -> Callable[[MergeSpec, DataFrame], MergeR
         # `before_id` (Spark's MERGE reads live table state, never a value
         # pinned at `before_id`-capture time), so "the unique child of
         # `before_id`" found below would be the SIBLING's commit, not ours.
-        base_shifted = _current_snapshot_id(spark, qt) != before_id
+        base_shifted = current_snapshot_id(spark, qt) != before_id
         try:
             spark.sql(sql_text)
         except Exception as exc:  # noqa: BLE001 -- mapped below or re-raised untouched
             if is_merge_cardinality_violation(exc):
-                # I-11 [T-12]: a deterministic, non-conforming custom fold --
-                # a NAMED defect, never TransientError (retrying via SFN
-                # would not help; the same duplicate rows would violate the
-                # cardinality precondition again).
+                # I-11 [T-12]/§8.2: a deterministic defect, never
+                # TransientError (retrying via SFN would not help; the same
+                # target-side duplicate rows would violate the cardinality
+                # precondition again). B10 (bead conveyer-6pg.22): the
+                # source is unique per `spec.key_cols` BY CONSTRUCTION post-
+                # `frames.fold.reduce_batch_winners` (row_number() keeps
+                # exactly one row per key) -- a cardinality violation here
+                # can therefore only mean the TARGET (this state table) has
+                # already broken its own one-row-per-domain grain (§6.2:
+                # "Grain: one row per domain_id"), never a non-conforming
+                # source. The message indicts the target, per state table,
+                # matching §8.2's own diagnosis: "the reduce sharpens the
+                # diagnosis... a runtime cardinality violation can only
+                # indict the target -- the state table already violates its
+                # one-row-per-domain grain."
                 raise ValueError(
-                    f"fold cardinality defect: fold must emit at most one row per "
-                    f"domain_id (merge into {qt} raised Spark's own "
-                    f"MERGE_CARDINALITY_VIOLATION, I-11 [T-12]) -- the custom fold "
-                    f"bound to this pipeline emitted more than one row for the same "
-                    f"key in a single batch"
+                    f"fold cardinality defect: state table {qt!r} already violates "
+                    f"its one-row-per-domain_id grain (MERGE raised Spark's own "
+                    f"MERGE_CARDINALITY_VIOLATION, I-11 [T-12]) -- the fold source is "
+                    f"unique per key by construction (frames.fold.reduce_batch_"
+                    f"winners), so this indicts the TARGET's grain, never the "
+                    f"reduce; remediate by diagnosing the writer that broke it, then "
+                    f"rebuild this table (007.1 §9), never DML"
                 ) from exc
             if is_transient_iceberg_failure(exc):  # pragma: no cover -- see append's identical note
-                raise TransientError(f"merge into {qt} failed: {exc}") from exc
+                # conveyer-6pg.35 item 1: `_transient_commit_message`, never
+                # `str(exc)` -- see that helper's own docstring.
+                raise TransientError(_transient_commit_message("merge into", qt, exc)) from exc
             raise
         _merge_race_probe(spark, qt, _MERGE_POST_COMMIT)
         if base_shifted:
@@ -966,24 +1347,32 @@ def _build_merge(spark: SparkSession) -> Callable[[MergeSpec, DataFrame], MergeR
 
 @dataclass(frozen=True)
 class SparkFx:
-    """The seven Spark-side `RunnerFx` callables (§7.6), assembled together
-    since they all close over the same `SparkSession` (+ `RunConfig` for
-    `append`). `effects/build.py::make_runner_fx` splices these fields
-    directly into the production `RunnerFx`."""
+    """The Spark-side `RunnerFx` callables (§7.6, `describe_table` additive
+    per P-4/006.1 §16.4 item 3; the five marker read/write callables
+    additive per 007.1 §4.3/§6.3, B9b), assembled together since they all
+    close over the same `SparkSession` (+ `RunConfig` for `append`).
+    `effects/build.py::make_runner_fx` splices these fields directly into
+    the production `RunnerFx`."""
 
     read_objects: Callable[[tuple[str, ...], ReadSpecModel, RawContractModel], DataFrame]
     read_table: Callable[[str], tuple[DataFrame, int]]
     read_batch: Callable[[str, str], DataFrame]
     table_has_batch: Callable[[str, str, str | None], bool]
+    describe_table: Callable[[str], TableFacts | None]
     append: Callable[[str, DataFrame, str, str | None], tuple[int, dict[str, str]]]
     merge: Callable[[MergeSpec, DataFrame], MergeResult]
     resolve_batch_snapshot: Callable[[str, str, str | None], int | None]
+    marker_row_present: Callable[[str, str, str, str], bool]
+    append_marker_row: Callable[[str, MarkerRowWrite], None]
+    read_marker_completions: Callable[[str, str], tuple[MarkerRow, ...]]
+    read_marker_presence: Callable[[str, str], tuple[MarkerRow, ...]]
+    read_marker_target: Callable[[str, str], tuple[MarkerRow, ...]]
 
 
 def build_spark_fx(spark: SparkSession, config: RunnerConfig) -> SparkFx:
-    """Assembles all seven Spark-side closures over one `SparkSession` and
-    the `RunConfig` parsed once from `config.run_config_json` (framework-
-    owned tuning surface, §6.4) -- the identical call production (`effects/
+    """Assembles every Spark-side closure over one `SparkSession` and the
+    `RunConfig` parsed once from `config.run_config_json` (framework-owned
+    tuning surface, §6.4) -- the identical call production (`effects/
     build.py::make_runner_fx`) and tests (`tests/conftest.py::local_runner_
     fx`, via that same production call) both make; no test-only fork."""
     run_config = RunConfig.model_validate_json(config.run_config_json)
@@ -992,7 +1381,13 @@ def build_spark_fx(spark: SparkSession, config: RunnerConfig) -> SparkFx:
         read_table=_build_read_table(spark),
         read_batch=_build_read_batch(spark),
         table_has_batch=_build_table_has_batch(spark),
+        describe_table=_build_describe_table(spark),
         append=_build_append(spark, run_config),
-        merge=_build_merge(spark),
+        merge=build_merge(spark),
         resolve_batch_snapshot=_build_resolve_batch_snapshot(spark),
+        marker_row_present=_build_marker_row_present(spark),
+        append_marker_row=_build_append_marker_row(spark),
+        read_marker_completions=_build_read_marker_completions(spark),
+        read_marker_presence=_build_read_marker_presence(spark),
+        read_marker_target=_build_read_marker_target(spark),
     )

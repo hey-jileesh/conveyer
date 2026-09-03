@@ -12,6 +12,23 @@ before calling `canonical_json`/`row_hash`; this parser is test-local (not
 imported from `spine.core.canonical` itself) -- 007's own fact-hash suite
 reads the same committed files and writes its OWN copy of this same small
 parser, per A-6's "shared vectors, never shared code" (004 D-13's idiom).
+See `contracts/fixtures/README.md` for the full fixture-review checklist
+(synthetic-only [DS-5], resident-serializer regeneration, the untagging-
+parser rule above, NFC/NFD authoring discipline) shared by every committed
+vector family in that directory.
+
+**006.1 §16.3 item 2's post-structure addendum (bead conveyer-6pg.14, B4):**
+`post-check-snapshot.json`'s one committed vector predates the
+`_conveyer_fact_type` reserved key (P-7(b)) 006.1 §7.1 adds to the
+post_check quarantine snapshot -- ruled **keep-as-is** (this suite's own
+blanket reproduction test below still reproduces it byte-exact via a bare
+`canonical_json`/`row_hash` call, which was always its whole claim; it was
+never itself an example of "the shaper's output shape"). The new,
+tag-bearing member of this family is `post-check-snapshot-tagged.json`,
+whose vectors DO byte-reproduce through the real `frames/quarantine.py::
+shape_post_quarantine` shaper directly -- see `tests/frames/test_
+quarantine.py::test_shape_post_quarantine_reproduces_a_tagged_post_
+structure_vector_byte_exact`.
 
 **Injectivity property scope**: `canonical_json` is injective over the
 value domain §7.1 documents, but that domain deliberately does NOT

@@ -1,0 +1,57 @@
+[
+  {
+    "check": {
+      "kind": "row",
+      "id": "positive-amount-tv",
+      "fact_type": "vec",
+      "expr": "amount > 0",
+      "reason": "business/negative-amount"
+    },
+    "input": {
+      "row": {
+        "domain_id": "d-tv-1",
+        "amount": {
+          "$decimal": null
+        }
+      }
+    },
+    "verdict": "pass"
+  },
+  {
+    "check": {
+      "kind": "row",
+      "id": "sum-positive-tv",
+      "fact_type": "vec",
+      "expr": "(a + b) > 0",
+      "reason": "business/negative-sum"
+    },
+    "input": {
+      "row": {
+        "domain_id": "d-tv-2",
+        "a": {
+          "$decimal": "5.00"
+        },
+        "b": {
+          "$decimal": null
+        }
+      }
+    },
+    "verdict": "pass"
+  },
+  {
+    "check": {
+      "kind": "row",
+      "id": "known-status-tv",
+      "fact_type": "vec",
+      "expr": "status = 'open'",
+      "reason": "business/bad-status"
+    },
+    "input": {
+      "row": {
+        "domain_id": "d-tv-3",
+        "status": null
+      }
+    },
+    "verdict": "pass"
+  }
+]

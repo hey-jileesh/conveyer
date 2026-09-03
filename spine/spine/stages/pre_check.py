@@ -2,8 +2,17 @@
 
 Three paths, decided by two guard-read probes (I-3: data, never snapshot
 metadata) — the quarantine guard `(batch_id, "pre_check")` and the
-fact-table presence probe `table_has_batch(fact_table, batch_id, None)`
-([DC-1]):
+fact-presence probe ([DC-1]):
+
+**006.1 §8.2's ANY-door delta (bead conveyer-6pg.13, B3).** [DC-1]'s
+`f_present` probe is no longer a single `table_has_batch(spec.fact_table,
+...)` call (that singular field is gone, P-1) — it is now the SAME
+ANY-declared-fact-table composition `core/doors.py::any_fact_present`
+gives `stages/post_check.py`'s own doors (§8.2's own text: "pre_check's
+[DC-1] door migrates identically"): one `table_has_batch` probe per
+declared fact type (P-1's `fact_types` enumeration), ORed together. Nothing
+else in this file's own door logic changes — the two-probe DECISION shape,
+and everything each door does once decided, are unchanged.
 
 - **Door 1 — quarantine guard present** (§6.5's A-9 subtraction path, a
   rerun after a prior attempt found violations and wrote them): durable
@@ -63,6 +72,7 @@ from typing import TYPE_CHECKING
 
 from pyspark.sql import functions as F
 
+from spine.core import doors
 from spine.core.model import LineageStamp
 from spine.frames import checks, quarantine
 
@@ -150,7 +160,14 @@ def run(ctx: BatchContext, fx: RunnerFx) -> BatchContext:
     compiled = checks.compile_contract(ctx.spec.raw_contract)
     quarantine_table = ctx.spec.quarantine_table
     q_present = fx.table_has_batch(quarantine_table, ctx.batch_id, _STAGE_KEY)
-    f_present = fx.table_has_batch(ctx.spec.fact_table, ctx.batch_id, None)  # [DC-1]
+    # 006.1 §8.2's ANY-door delta: one probe per declared fact type, ORed
+    # (module docstring) -- replaces the pre-006.1 singular `spec.fact_table`
+    # probe.
+    fact_presence = {
+        fact_type: fx.table_has_batch(fact_type_decl.fact_table, ctx.batch_id, None)
+        for fact_type, fact_type_decl in ctx.spec.fact_types.items()
+    }
+    f_present = doors.any_fact_present(fact_presence)  # [DC-1]
     pre_quarantined_count = 0  # [DC-13][R2-5a]: explicit before any branch
 
     if q_present:  # Door 1: A-9 read-back subtraction (§6.5)

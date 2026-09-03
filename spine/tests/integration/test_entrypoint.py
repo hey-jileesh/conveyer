@@ -12,10 +12,13 @@ against the identity exemplar fixtures, over the shared session-scoped
 Two of `main()`'s own DI seams are exercised deliberately (see `glue_main`'s
 module docstring for the full rationale):
 
-* `fetch_spec` — a lambda returning this test's own in-memory spec YAML
-  (per-test `unique_table` names), so no real S3 round-trip is needed; the
-  URI itself is still a genuine `s3://.../spine/specs/pipelines--identity/`
-  string and still passes `check_spec_uri_allowlist` for real.
+* `fetch_spec` — `_make_fetch_spec`'s in-memory dispatcher, serving BOTH
+  artifacts real `main()` fetches through this one seam (per-test `unique_
+  table` names, no real S3 round-trip needed): the spec YAML itself, and
+  (F-10) the sibling `table-classes.json` `naming.table_class_inventory_uri`
+  derives from the same spec URI. The URI itself is still a genuine
+  `s3://.../spine/specs/<slug>/` string and still passes `check_spec_uri_
+  allowlist` for real.
 * `fx_factory` — the REAL `make_runner_fx(spark, config)` production
   assembly, with ONLY `read_objects` wrapped to translate the (real,
   allowlisted) `s3://` object URIs to the real local exemplar fixture files
@@ -51,6 +54,10 @@ from scenario_helpers import create_fact_table as _create_fact_table
 from scenario_helpers import create_quarantine_table as _create_quarantine_table
 from scenario_helpers import create_raw_table as _create_raw_table
 from scenario_helpers import create_state_table as _create_state_table
+from scenario_helpers import facts_appended_total as _facts_appended_total
+from scenario_helpers import unique_pipeline as _unique_pipeline
+from spine.bootstrap.create_record_tables import bootstrap_markers_table
+from spine.core import naming
 from spine.effects.build import make_runner_fx
 from spine.entrypoints import glue_main
 
@@ -64,11 +71,21 @@ if TYPE_CHECKING:
 _LANDING_BUCKET = "conveyer-test-landing"
 _FEED_ID = "feed/identity"
 _RECEIVED_AT = datetime(2026, 1, 1, tzinfo=UTC)
-_PIPELINE = "pipelines/identity"
 
 
 def _delivery_id(n: int) -> str:
     return str(uuid.UUID(int=n, version=4))
+
+
+def _create_markers_table(spark: SparkSession, raw_table: str, pipeline: str) -> None:
+    """B10 (bead conveyer-6pg.22): every scenario driving the real entrypoint
+    all the way through `commit` needs a real markers table -- `glue_main.
+    main`'s own bind-time `_committed_tables` read tolerates an absent table
+    ([DC-1]'s own docstring), but `stages/commit.py`'s later marker WRITES do
+    not. Mirrors `scenario_helpers.create_markers_table_for`, built from the
+    raw YAML-dict `pipeline`/`raw_table` values this file authors directly
+    (no `PipelineSpecModel` object exists yet at this point in these tests)."""
+    bootstrap_markers_table(spark, naming.qualified(naming.markers_table(raw_table, pipeline)))
 
 
 def _canonical_object_uri(delivery_id: str, name: str) -> str:
@@ -98,6 +115,7 @@ def _argv(
         "--conveyer-run-ledger-table", ledger_catalog.config.run_ledger_table,
         "--conveyer-event-bus", event_bus,
         "--conveyer-landing-bucket", _LANDING_BUCKET,
+        "--conveyer-artifacts-bucket", "some-artifacts-bucket",
         "--conveyer-pipeline-spec-uri", pipeline_spec_uri,
         "--conveyer-delivery", delivery_json,
         "--conveyer-sfn-retry-count", "0",
@@ -131,6 +149,43 @@ def _make_fx_factory(
     return fx_factory
 
 
+def _make_fetch_spec(
+    *,
+    spec_uri: str,
+    spec_text: str,
+    raw_table: str,
+    quarantine_table: str,
+    fact_table: str,
+    state_table: str,
+    markers_table: str,
+) -> Callable[[str], str]:
+    """Real `main()` fetches TWO artifacts through this one DI seam: the
+    spec itself, and (F-10, `_load_table_class_inventory`) the sibling
+    `table-classes.json` `naming.table_class_inventory_uri` derives from
+    the SAME spec URI `check_spec_uri_allowlist` already validated -- both
+    served from one in-memory lambda, dispatched by URI, mirroring what
+    `bootstrap/create_record_tables.py::main` actually emits beside a real
+    deployed spec (raw/quarantine/facts/state/marker, F-10's own class
+    enumeration)."""
+    inventory_uri = naming.table_class_inventory_uri(spec_uri)
+    inventory = json.dumps(
+        {
+            raw_table: "raw",
+            quarantine_table: "quarantine",
+            fact_table: "facts",
+            state_table: "state",
+            markers_table: "marker",
+        }
+    )
+
+    def fetch_spec(uri: str) -> str:
+        if uri == inventory_uri:
+            return inventory
+        return spec_text
+
+    return fetch_spec
+
+
 def test_main_end_to_end_identity_clean_batch_matches_goldens_and_emits_both_events(
     spark: SparkSession,
     unique_table: Callable[[str], str],
@@ -145,15 +200,30 @@ def test_main_end_to_end_identity_clean_batch_matches_goldens_and_emits_both_eve
     _create_quarantine_table(spark, qtn_qt)
     _create_fact_table(spark, fact_qt)
     _create_state_table(spark, state_qt)
+    pipeline = _unique_pipeline("ep1")
+    _create_markers_table(spark, _bare(raw_qt), pipeline)
 
     spec_text = yaml.safe_dump(
         {
-            "pipeline": _PIPELINE,
+            "pipeline": pipeline,
             "transforms_module": "pipelines.identity.transforms",
             "raw_table": _bare(raw_qt),
             "quarantine_table": _bare(qtn_qt),
-            "fact_table": _bare(fact_qt),
-            "state_table": _bare(state_qt),
+            "fact_types": {
+                "identity": {
+                    "fact_table": _bare(fact_qt),
+                    "state_table": _bare(state_qt),
+                    "schema": {
+                        "columns": [
+                            {"name": "domain_id", "type": "string"},
+                            {"name": "event_time", "type": "string"},
+                            {"name": "payload", "type": "string"},
+                        ],
+                        "domain_id_col": "domain_id",
+                        "record_key": ["domain_id"],
+                    },
+                }
+            },
             "read": {"dialect": {"format": "csv", "header": True}},
             "raw_contract": {
                 "columns": [
@@ -167,7 +237,7 @@ def test_main_end_to_end_identity_clean_batch_matches_goldens_and_emits_both_eve
             "sla_minutes": 480,
         }
     )
-    spec_uri = "s3://some-artifacts-bucket/spine/specs/pipelines--identity/pipeline.yaml"
+    spec_uri = f"s3://some-artifacts-bucket/spine/specs/{naming.slug(pipeline)}/pipeline.yaml"
 
     batch_id = _batch_id(9001)
     delivery_id = _delivery_id(9001)
@@ -184,7 +254,7 @@ def test_main_end_to_end_identity_clean_batch_matches_goldens_and_emits_both_eve
             _canonical_object_uri(delivery_id, "object_2.csv"),
         ],
         "received_at": _RECEIVED_AT.isoformat(),
-        "pipeline": _PIPELINE,
+        "pipeline": pipeline,
     }
 
     argv = _argv(
@@ -193,17 +263,26 @@ def test_main_end_to_end_identity_clean_batch_matches_goldens_and_emits_both_eve
         delivery_json=json.dumps(delivery),
         pipeline_spec_uri=spec_uri,
     )
+    fetch_spec = _make_fetch_spec(
+        spec_uri=spec_uri,
+        spec_text=spec_text,
+        raw_table=_bare(raw_qt),
+        quarantine_table=_bare(qtn_qt),
+        fact_table=_bare(fact_qt),
+        state_table=_bare(state_qt),
+        markers_table=naming.markers_table(_bare(raw_qt), pipeline),
+    )
 
     result = glue_main.main(
         argv,
-        fetch_spec=lambda uri: spec_text,
+        fetch_spec=fetch_spec,
         fx_factory=_make_fx_factory("clean"),
     )
 
     assert result.raw_count == 3
     assert result.pre_quarantined_count == 0
     assert result.post_quarantined_count == 0
-    assert result.facts_appended == 3
+    assert _facts_appended_total(result) == 3
     assert result.guard_skips == ()
     assert result.published is True
     assert result.attempt_id == "jr_entrypoint_test"  # I-5, --JOB_RUN_ID fallback
@@ -242,6 +321,10 @@ def test_main_raises_before_land_on_forged_object_uris_no_raw_rows_no_events(
     forged_uri = _canonical_object_uri(delivery_id, "object_1.csv").replace(
         _FEED_ID, "feed/some-other-feed"
     )
+    # I-22 fails before spec fetch (`_never_fetch` asserts it's never
+    # called), so `pipeline`/`spec_uri`'s exact content is never
+    # dereferenced -- any grammar-legal pipeline string suffices.
+    pipeline = _unique_pipeline("ep2")
     delivery = {
         "schema_version": 1,
         "feed_id": _FEED_ID,
@@ -252,9 +335,9 @@ def test_main_raises_before_land_on_forged_object_uris_no_raw_rows_no_events(
         "size_bytes": 10,
         "object_uris": [forged_uri],
         "received_at": _RECEIVED_AT.isoformat(),
-        "pipeline": _PIPELINE,
+        "pipeline": pipeline,
     }
-    spec_uri = "s3://some-artifacts-bucket/spine/specs/pipelines--identity/pipeline.yaml"
+    spec_uri = f"s3://some-artifacts-bucket/spine/specs/{naming.slug(pipeline)}/pipeline.yaml"
     argv = _argv(
         ledger_catalog=ledger_catalog,
         event_bus=moto_events_bus.bus_name,
@@ -315,15 +398,30 @@ def test_main_installs_json_log_handler_exactly_once_across_two_invocations(
     _create_quarantine_table(spark, qtn_qt)
     _create_fact_table(spark, fact_qt)
     _create_state_table(spark, state_qt)
+    pipeline = _unique_pipeline("ep3")
+    _create_markers_table(spark, _bare(raw_qt), pipeline)
 
     spec_text = yaml.safe_dump(
         {
-            "pipeline": _PIPELINE,
+            "pipeline": pipeline,
             "transforms_module": "pipelines.identity.transforms",
             "raw_table": _bare(raw_qt),
             "quarantine_table": _bare(qtn_qt),
-            "fact_table": _bare(fact_qt),
-            "state_table": _bare(state_qt),
+            "fact_types": {
+                "identity": {
+                    "fact_table": _bare(fact_qt),
+                    "state_table": _bare(state_qt),
+                    "schema": {
+                        "columns": [
+                            {"name": "domain_id", "type": "string"},
+                            {"name": "event_time", "type": "string"},
+                            {"name": "payload", "type": "string"},
+                        ],
+                        "domain_id_col": "domain_id",
+                        "record_key": ["domain_id"],
+                    },
+                }
+            },
             "read": {"dialect": {"format": "csv", "header": True}},
             "raw_contract": {
                 "columns": [
@@ -337,7 +435,7 @@ def test_main_installs_json_log_handler_exactly_once_across_two_invocations(
             "sla_minutes": 480,
         }
     )
-    spec_uri = "s3://some-artifacts-bucket/spine/specs/pipelines--identity/pipeline.yaml"
+    spec_uri = f"s3://some-artifacts-bucket/spine/specs/{naming.slug(pipeline)}/pipeline.yaml"
 
     batch_id = _batch_id(9003)
     delivery_id = _delivery_id(9003)
@@ -351,7 +449,7 @@ def test_main_installs_json_log_handler_exactly_once_across_two_invocations(
         "size_bytes": 10,
         "object_uris": [_canonical_object_uri(delivery_id, "object_1.csv")],
         "received_at": _RECEIVED_AT.isoformat(),
-        "pipeline": _PIPELINE,
+        "pipeline": pipeline,
     }
     argv = _argv(
         ledger_catalog=ledger_catalog,
@@ -360,9 +458,19 @@ def test_main_installs_json_log_handler_exactly_once_across_two_invocations(
         pipeline_spec_uri=spec_uri,
     )
 
-    glue_main.main(argv, fetch_spec=lambda uri: spec_text, fx_factory=_make_fx_factory("clean"))
+    fetch_spec = _make_fetch_spec(
+        spec_uri=spec_uri,
+        spec_text=spec_text,
+        raw_table=_bare(raw_qt),
+        quarantine_table=_bare(qtn_qt),
+        fact_table=_bare(fact_qt),
+        state_table=_bare(state_qt),
+        markers_table=naming.markers_table(_bare(raw_qt), pipeline),
+    )
+
+    glue_main.main(argv, fetch_spec=fetch_spec, fx_factory=_make_fx_factory("clean"))
     glue_main.main(  # warm-process repeat invocation (I-3 guard-skip, same batch_id)
-        argv, fetch_spec=lambda uri: spec_text, fx_factory=_make_fx_factory("clean")
+        argv, fetch_spec=fetch_spec, fx_factory=_make_fx_factory("clean")
     )
 
     installed = [h for h in _clean_root_logger.handlers if h.name == _JSON_HANDLER_NAME]

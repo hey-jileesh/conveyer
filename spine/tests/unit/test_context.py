@@ -14,16 +14,17 @@ from datetime import UTC, datetime
 import pytest
 from spine import config, context
 from spine.binding import Transforms
+from spine.core.checks import checks_version
 from spine.core.contract import check_version, read_spec_version
 from spine.core.model import PipelineSpecModel
 
 
 def _make_transforms() -> Transforms:
-    return Transforms(
-        apply=lambda valid_df, co_effects: valid_df,
-        post_check=lambda candidate_df, co_effects: candidate_df,
-        fold=lambda state_slice, facts_df: facts_df,
-    )
+    # 006.1 §4.4 (bead conveyer-6pg.13, B3): `Transforms` drops `post_check`;
+    # `apply` now returns a `Mapping[str, DataFrame]`. Critique gate
+    # wf_24a3125f-ecc F2 (bead conveyer-6pg.31): `Transforms` drops `fold`
+    # too -- `apply` is its ONLY field now.
+    return Transforms(apply=lambda valid_df, co_effects: {"t": valid_df})
 
 
 def _make_spec() -> PipelineSpecModel:
@@ -32,8 +33,19 @@ def _make_spec() -> PipelineSpecModel:
         transforms_module="pipelines.commissions.transforms",
         raw_table="lake.commissions__raw",
         quarantine_table="lake.commissions__quarantine",
-        fact_table="lake.commissions__facts",
-        state_table="lake.commissions__state",
+        # 006.1 P-1: singular fact_table/state_table replaced by a per-type
+        # `fact_types` mapping -- this fixture just needs SOME valid spec.
+        fact_types={
+            "detail": {
+                "fact_table": "lake.commissions__facts",
+                "state_table": "lake.commissions__state",
+                "schema": {
+                    "columns": [{"name": "domain_id", "type": "string"}],
+                    "domain_id_col": "domain_id",
+                    "record_key": ["domain_id"],
+                },
+            }
+        },
         read={"dialect": {"format": "csv"}},
         raw_contract={"columns": [{"name": "id"}]},
     )
@@ -58,6 +70,7 @@ def _make_seed() -> context.BatchContext:
         sfn_redrive_count=0,
         read_spec_version=read_spec_version(spec.read),
         check_version=check_version(spec.raw_contract, spec.read),
+        checks_version=checks_version(spec.checks),
     )
 
 
@@ -69,6 +82,20 @@ def test_seed_construction_defaults_post_seed_fields() -> None:
     assert seed.started_emitted is False
     assert seed.published is False
     assert seed.completed_event is None
+
+
+def test_seed_construction_defaults_007_1_per_type_delta_fields() -> None:
+    # 007.1 §4.2's seven per-type BatchContext deltas (F-4/F-5's field-level
+    # ground) -- same "None (or ()/False)" default convention as every
+    # other post-seed field.
+    seed = _make_seed()
+    assert seed.facts_appended_by_table is None
+    assert seed.commit_snapshot_ids is None
+    assert seed.rows_merged_by_table is None
+    assert seed.fold_snapshot_ids is None
+    assert seed.delta_predecessor_batch_ids == ()
+    assert seed.delta_read_snapshot_ids is None
+    assert seed.delta_probe_refusal is None
 
 
 def test_replace_sets_a_field_once() -> None:

@@ -1,0 +1,55 @@
+# CODEOWNERS — conveyer
+#
+# conveyer-6pg.35 item 3 / [DS-4] ([DS2-2] extension, 006.1 §16.8, 007.1
+# §15's final row + §16's [DC2-2]/[DS2-2] block): the security-gate-named
+# approver pair for growth of the spine purity/idiom linter's banned-
+# attribute profile and its per-file exemption list — "any growth of the
+# banned-attribute profile OR of its per-file exemption list carries
+# 006.1 §16.8's [DS-4] approver pattern — the platform data-architecture
+# owner plus security-gate countersign — since an exemption is precisely a
+# licensed hole in the construction §15's final row leans on, never an
+# ordinary code review" (007.1 §15/§16). The SAME pair already governs
+# `core/check_grammar.py` and the G-07/G-08 corpus growth (006.1 §16.8's
+# own row) — this entry is [DS2-2]'s extension of that pattern to the
+# linter engine itself.
+#
+# Known gap, recorded rather than papered over: this repository currently
+# has exactly one accredited GitHub identity (@hey-jileesh, the platform
+# data-architecture owner per 006.1/007.1's decision records). The second
+# named role — an independent security-gate countersign (the
+# `director:security` gate class, e.g. the `conveyer-hpp.6`/`conveyer-6pg.35`
+# gate lineage) — has no distinct GitHub account/team provisioned yet; that
+# provisioning is an explicit follow-up (register alongside 006.1 §16.1),
+# not silently assumed satisfied by one reviewer wearing both hats. Until a
+# second identity exists, GitHub's own required-reviewer count on this rule
+# cannot be mechanically enforced above one — the checklist obligation
+# (both roles must actually read and countersign the diff) stays a
+# process control until that identity lands.
+#
+# Second known gap (F-3, security gate `wf_c9aadeb2-8eb`, LOW, bead
+# conveyer-swb.30): a CODEOWNERS entry is comment-only enforcement without
+# a `main` branch ruleset requiring a PR, >=1 approval, and "require review
+# from code owners" — main is unprotected today (`gh api .../branches/main/
+# protection` -> "Branch not protected"; `gh api .../rulesets` -> `[]`), so
+# even with a second identity provisioned, nobody is mechanically forced to
+# request or honor these entries yet. Provisioning that ruleset is a human
+# action (repo settings), tracked as an explicit follow-up alongside the
+# second-identity gap above — not done by this file alone.
+
+tools/purity_linter.py                                @hey-jileesh
+tools/linter_configs/spine.py                         @hey-jileesh
+
+# F-3 path widening (security gate `wf_c9aadeb2-8eb`, LOW): the [DS-4]/
+# [DS2-2] approver pair's governed surface also includes the grammar
+# engine `check_grammar.py` actually compiles against, its own G-07/G-08
+# corpus tests, and the IAM policy document (`spine-pipeline/iam.tf`) the
+# module-level "never database-wide" invariant (I-21/S-5, this same bead's
+# F-1) is expressed in — same owner set, one governed pair, never allowed
+# to drift apart into a laxer review bar for any of these (007.1 §16.8's
+# own row already named `core/check_grammar.py`/the G-07/G-08 corpus; this
+# entry makes that a mechanical CODEOWNERS fact, not prose alone).
+spine/spine/core/check_grammar.py                     @hey-jileesh
+spine/tests/unit/test_check_grammar.py                @hey-jileesh
+spine/spine/probes/g08_parity.py                      @hey-jileesh
+spine/tests/frames/test_business_checks.py            @hey-jileesh
+spine/terraform/modules/spine-pipeline/iam.tf         @hey-jileesh

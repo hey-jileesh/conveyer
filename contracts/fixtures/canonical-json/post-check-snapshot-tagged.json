@@ -1,0 +1,36 @@
+[
+  {
+    "value": {
+      "domain_id": "abc-123",
+      "amount": {
+        "$decimal": "10.50"
+      },
+      "event_time": {
+        "$timestamp": "2026-01-02T03:04:05.000000+00:00"
+      },
+      "quantity": 3,
+      "is_active": true,
+      "note": null,
+      "_conveyer_fact_type": "orders"
+    },
+    "canonical": "{\"_conveyer_fact_type\":\"orders\",\"amount\":\"10.50\",\"domain_id\":\"abc-123\",\"event_time\":\"2026-01-02T03:04:05.000000Z\",\"is_active\":true,\"note\":null,\"quantity\":3}",
+    "sha256": "836d72bd0655a5aa3d96441499e5a8bac997cc717ec867e272947be5b8e4579a"
+  },
+  {
+    "value": {
+      "domain_id": "abc-123",
+      "amount": {
+        "$decimal": "10.50"
+      },
+      "event_time": {
+        "$timestamp": "2026-01-02T03:04:05.000000+00:00"
+      },
+      "quantity": 3,
+      "is_active": true,
+      "note": null,
+      "_conveyer_fact_type": "shipments"
+    },
+    "canonical": "{\"_conveyer_fact_type\":\"shipments\",\"amount\":\"10.50\",\"domain_id\":\"abc-123\",\"event_time\":\"2026-01-02T03:04:05.000000Z\",\"is_active\":true,\"note\":null,\"quantity\":3}",
+    "sha256": "661072e58daa02546e3decaa4cbb921b6167ef11a22e64d94ea4f86662d70a53"
+  }
+]

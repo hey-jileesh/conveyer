@@ -105,15 +105,21 @@ import killfx
 import pytest
 from pyspark.sql import SparkSession
 from scenario_helpers import FIXTURES_DIR as _FIXTURES_DIR
+from scenario_helpers import IDENTITY_FACT_SCHEMA as _IDENTITY_FACT_SCHEMA
 from scenario_helpers import IDENTITY_RAW_CONTRACT as _IDENTITY_RAW_CONTRACT
 from scenario_helpers import IDENTITY_READ as _IDENTITY_READ
+from scenario_helpers import VIOLATIONS_CHECKS as _VIOLATIONS_CHECKS
 from scenario_helpers import bare as _bare
 from scenario_helpers import batch_id as _batch_id
 from scenario_helpers import create_fact_table as _create_fact_table
+from scenario_helpers import create_markers_table_for as _create_markers_table_for
 from scenario_helpers import create_quarantine_table as _create_quarantine_table
 from scenario_helpers import create_raw_table as _create_raw_table
 from scenario_helpers import create_state_table as _create_state_table
+from scenario_helpers import facts_appended_total as _facts_appended_total
 from scenario_helpers import quarantine_rows as _quarantine_rows
+from scenario_helpers import rows_merged_total as _rows_merged_total
+from scenario_helpers import unique_pipeline as _unique_pipeline
 from snapshot_asserts import (
     assert_no_new_snapshot,
     assert_stamped_batch,
@@ -123,8 +129,16 @@ from snapshot_asserts import (
 from spine.binding import bind_transforms
 from spine.config import RunConfig
 from spine.context import BatchContext
+from spine.core.checks import checks_version
 from spine.core.contract import check_version, read_spec_version
-from spine.core.model import CoEffectDecl, ColumnSpec, PipelineSpecModel, RawContractModel
+from spine.core.model import (
+    ChecksModel,
+    CoEffectDecl,
+    ColumnSpec,
+    FactTypeModel,
+    PipelineSpecModel,
+    RawContractModel,
+)
 from spine.effects.records import RunnerFx, TransientError
 from spine.run import run as run_sequence
 from spine.stages import land, pre_check
@@ -162,18 +176,39 @@ def _make_spec_with_probe(
     fact_table: str,
     state_table: str,
     probe_table: str,
+    pipeline: str | None = None,
+    checks: ChecksModel | None = None,
 ) -> PipelineSpecModel:
+    # B10 (bead conveyer-6pg.22): per-call-site unique `pipeline` -- see
+    # `scenario_helpers.unique_pipeline`'s own docstring for why a shared
+    # literal would collide every test's markers table onto one name.
     return PipelineSpecModel(
-        pipeline="pipelines/identity",
+        pipeline=pipeline if pipeline is not None else _unique_pipeline("kill"),
         transforms_module=transforms_module,
         co_effects={"probe": CoEffectDecl(table=probe_table, own_state=False)},
         raw_table=raw_table,
         quarantine_table=quarantine_table,
-        fact_table=fact_table,
-        state_table=state_table,
+        fact_types={
+            "identity": FactTypeModel(
+                fact_table=fact_table, state_table=state_table, schema=_IDENTITY_FACT_SCHEMA
+            )
+        },
+        checks=checks if checks is not None else ChecksModel(),
         read=_IDENTITY_READ,
         raw_contract=_IDENTITY_RAW_CONTRACT,
     )
+
+
+def _fact_types(fact_table: str, state_table: str) -> dict[str, FactTypeModel]:
+    """006.1 P-1: the per-type `fact_types` mapping every direct
+    `PipelineSpecModel(...)` construction in this file now needs, in place
+    of the deleted singular `fact_table`/`state_table` fields -- mirrors
+    `test_scenarios_core.py`'s own identically-named helper."""
+    return {
+        "identity": FactTypeModel(
+            fact_table=fact_table, state_table=state_table, schema=_IDENTITY_FACT_SCHEMA
+        )
+    }
 
 
 def _make_seed(
@@ -187,7 +222,7 @@ def _make_seed(
     `attempt_id` (that helper hardcodes `"attempt-1"`) — R-08's 3-attempt
     flow needs each attempt distinguishable in the run ledger."""
     return BatchContext(
-        pipeline="pipelines/identity",
+        pipeline=spec.pipeline,
         feed_id="feed/identity",
         delivery_id=str(uuid.UUID(int=1, version=4)),
         batch_id=batch_id,
@@ -203,6 +238,7 @@ def _make_seed(
         sfn_redrive_count=0,
         read_spec_version=read_spec_version(spec.read),
         check_version=check_version(spec.raw_contract, spec.read),
+        checks_version=checks_version(spec.checks),
     )
 
 
@@ -276,7 +312,14 @@ def test_r03_kill_at_each_point_then_restart_converges(
         fact_table=_bare(fact_qt),
         state_table=_bare(state_qt),
         probe_table=_bare(probe_qt),
+        # `label` (e.g. "pre_land") may carry `_`, illegal in the pipeline
+        # grammar's segment (`_PIPELINE_SEGMENT` -- lowercase alnum + single
+        # dashes only) -- stripped, uniqueness still comes from `unique_
+        # pipeline`'s own uuid suffix.
+        pipeline=_unique_pipeline(f"r03{label.replace('_', '')}"),
+        checks=_VIOLATIONS_CHECKS,
     )
+    _create_markers_table_for(spark, spec)
     batch_id = _batch_id(300)
 
     killed_fx = make_wrapped_fx(
@@ -345,15 +388,15 @@ def test_r08_merge_conflict_rerun_converges_then_healthy_rerun_is_a_logical_noop
     _create_fact_table(spark, fact_qt)
     _create_state_table(spark, state_qt)
     spec = PipelineSpecModel(
-        pipeline="pipelines/identity",
+        pipeline=_unique_pipeline("r08"),
         transforms_module="pipelines.identity.transforms",
         raw_table=_bare(raw_qt),
         quarantine_table=_bare(qtn_qt),
-        fact_table=_bare(fact_qt),
-        state_table=_bare(state_qt),
+        fact_types=_fact_types(_bare(fact_qt), _bare(state_qt)),
         read=_IDENTITY_READ,
         raw_contract=_IDENTITY_RAW_CONTRACT,
     )
+    _create_markers_table_for(spark, spec)
     batch_id = _batch_id(380)
 
     # A SINGLE flaky-merge fx, reused across attempts 1 and 2: the wrapper's
@@ -383,7 +426,7 @@ def test_r08_merge_conflict_rerun_converges_then_healthy_rerun_is_a_logical_noop
     )
     result2 = run_sequence(seed2, flaky_fx)
     assert result2.published is True
-    assert result2.state_snapshot_id is not None
+    assert result2.completed_event.state_snapshot_id is not None
     assert _failed_rows(ledger_catalog, batch_id, "attempt-2") == []
 
     fact_rows = sorted((r["domain_id"], r["payload"]) for r in spark.table(fact_qt).collect())
@@ -391,15 +434,15 @@ def test_r08_merge_conflict_rerun_converges_then_healthy_rerun_is_a_logical_noop
 
     # Attempt 3: a plain, unwrapped, healthy rerun -- I-19's logical no-op
     # merge contract, observed via the run ledger's OWN fold row (not just
-    # `result3`/context fields): `snapshot_id` (this ledger column IS
-    # `state_snapshot_id` for a fold row, `core/run_facts.py::_stage_fields`)
-    # null, `rows_merged` zero.
+    # `result3`/context fields): `snapshot_id` (this ledger column is `core/
+    # run_facts.py::one_snapshot(ctx.fold_snapshot_ids)` for a fold row) null,
+    # `rows_merged` zero.
     seed3 = _make_seed(
         spec=spec, batch_id=batch_id, attempt_id="attempt-3", object_uris=_CLEAN_OBJECT_URIS
     )
     result3 = run_sequence(seed3, local_runner_fx)
-    assert result3.state_snapshot_id is None
-    assert result3.merge_summary is None
+    assert result3.fold_snapshot_ids == {}
+    assert _rows_merged_total(result3) == 0
 
     fold_rows_attempt3 = [
         r
@@ -433,15 +476,15 @@ def test_r13_one_commit_invariant_per_effectful_stage_then_rerun_advances_zero(
     _create_fact_table(spark, fact_qt)
     _create_state_table(spark, state_qt)
     spec = PipelineSpecModel(
-        pipeline="pipelines/identity",
+        pipeline=_unique_pipeline("r13"),
         transforms_module="pipelines.identity.transforms",
         raw_table=_bare(raw_qt),
         quarantine_table=_bare(qtn_qt),
-        fact_table=_bare(fact_qt),
-        state_table=_bare(state_qt),
+        fact_types=_fact_types(_bare(fact_qt), _bare(state_qt)),
         read=_IDENTITY_READ,
         raw_contract=_IDENTITY_RAW_CONTRACT,
     )
+    _create_markers_table_for(spark, spec)
     batch_id = _batch_id(390)
 
     raw_before = snapshot_ids(spark, raw_qt)
@@ -454,7 +497,7 @@ def test_r13_one_commit_invariant_per_effectful_stage_then_rerun_advances_zero(
     )
     result1 = run_sequence(seed1, local_runner_fx)
     assert result1.raw_count == 3
-    assert result1.facts_appended == 3
+    assert _facts_appended_total(result1) == 3
 
     # land -> raw: exactly one new snapshot, stamped with conveyer.batch-id
     # (land's own stage_key is None -- no conveyer.stage property on this
@@ -475,7 +518,7 @@ def test_r13_one_commit_invariant_per_effectful_stage_then_rerun_advances_zero(
     assert_stamped_batch(fact_summary, batch_id)
 
     # fold -> state (MERGE): exactly one new snapshot -- but `effects/
-    # spark.py::_build_merge` never stamps snapshot-property options at all
+    # spark.py::build_merge` never stamps snapshot-property options at all
     # (only `append`'s writer chain does), so a MERGE commit carries NEITHER
     # conveyer.batch-id NOR conveyer.stage -- a documented deviation from
     # R-13's general framing, not asserted as stamped here
@@ -503,9 +546,10 @@ def test_r13_one_commit_invariant_per_effectful_stage_then_rerun_advances_zero(
     # still commits a harmless PHYSICAL no-op snapshot on this runtime
     # (effects/spark.py's own documented empirical finding, reused from
     # R-02's identical carve-out). The LOGICAL no-op is what "advances zero"
-    # means here (I-19): `state_snapshot_id is None`.
-    assert result2.state_snapshot_id is None
-    assert result2.merge_summary is None
+    # means here (I-19): absent from `fold_snapshot_ids`, per-table §8.2
+    # projection rule.
+    assert result2.fold_snapshot_ids == {}
+    assert _rows_merged_total(result2) == 0
 
     fact_rows = sorted((r["domain_id"], r["payload"]) for r in spark.table(fact_qt).collect())
     assert fact_rows == _CLEAN_FACT_GOLDEN  # unchanged by the rerun
@@ -553,15 +597,18 @@ def test_a07b_pre_check_contract_mutated_between_attempts_drift_recorded_via_kil
         ]
     )
     spec1 = PipelineSpecModel(
-        pipeline="pipelines/identity",
+        pipeline=_unique_pipeline("a07b"),
         transforms_module="pipelines.identity.transforms",
         raw_table=_bare(raw_qt),
         quarantine_table=_bare(qtn_qt),
-        fact_table=_bare(fact_qt),
-        state_table="spine_test_tables.unused_state_a07b",
+        fact_types=_fact_types(_bare(fact_qt), "spine_test_tables.unused_state_a07b"),
         read=_IDENTITY_READ,
         raw_contract=original_contract,
     )
+    # No `_create_markers_table_for` here -- this scenario only ever drives
+    # `land`/`pre_check` (see below, both attempts), never `commit`, so no
+    # marker table is ever read or written (mirrors `test_scenarios_core.py`
+    # ::test_a04...'s own identical carve-out).
     path = tmp_path / "object_1.csv"
     path.write_text(
         "domain_id,event_time,source_ts,content_hash,payload\n"
@@ -587,7 +634,15 @@ def test_a07b_pre_check_contract_mutated_between_attempts_drift_recorded_via_kil
     # (quarantine guard present, §6.5's A-9 subtraction path). land+pre_check
     # only, via the real `run()` driver (not direct stage calls) so
     # `fx.record_run` genuinely fires -- the WIRING this leg pins.
-    spec2 = PipelineSpecModel(**{**spec1.model_dump(), "raw_contract": tightened_contract})
+    # `by_alias=True`: `FactTypeModel.schema_` is aliased to `schema` at the
+    # pydantic boundary (`Field(alias="schema")`) -- a plain `model_dump()`
+    # emits the FIELD name (`schema_`), which `PipelineSpecModel(**...)`'s
+    # own reconstruction then refuses (`schema_` is `extra_forbidden`, only
+    # the alias `schema` is accepted on construction) -- `by_alias=True`
+    # round-trips correctly.
+    spec2 = PipelineSpecModel(
+        **{**spec1.model_dump(by_alias=True), "raw_contract": tightened_contract}
+    )
     seed2 = _make_seed(
         spec=spec2, batch_id=batch_id, attempt_id="attempt-2", object_uris=(str(path),)
     )
@@ -644,15 +699,16 @@ def test_a10_post_check_hash_keyed_rerun_subtraction_exercised_via_killfx(
     _create_fact_table(spark, fact_qt)
     _create_state_table(spark, state_qt)
     spec = PipelineSpecModel(
-        pipeline="pipelines/identity",
+        pipeline=_unique_pipeline("a10hash"),
         transforms_module="pipelines.identity_violations.transforms",
         raw_table=_bare(raw_qt),
         quarantine_table=_bare(qtn_qt),
-        fact_table=_bare(fact_qt),
-        state_table=_bare(state_qt),
+        fact_types=_fact_types(_bare(fact_qt), _bare(state_qt)),
+        checks=_VIOLATIONS_CHECKS,
         read=_IDENTITY_READ,
         raw_contract=_IDENTITY_RAW_CONTRACT,
     )
+    _create_markers_table_for(spark, spec)
     batch_id = _batch_id(310)
 
     # Kill AFTER post_check's own append (occurrence 3: land=1, pre_check=2,

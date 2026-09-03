@@ -107,15 +107,25 @@ from spine.bootstrap.create_admission_tables import (
     render_quarantine_create_table_sql,
     render_raw_create_table_sql,
 )
+from spine.bootstrap.create_record_tables import (
+    bootstrap_fact_table,
+    bootstrap_markers_table,
+    bootstrap_state_table,
+)
 from spine.config import RunConfig, RunnerConfig
 from spine.context import BatchContext
 from spine.core import naming
+from spine.core.checks import checks_version
 from spine.core.contract import check_version, read_spec_version
 from spine.core.model import (
+    ChecksModel,
     CoEffectDecl,
     ColumnSpec,
     DeliveryRegisteredV1,
     DialectModel,
+    FactColumnSpec,
+    FactSchemaModel,
+    FactTypeModel,
     PipelineSpecModel,
     RawContractModel,
     ReadSpecModel,
@@ -131,12 +141,6 @@ if TYPE_CHECKING:
 _CATALOG_PREFIX = "spine_cat."
 _EXEMPLAR_DIR = Path(__file__).resolve().parent.parent / "exemplar" / "identity"
 _FIXTURES_DIR = _EXEMPLAR_DIR / "fixtures"
-
-_ROW_DDL = (
-    "domain_id STRING, event_time STRING, source_ts STRING, content_hash STRING, "
-    "payload STRING, batch_id STRING, delivery_id STRING, feed_id STRING, "
-    "received_at TIMESTAMP"
-)
 
 # §7.3 STAGES order -- also `spine/stages/__init__.py::SEQUENCE`'s own order.
 _SEQUENCE_ORDER = ("land", "pre_check", "pull", "apply", "post_check", "commit", "fold", "publish")
@@ -177,16 +181,28 @@ def _create_quarantine_table(spark: SparkSession, qualified_table: str) -> None:
 
 
 def _create_fact_table(spark: SparkSession, qualified_table: str) -> None:
-    spark.sql(f"CREATE TABLE {qualified_table} ({_ROW_DDL}) USING iceberg")
+    # 007.1 §6.5 DDL parity swap (bead conveyer-6pg.21, B9b addendum 1; B10
+    # migration, bead conveyer-6pg.22): the SAME builder `bootstrap-record-
+    # tables` issues in production, not a hand-rolled `_ROW_DDL` shape (that
+    # provisional 9-column shape never carried `record_key`, F-2 -- the
+    # residual bug B10's migration pass surfaced and fixes here) -- see
+    # `scenario_helpers.py`'s own identical fix and this file's own
+    # docstring on why this module keeps its own copy rather than importing
+    # that one.
+    bootstrap_fact_table(spark, qualified_table, _IDENTITY_FACT_SCHEMA)
 
 
 def _create_state_table(spark: SparkSession, qualified_table: str) -> None:
-    # write.merge.mode=merge-on-read: the fold no-op detection precondition
-    # (effects/spark.py's own documented empirical finding).
-    spark.sql(
-        f"CREATE TABLE {qualified_table} ({_ROW_DDL}) USING iceberg "
-        "TBLPROPERTIES ('write.merge.mode'='merge-on-read')"
-    )
+    # `bootstrap_state_table` bakes in write.merge.mode=merge-on-read (the
+    # fold no-op detection precondition) + write.merge.isolation-level=
+    # serializable + the declared sort order at CREATE -- strictly more than
+    # the old hand-rolled DDL's own single TBLPROPERTY.
+    bootstrap_state_table(spark, qualified_table, _IDENTITY_FACT_SCHEMA)
+
+
+def _create_markers_table(spark: SparkSession, spec: PipelineSpecModel) -> None:
+    markers_table = naming.qualified(naming.markers_table(spec.raw_table, spec.pipeline))
+    bootstrap_markers_table(spark, markers_table)
 
 
 def _create_coeff_table(spark: SparkSession, qualified_table: str) -> None:
@@ -214,6 +230,28 @@ _IDENTITY_RAW_CONTRACT = RawContractModel(
     ]
 )
 
+# 006.1 §4.1: the `identity` fact type's own declared `FactSchemaModel` --
+# mirrors (not imports, this file's own docstring) `scenario_helpers.py::
+# IDENTITY_FACT_SCHEMA`; `source_ts`/`content_hash` excluded (both are
+# `core/record.py::FACT_STAMP_COLUMNS`, 007.1's framework-derived stamp set).
+_IDENTITY_FACT_SCHEMA = FactSchemaModel(
+    columns=[
+        FactColumnSpec(name="domain_id", type="string"),
+        FactColumnSpec(name="event_time", type="string"),
+        FactColumnSpec(name="payload", type="string"),
+    ],
+    domain_id_col="domain_id",
+    record_key=["domain_id"],
+)
+
+
+def _unique_pipeline(prefix: str) -> str:
+    """Per-test-unique `pipeline` slug (B10, bead conveyer-6pg.22) -- mirrors
+    `scenario_helpers.unique_pipeline`'s own docstring (not imported, this
+    file's own "mirrors, never imports" convention): a shared literal
+    pipeline collides every test's markers table onto one physical name."""
+    return f"pipelines/{prefix}{uuid.uuid4().hex[:8]}"
+
 
 def _make_spec(
     *,
@@ -223,14 +261,19 @@ def _make_spec(
     fact_table: str,
     state_table: str,
     co_effects: dict[str, CoEffectDecl] | None = None,
+    pipeline: str | None = None,
 ) -> PipelineSpecModel:
     return PipelineSpecModel(
-        pipeline="pipelines/identity",
+        pipeline=pipeline if pipeline is not None else _unique_pipeline("ledger"),
         transforms_module=transforms_module,
         raw_table=raw_table,
         quarantine_table=quarantine_table,
-        fact_table=fact_table,
-        state_table=state_table,
+        fact_types={
+            "identity": FactTypeModel(
+                fact_table=fact_table, state_table=state_table, schema=_IDENTITY_FACT_SCHEMA
+            )
+        },
+        checks=ChecksModel(),
         read=_IDENTITY_READ,
         raw_contract=_IDENTITY_RAW_CONTRACT,
         co_effects=co_effects or {},
@@ -241,7 +284,7 @@ def _make_seed(
     *, spec: PipelineSpecModel, batch_id: str, object_uris: tuple[str, ...]
 ) -> BatchContext:
     return BatchContext(
-        pipeline="pipelines/identity",
+        pipeline=spec.pipeline,
         feed_id="feed/identity",
         delivery_id=str(uuid.UUID(int=1, version=4)),
         batch_id=batch_id,
@@ -257,11 +300,23 @@ def _make_seed(
         sfn_redrive_count=0,
         read_spec_version=read_spec_version(spec.read),
         check_version=check_version(spec.raw_contract, spec.read),
+        checks_version=checks_version(spec.checks),
     )
 
 
 def _ledger_rows_for(ledger_catalog: LedgerCatalogFixture, batch_id: str) -> list[dict[str, Any]]:
     return [row for row in ledger_catalog.rows() if row["batch_id"] == batch_id]
+
+
+def _facts_appended_total(ctx: BatchContext) -> int:
+    """`sum(ctx.facts_appended_by_table.values())` -- B10 (bead conveyer-
+    6pg.22): the old singular `ctx.facts_appended` field was never set past
+    `stages/commit.py`'s B9b rewrite and has since been deleted from
+    `BatchContext` outright (critique gate wf_24a3125f-ecc ruling 1, bead
+    conveyer-6pg.29, F4; mirrors, not imports, `scenario_helpers.
+    facts_appended_total`, this file's own docstring convention)."""
+    by_table = ctx.facts_appended_by_table
+    return sum(by_table.values()) if by_table is not None else 0
 
 
 def _raise_once(exc: BaseException) -> Callable[[Callable[..., object]], Callable[..., object]]:
@@ -329,8 +384,21 @@ def _valid_spec_data(
         "transforms_module": transforms_module,
         "raw_table": raw_table,
         "quarantine_table": quarantine_table,
-        "fact_table": fact_table,
-        "state_table": state_table,
+        "fact_types": {
+            "identity": {
+                "fact_table": fact_table,
+                "state_table": state_table,
+                "schema": {
+                    "columns": [
+                        {"name": "domain_id", "type": "string"},
+                        {"name": "event_time", "type": "string"},
+                        {"name": "payload", "type": "string"},
+                    ],
+                    "domain_id_col": "domain_id",
+                    "record_key": ["domain_id"],
+                },
+            }
+        },
         "read": {"dialect": {"format": "csv", "header": True}},
         "raw_contract": {
             "columns": [
@@ -423,7 +491,9 @@ def test_r05(
         fact_table=_bare(fact_qt),
         state_table=_bare(state_qt),
         co_effects={"lookup": CoEffectDecl(table=_bare(coeff_qt))},
+        pipeline=_unique_pipeline("r05"),
     )
+    _create_markers_table(spark, spec)
     object_uris = (
         str(_FIXTURES_DIR / "clean" / "object_1.csv"),
         str(_FIXTURES_DIR / "clean" / "object_2.csv"),
@@ -437,7 +507,7 @@ def test_r05(
     result = run_sequence(seed, local_runner_fx)
     moto_events_bus.read_events()  # drain -- events are R-01's own concern
 
-    assert result.facts_appended == 3
+    assert _facts_appended_total(result) == 3
     assert result.guard_skips == ()
     # BatchContext-level proof the co-effect was genuinely pulled --
     # test_stages_land_pre_pull_apply.py already covers this at the
@@ -455,7 +525,7 @@ def test_r05(
     by_stage = {row["stage"]: row for row in rows}
     for row in rows:
         assert row["batch_id"] == batch_id
-        assert row["pipeline"] == "pipelines/identity"
+        assert row["pipeline"] == spec.pipeline
         assert row["feed_id"] == "feed/identity"
         assert row["attempt_id"] == "attempt-1"
         assert row["sfn_retry_count"] == 0
@@ -496,13 +566,27 @@ def test_r05(
     commit_row = by_stage["commit"]
     assert commit_row["facts_appended"] == 3
     assert commit_row["snapshot_id"] is not None
-    assert commit_row["snapshot_id"] == result.fact_snapshot_id
+    # B10: the old singular `BatchContext.fact_snapshot_id` field was never
+    # set past `stages/commit.py`'s own B9b rewrite and has since been
+    # deleted outright (F4, bead conveyer-6pg.29) -- the durable, correctly-
+    # resolved singular projection is the completed event's own field
+    # (`stages/publish.py`'s `core.run_facts.one_snapshot`-derived value,
+    # SEPARATE from but numerically identical to the ledger row's own
+    # `one_snapshot(commit_snapshot_ids)` derivation here, single fact type).
+    assert commit_row["snapshot_id"] == result.completed_event.fact_snapshot_id
 
     fold_row = by_stage["fold"]
-    assert fold_row["state_read_snapshot_id"] == -1  # fresh state table, zero snapshots [E-14]
+    # `state_read_snapshot_id`/`merge_summary` are permanently vestigial
+    # under the N-table mechanical design (`stages/fold.py`'s own docstring:
+    # no separate state read happens any more -- the MERGE's own `USING`/
+    # `ON` clause reads the target live, inside the effect, never through a
+    # plan-visible pinned frame this stage could report a snapshot id for).
+    assert fold_row["state_read_snapshot_id"] is None
+    assert fold_row["merge_summary"] is None
     assert fold_row["snapshot_id"] is not None
-    assert fold_row["snapshot_id"] == result.state_snapshot_id
-    assert dict(fold_row["merge_summary"])  # non-empty, verbatim Iceberg summary
+    assert fold_row["snapshot_id"] == result.completed_event.state_snapshot_id
+    assert dict(fold_row["rows_merged_by_table"])  # non-empty per-state-table map (§4.2)
+    assert dict(fold_row["snapshot_ids_by_table"])  # non-empty -- a real, attributable MERGE
 
     publish_row = by_stage["publish"]
     for field in _STAGE_ONLY_FIELDS:

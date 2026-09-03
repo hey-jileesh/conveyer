@@ -85,6 +85,17 @@ Makefile has no terraform of its own to run.
                                                    # `pipeline.yaml` URI (s3:// in a real deploy,
                                                    # file:// for a local/dev dry run) -- run once per
                                                    # pipeline being deployed, not once per environment.
+5c. make -C spine bootstrap-record-tables ENV=dev SPEC=<pipeline spec URI>
+                                                   # PER PIPELINE, once per deploy, AFTER 5b and before
+                                                   # smoke (007.1 LLD §6.5): idempotent, additive-only
+                                                   # fact/state/marker Iceberg table creation, per the
+                                                   # pipeline's `fact_types` mapping (006.1 P-1). Also
+                                                   # emits/refreshes `table-classes.json` BESIDE the
+                                                   # deployed spec (same `SPEC` directory, F-10) -- the
+                                                   # bind-time authority `entrypoints/glue_main.py`
+                                                   # loads for [DC-1]'s marker-table probe; re-run
+                                                   # whenever `fact_types` changes shape, not only on a
+                                                   # brand-new pipeline.
 6. make -C spine smoke ENV=dev                    # via the identity FEED (ingestion front door,
                                                    # conveyer-internal/identity-smoke, §12.6); polls
                                                    # the run ledger for a publish/ok row, the facts
@@ -118,6 +129,71 @@ Dev-only migration (N5), identity exemplar only:
   real §4.1/§4.2 shape, then re-run smoke. Dev-only disposable data -- a real
   pipeline's production tables never carry the provisional shape, so this step
   is never needed for one.
+```
+
+### B5 deploy-refresh checklist (006.1 LLD §14 B5)
+
+Local half shipped by `conveyer-6pg.15`; executed by `conveyer-6pg.16`
+(B5-gate) — human-supervised, LEAVE OPEN, mirrors the `conveyer-nvh.32`/
+`conveyer-4ot.27`/N5 precedent above: no AWS mutation by any agent.
+
+```
+1. Spec redeploy -- no NEW authoring needed: `tests/exemplar/identity/
+   pipeline.yaml` already carries the per-type `fact_types` shape (006.1
+   P-1, migrated at B3/`conveyer-6pg.13`) -- push it to
+   s3://${p}-artifacts/spine/specs/pipelines--identity/pipeline.yaml and
+   `terraform apply -var spine_pipeline_spec_uri=<pushed URI>` (steps 3-4
+   above); confirms the deployed Glue job's `--conveyer-pipeline-spec-uri`
+   argv resolves the new shape, not a stale singular `fact_table`/
+   `state_table` one.
+
+2. Dev quarantine re-create (P-7), identity exemplar only -- DROP
+   `<lake_db>.identity__quarantine` ONLY (not `identity__raw` -- P-7 never
+   touches raw's shape) and re-run step 5b (`bootstrap-admission`) to
+   recreate it. Why: P-7 adds one reserved key (`_conveyer_fact_type`) to
+   every NEW quarantine row's `row_snapshot` JSON so `row_hash` can
+   discriminate which fact type a quarantined row belongs to (§8.1's
+   per-type rerun subtraction); rows quarantined by a pre-P-7 deploy lack
+   that key. No DDL changes -- the tag lives inside the existing
+   `row_snapshot` column's JSON value, never a new column, so
+   `bootstrap-admission`'s own exact-schema assertion is untouched by this
+   step; it is a DATA disposal, not a schema migration. P-7's own decision
+   record (006.1 §2): "accepting ... that pre-tag durable quarantine rows
+   in the dev exemplar are re-created rather than migrated (dev-disposable,
+   §14)". Dev-only, same framing as N5 above -- a real pipeline's
+   quarantine table is never pre-tag, so this step is never needed for one.
+
+3. Record tables + inventory refresh -- step 5c above
+   (`bootstrap-record-tables`), idempotent; re-run whenever `fact_types`
+   changed shape since the last deploy (harmless no-op otherwise). Confirms
+   `table-classes.json` (F-10) is content-current beside the redeployed
+   spec -- the bind-time authority `entrypoints/glue_main.py` loads before
+   ANY stage runs ([DC-1]'s marker-table probe).
+
+4. `make -C spine smoke ENV=dev` (step 6 above) -- confirms the redeployed
+   spec + refreshed table set round-trips one real batch end to end
+   (publish/ok ledger row, a facts-table row, an EMF-marked log line).
+
+5. Glue G-08 parity -- `make -C spine glue-parity` (Makefile target added
+   this bead), run the SAME way against the deployed Glue job's own
+   wheel/environment (a `spark-submit`/ad hoc job run against a live Glue
+   5.0 cluster -- the probe needs no seed/delivery/catalog access of its
+   own, `spine/probes/g08_parity.py`'s own docstring) rather than a
+   laptop's local Spark. Expect `55/55 discriminator rows passed on this
+   engine` in the job's continuous-logging output and exit code 0 -- a
+   LOCAL rehearsal of the identical command already passed 55/55 under
+   local Spark (originally 45/45, `conveyer-6pg.15`; extended to 55/55 with
+   the §6.3 aggregate-position engine rows, `conveyer-swb.12`/A006-4); this
+   step is what settles
+   whether Glue 5.0's real JVM agrees (§13.1's own class of claim: "only a
+   real account can confirm").
+
+This bead (`conveyer-6pg.15`, B5-local) ships every artifact steps 1-5 need
+— the already-migrated spec, this checklist's own instructions for step 2's
+DROP (never the DROP itself), the `bootstrap-record-tables` step 5c wiring,
+and the `glue-parity` probe/Makefile target — each validated locally end to
+end (every command above runs clean against a local/dry-run substrate; only
+the AWS-account-specific parts of steps 1-5 are deferred to B5-gate).
 ```
 
 ### Reader cost note: `multiline: true` parses on the driver (005.1 LLD §5.5, critique F3)
@@ -196,3 +272,72 @@ during its own abort-cleanup attempt — **expected noise** under the
 append-only bucket policy (no spine role holds `s3:DeleteObject`, §10.3);
 orphaned files are never visible to any snapshot and are swept by 008's
 maintenance design (§15.2). Do not chase these as a real failure signal.
+
+### Out-of-band rebuild (interim) — I-20's governed escape hatch (007.1 §9)
+
+Full rebuild recomputes a pipeline's state tables from ALL committed facts
+through the SAME per-type fold (`core.merge.merge_spec` +
+`frames.fold.reduce_batch_winners`, §8.2's normative plan — bit-for-bit the
+plan `stages/fold.py` runs per batch), then atomically swaps each result
+in via an Iceberg conditional overwrite (`effects.rebuild.swap_with_retry`
+— `validate-from-snapshot-id` + `isolation-level=serializable`, BOTH
+options always, §9.2). It is a separate run mode, invoked directly —
+**there is no `--force` flag anywhere in this path, by construction
+(RB-2)**: a refused swap re-pins facts and recomputes, retrying up to a
+budget before failing loudly (`TransientError`, D-1's ordinary job-
+failure channel); the write is never issued past a refusal.
+
+```
+spine/spine/entrypoints/rebuild_main.py::main(argv) — a SEPARATE entrypoint
+from the Glue job's own glue_main.py (that composition hard-requires a
+seed/delivery event a rebuild invocation does not have). Reuses glue_main's
+own I-23 spec-URI allowlist and file:// / s3:// spec fetch (imported, not
+duplicated).
+
+Required argv (Terraform/operator-supplied, same --conveyer-<kebab> shape
+glue_main's own job args use):
+  --conveyer-pipeline               <pipeline slug, e.g. "pipelines/identity">
+  --conveyer-pipeline-spec-uri      <s3:// or file:// URI under .../spine/specs/<slug>/…>
+  --conveyer-artifacts-bucket       <pinned bucket name; s3:// pipeline-spec-uri must be in it (6pg.35 item 4)>
+  --conveyer-env                    <env name>
+  --conveyer-aws-region             <region>
+  --conveyer-catalog-kind           glue | hadoop
+  --conveyer-warehouse-uri          <hadoop only; omit for glue>
+  --conveyer-ledger-catalog-kind    glue | sql
+  --conveyer-ledger-sql-uri         <sql only; omit for glue>
+  --conveyer-spine-db               <ledger's Glue/SQL database name>
+  --conveyer-run-ledger-table       <run-ledger table name>
+
+A never-folded (virgin) state table converges too (M4, bead conveyer-
+swb.25): `rebuild_state_table` genesis-seeds it first, pushing an empty
+reduce of the fact table's own schema through the SAME `effects/spark.py::
+build_merge` closure production `RunnerFx.merge` uses (no second `MERGE
+INTO`/`.overwrite(` call site) — a zero-row MERGE still commits a real
+first Iceberg snapshot on this runtime, establishing the lineage §9.2's
+swap needs, then the normal swap proceeds. Bootstrap-record-tables' own
+DDL creation alone still carries no snapshot on its own; this run mode's
+own FIRST invocation against a bootstrapped-but-never-folded table is what
+now supplies one, in the SAME call, rather than requiring a prior ordinary
+fold or a hand-run genesis step first.
+
+Observability today (the interim, until 004.1's rebuild stage-vocabulary
+accretion lands, §16): one `stage="rebuild"` run-ledger row per swap
+attempt (`outcome="ok"|"failed"`, `error_type` the OBSERVED wrapped Iceberg
+exception class on a refusal) and a `RebuildSwapRetries` EMF metric per
+refused attempt, dimensioned by `pipeline` and `state_table`.
+```
+
+**The manual re-materialization step — discipline, and says so (§9.3).**
+`rebuild_main.main`'s successful return means every declared fact type's
+state table now reflects `fold(all facts)` — nothing more. No
+`RebuildCompletedV1` event exists yet (004.1's own proposed contract,
+`effects/rebuild.py`'s module docstring), so **this run mode announces
+nothing**: any downstream materialization outside spine's own state tables
+(in particular `domainDB`, or any other consumer that reads spine's state
+tables directly rather than reacting to an event) must be re-triggered BY
+HAND after a successful out-of-band rebuild — re-run whatever job/query
+populates it, the same way you would after any other out-of-band state
+change. A kill between a successful swap and this manual step leaves state
+already correct (§11's K-27 kill-matrix row) — only the announcement is
+stale, closed by re-running this step (or `rebuild_main.main` again:
+idempotent by content, §9.5).

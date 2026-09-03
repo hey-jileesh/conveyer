@@ -28,6 +28,7 @@ from pathlib import Path
 
 import pytest
 from spine.bootstrap.create_run_ledger import create_run_ledger
+from spine.core.delta import DELTA_PROBE_REFUSAL_REASONS
 from spine.core.run_facts import RunFact
 from spine.effects import ledger
 
@@ -114,6 +115,43 @@ def test_build_catalog_glue_constructs_without_network_call() -> None:
     catalog = ledger.build_catalog(config)
     assert isinstance(catalog, GlueCatalog)
     assert catalog.glue.meta.region_name == "eu-west-1"
+
+
+def test_build_catalog_and_record_run_accept_rebuild_config_structurally(tmp_path) -> None:
+    """M3 (bead conveyer-swb.25): `build_catalog`/`build_record_run` are
+    typed against `LedgerConfig`, a narrow six-field Protocol -- NOT the
+    full `spine.config.RunnerConfig` they used to require. `entrypoints/
+    rebuild_main.py::RebuildConfig` (a DIFFERENT concrete dataclass, with
+    no seed/SFN/SLA fields to fabricate the way the deleted `_as_runner_
+    config` adapter used to) satisfies `LedgerConfig` structurally, with no
+    adapter -- proven here by passing a REAL `RebuildConfig` straight into
+    both functions and getting a genuinely-working SQLite catalog + a real
+    ledger append, exactly like `_FakeConfig`'s own shape above."""
+    from spine.entrypoints.rebuild_main import RebuildConfig
+
+    config = RebuildConfig(
+        pipeline="pipelines/ledger-protocol-probe",
+        pipeline_spec_uri="file:///x/spine/specs/p/y.yaml",
+        artifacts_bucket="unused-bucket",
+        env="test",
+        aws_region="us-east-1",
+        catalog_kind="hadoop",
+        warehouse_uri=f"file://{tmp_path}/spark-warehouse",
+        ledger_catalog_kind="sql",
+        ledger_sql_uri=f"sqlite:///{tmp_path}/catalog.db",
+        spine_db="spine_db",
+        run_ledger_table="run_ledger",
+    )
+    catalog = ledger.build_catalog(config)
+    create_run_ledger(catalog, config.spine_db, config.run_ledger_table)
+    record_run = ledger.build_record_run(catalog, config)
+
+    record_run(_run_fact())
+
+    identifier = f"{config.spine_db}.{config.run_ledger_table}"
+    rows = catalog.load_table(identifier).scan().to_arrow().to_pylist()
+    assert len(rows) == 1
+    assert rows[0]["batch_id"] == "b1"
 
 
 # --- _row_from_run_fact / _stage_metrics (pure) -------------------------------
@@ -707,6 +745,166 @@ def test_record_run_pre_check_drift_does_not_leak_into_other_stage(
         )
 
     assert not any(c[0] == "PreCheckDrift" for c in metric_calls)
+
+
+# --- DeltaProbeRefusals WARNING + EMF (007.1 §7.2/§12, F-5; A007-4/K-06) -----
+#
+# Only `none-with-key-match` had a full ledger-projection/EMF/value-free
+# golden before this bead (`test_scenarios_commit.py`'s own K-06 test) --
+# parametrized here over all four `DELTA_PROBE_REFUSAL_REASONS` so the other
+# three (`target-incoherent`/`target-unmarked`/`horizon-exceeded`, the last
+# constructed-but-Phase-1-unreachable per `core/delta.py`'s own docstring)
+# get the identical channel + value-free assertion directly at `record_run`'s
+# own grain, independent of whichever single reason the real wiring happens
+# to reach today.
+
+
+@pytest.mark.parametrize("reason", sorted(DELTA_PROBE_REFUSAL_REASONS))
+def test_record_run_delta_probe_refusal_warns_and_emits_reason_dimensioned_metric(
+    monkeypatch: pytest.MonkeyPatch, tmp_path, caplog: pytest.LogCaptureFixture, reason: str
+) -> None:
+    """Each of the four probe-refusal reasons gets its own ledger projection
+    (`run_fact.delta_probe_refusal`, `test_run_facts.py`'s own obligation) +
+    reason-dimensioned EMF `DeltaProbeRefusals` + a value-free payload
+    ([S-7]/[S-18]: the reason CODE is the entire payload -- no delivery_key/
+    content_hash/batch-value text ever reaches this channel)."""
+    monkeypatch.setattr(ledger, "time", types.SimpleNamespace(sleep=lambda _s: None))
+    metric_calls: list[tuple[str, float, str | None, Mapping[str, str] | None]] = []
+    monkeypatch.setattr(
+        ledger.observability,
+        "emit_metric",
+        lambda name, value, _pipeline, _feed_id, stage=None, extra_dims=None, **_kw: (
+            metric_calls.append((name, value, stage, extra_dims))
+        ),
+    )
+    record_run = ledger.build_record_run(lambda: None, _sql_config(tmp_path))  # type: ignore[arg-type]
+
+    with caplog.at_level(logging.INFO, logger=ledger._LOGGER_NAME):
+        record_run(_run_fact(stage="commit", outcome="ok", delta_probe_refusal=reason))
+
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    refusal_warnings = [r for r in warnings if "delta probe refusal" in r.getMessage().lower()]
+    assert len(refusal_warnings) == 1
+    assert refusal_warnings[0].getMessage().endswith(reason)  # value-free: the reason code only
+    assert refusal_warnings[0].stage == "commit"
+    assert refusal_warnings[0].batch_id == "b1"
+
+    refusal_metrics = [c for c in metric_calls if c[0] == "DeltaProbeRefusals"]
+    assert refusal_metrics == [("DeltaProbeRefusals", 1, "commit", {"reason": reason})]
+
+
+# --- DivergentDuplicates WARNING + EMF (moved here from stages/commit.py, ---
+# --- critique gate wf_24a3125f-ecc F1, bead conveyer-6pg.30 -- previously ---
+# --- ZERO test coverage of any kind) -----------------------------------------
+
+
+def test_record_run_divergent_duplicates_emits_metric_per_table_and_warns_only_if_positive(
+    monkeypatch: pytest.MonkeyPatch, tmp_path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """§12 (D-2(b)): the EMF metric fires for EVERY table entry in the map,
+    including a zero count (the pre-fix stage-side cadence, preserved) --
+    the WARNING log fires ONLY for a table whose count is actually positive
+    (`_emit_divergent_duplicates`'s own documented deviation from the
+    drift-channel gate shape)."""
+    monkeypatch.setattr(ledger, "time", types.SimpleNamespace(sleep=lambda _s: None))
+    metric_calls: list[tuple[str, float, str | None, dict[str, str] | None]] = []
+    monkeypatch.setattr(
+        ledger.observability,
+        "emit_metric",
+        lambda name, value, _pipeline, _feed_id, stage=None, extra_dims=None, **_kw: (
+            metric_calls.append((name, value, stage, dict(extra_dims) if extra_dims else None))
+        ),
+    )
+
+    def broken_catalog() -> None:
+        raise RuntimeError("boom")
+
+    record_run = ledger.build_record_run(broken_catalog, _sql_config(tmp_path))
+    with caplog.at_level(logging.INFO, logger=ledger._LOGGER_NAME):
+        record_run(
+            _run_fact(
+                stage="commit",
+                outcome="ok",
+                divergent_duplicates_by_table={
+                    "lake.orders__facts": 2,
+                    "lake.shipments__facts": 0,
+                },
+            )
+        )
+
+    divergence_metrics = [c for c in metric_calls if c[0] == "DivergentDuplicates"]
+    assert sorted(divergence_metrics) == [
+        ("DivergentDuplicates", 0, "commit", {"table": "lake.shipments__facts"}),
+        ("DivergentDuplicates", 2, "commit", {"table": "lake.orders__facts"}),
+    ]
+
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    divergence_warnings = [r for r in warnings if "divergent duplicates" in r.getMessage().lower()]
+    assert len(divergence_warnings) == 1  # only the positive-count table
+    assert "table=lake.orders__facts" in divergence_warnings[0].getMessage()
+    assert "count=2" in divergence_warnings[0].getMessage()
+    assert divergence_warnings[0].stage == "commit"
+    assert divergence_warnings[0].batch_id == "b1"
+
+
+def test_record_run_divergent_duplicates_none_map_does_not_warn_or_emit(
+    monkeypatch: pytest.MonkeyPatch, tmp_path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A `commit` `RunFact` whose `divergent_duplicates_by_table` is `None`
+    (a genuinely failed transition never reaches `_stage_fields` at all,
+    §7.7 -- `failed()` never populates this field) never trips the channel."""
+    monkeypatch.setattr(ledger, "time", types.SimpleNamespace(sleep=lambda _s: None))
+    metric_calls: list[tuple[str, float, str | None]] = []
+    monkeypatch.setattr(
+        ledger.observability,
+        "emit_metric",
+        lambda name, value, _pipeline, _feed_id, stage=None, **_kw: metric_calls.append(
+            (name, value, stage)
+        ),
+    )
+    record_run = ledger.build_record_run(lambda: None, _sql_config(tmp_path))  # type: ignore[arg-type]
+
+    with caplog.at_level(logging.INFO, logger=ledger._LOGGER_NAME):
+        record_run(
+            _run_fact(
+                stage="commit",
+                outcome="failed",
+                error_type="TransientError",
+                error_message="spine.stages.commit:210",
+            )
+        )
+
+    assert not any("divergent duplicates" in r.getMessage().lower() for r in caplog.records)
+    assert not any(c[0] == "DivergentDuplicates" for c in metric_calls)
+
+
+def test_record_run_divergent_duplicates_does_not_leak_into_other_stage(
+    monkeypatch: pytest.MonkeyPatch, tmp_path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A non-`commit` stage never trips the `DivergentDuplicates` channel,
+    even if it were (adversarially) carrying a populated map."""
+    monkeypatch.setattr(ledger, "time", types.SimpleNamespace(sleep=lambda _s: None))
+    metric_calls: list[tuple[str, float, str | None]] = []
+    monkeypatch.setattr(
+        ledger.observability,
+        "emit_metric",
+        lambda name, value, _pipeline, _feed_id, stage=None, **_kw: metric_calls.append(
+            (name, value, stage)
+        ),
+    )
+    record_run = ledger.build_record_run(lambda: None, _sql_config(tmp_path))  # type: ignore[arg-type]
+
+    with caplog.at_level(logging.INFO, logger=ledger._LOGGER_NAME):
+        record_run(
+            _run_fact(
+                stage="fold",
+                outcome="ok",
+                divergent_duplicates_by_table={"lake.orders__facts": 3},
+            )
+        )
+
+    assert not any("divergent duplicates" in r.getMessage().lower() for r in caplog.records)
+    assert not any(c[0] == "DivergentDuplicates" for c in metric_calls)
 
 
 # --- RunFact -> Arrow round trip, every nullable field combination -----------

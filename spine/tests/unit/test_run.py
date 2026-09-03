@@ -11,20 +11,22 @@ from __future__ import annotations
 
 import dataclasses
 from datetime import UTC, datetime, timedelta
+from types import MappingProxyType
 
 import pytest
 from spine import config, context, run
 from spine.binding import Transforms
+from spine.core.checks import checks_version
 from spine.core.contract import check_version, read_spec_version
 from spine.core.model import PipelineSpecModel
 
 
 def _make_transforms() -> Transforms:
-    return Transforms(
-        apply=lambda valid_df, co_effects: valid_df,
-        post_check=lambda candidate_df, co_effects: candidate_df,
-        fold=lambda state_slice, facts_df: facts_df,
-    )
+    # 006.1 §4.4 (bead conveyer-6pg.13, B3): `Transforms` drops `post_check`;
+    # `apply` now returns a `Mapping[str, DataFrame]`. Critique gate
+    # wf_24a3125f-ecc F2 (bead conveyer-6pg.31): `Transforms` drops `fold`
+    # too -- `apply` is its ONLY field now.
+    return Transforms(apply=lambda valid_df, co_effects: {"t": valid_df})
 
 
 def _make_spec() -> PipelineSpecModel:
@@ -33,8 +35,19 @@ def _make_spec() -> PipelineSpecModel:
         transforms_module="pipelines.commissions.transforms",
         raw_table="lake.commissions__raw",
         quarantine_table="lake.commissions__quarantine",
-        fact_table="lake.commissions__facts",
-        state_table="lake.commissions__state",
+        # 006.1 P-1: singular fact_table/state_table replaced by a per-type
+        # `fact_types` mapping -- this fixture just needs SOME valid spec.
+        fact_types={
+            "detail": {
+                "fact_table": "lake.commissions__facts",
+                "state_table": "lake.commissions__state",
+                "schema": {
+                    "columns": [{"name": "domain_id", "type": "string"}],
+                    "domain_id_col": "domain_id",
+                    "record_key": ["domain_id"],
+                },
+            }
+        },
         read={"dialect": {"format": "csv"}},
         raw_contract={"columns": [{"name": "id"}]},
     )
@@ -59,6 +72,7 @@ def _make_seed() -> context.BatchContext:
         sfn_redrive_count=0,
         read_spec_version=read_spec_version(spec.read),
         check_version=check_version(spec.raw_contract, spec.read),
+        checks_version=checks_version(spec.checks),
     )
 
 
@@ -204,3 +218,90 @@ def test_run_returns_the_seed_unchanged_when_stages_is_empty() -> None:
 
     assert final is seed
     assert fx.recorded == []
+
+
+# --- 007.1 §4.2's seven per-type BatchContext deltas, against the REAL
+# --- `_assert_set_once` (bead conveyer-6pg.17, B6) --------------------------
+#
+# The ledger-mappingproxy defect class has bitten before (`effects/
+# ledger.py::_row_from_run_fact`'s `dataclasses.asdict` + `copy.deepcopy`
+# choking on `types.MappingProxyType`, fixed bead conveyer-nvh.36) -- this
+# suite deliberately exercises the REAL reflective assertion end-to-end
+# through `run.run()` (never a hand-rolled `!=` comparison standing in for
+# it), with the new fields wrapped in `types.MappingProxyType` exactly as
+# `context.py`'s own construction-site convention documents, so a future
+# regression in `_assert_set_once`'s own MappingProxyType handling (there is
+# none today -- `!=` alone, no `asdict`/`deepcopy` in this code path) would
+# be caught here too.
+
+
+def _stage_commit(ctx: context.BatchContext, fx: _FakeFx) -> context.BatchContext:
+    return dataclasses.replace(
+        ctx,
+        facts_appended_by_table=MappingProxyType({"detail": 3}),
+        commit_snapshot_ids=MappingProxyType({"detail": 101}),
+        delta_predecessor_batch_ids=("batch-prev",),
+        delta_read_snapshot_ids=MappingProxyType({"detail": 55}),
+        delta_probe_refusal=None,
+    )
+
+
+def _stage_fold(ctx: context.BatchContext, fx: _FakeFx) -> context.BatchContext:
+    return dataclasses.replace(
+        ctx,
+        rows_merged_by_table=MappingProxyType({"detail": 3}),
+        fold_snapshot_ids=MappingProxyType({"detail": 202}),
+    )
+
+
+def _stage_fold_overwrites_a_commit_mapping_field(
+    ctx: context.BatchContext, fx: _FakeFx
+) -> context.BatchContext:
+    # illegal: facts_appended_by_table was already set by _stage_commit
+    return dataclasses.replace(ctx, facts_appended_by_table=MappingProxyType({"detail": 999}))
+
+
+def _stage_fold_overwrites_delta_predecessor_batch_ids(
+    ctx: context.BatchContext, fx: _FakeFx
+) -> context.BatchContext:
+    # illegal: delta_predecessor_batch_ids was already set by _stage_commit,
+    # to a DIFFERENT (non-default) tuple
+    return dataclasses.replace(ctx, delta_predecessor_batch_ids=("batch-other",))
+
+
+def test_run_allows_a_single_legitimate_set_of_all_seven_per_type_delta_fields() -> None:
+    seed = _make_seed()
+    fx = _FakeFx()
+    stages = (("commit", _stage_commit), ("fold", _stage_fold))
+
+    final = run.run(seed, fx, stages=stages)
+
+    assert dict(final.facts_appended_by_table) == {"detail": 3}
+    assert dict(final.commit_snapshot_ids) == {"detail": 101}
+    assert final.delta_predecessor_batch_ids == ("batch-prev",)
+    assert dict(final.delta_read_snapshot_ids) == {"detail": 55}
+    assert final.delta_probe_refusal is None
+    assert dict(final.rows_merged_by_table) == {"detail": 3}
+    assert dict(final.fold_snapshot_ids) == {"detail": 202}
+    assert [fact.outcome for fact in fx.recorded] == ["ok", "ok"]
+
+
+def test_run_trips_set_once_on_a_mappingproxytype_field_overwrite() -> None:
+    seed = _make_seed()
+    fx = _FakeFx()
+    stages = (("commit", _stage_commit), ("fold", _stage_fold_overwrites_a_commit_mapping_field))
+
+    with pytest.raises(AssertionError, match="facts_appended_by_table"):
+        run.run(seed, fx, stages=stages)
+
+
+def test_run_trips_set_once_on_a_delta_predecessor_batch_ids_overwrite() -> None:
+    seed = _make_seed()
+    fx = _FakeFx()
+    stages = (
+        ("commit", _stage_commit),
+        ("fold", _stage_fold_overwrites_delta_predecessor_batch_ids),
+    )
+
+    with pytest.raises(AssertionError, match="delta_predecessor_batch_ids"):
+        run.run(seed, fx, stages=stages)

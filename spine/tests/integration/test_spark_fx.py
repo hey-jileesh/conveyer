@@ -51,6 +51,7 @@ from snapshot_asserts import (
     snapshot_delta,
     snapshot_ids,
 )
+from spine.core.delta import MarkerRowWrite
 from spine.core.merge import MergeSpec
 from spine.core.model import (
     ColumnSpec,
@@ -310,8 +311,20 @@ def test_header_false_contract_with_a_required_column_is_rejected_at_spec_parse(
             transforms_module="pipelines.reader_probe.transforms",
             raw_table="db.reader_probe__raw",
             quarantine_table="db.reader_probe__quarantine",
-            fact_table="db.reader_probe__facts",
-            state_table="db.reader_probe__state",
+            # 006.1 P-1: singular fact_table/state_table replaced by a
+            # per-type `fact_types` mapping -- this fixture just needs SOME
+            # valid declaration, not to exercise fact-type semantics.
+            fact_types={
+                "probe": {
+                    "fact_table": "db.reader_probe__facts",
+                    "state_table": "db.reader_probe__state",
+                    "schema": {
+                        "columns": [{"name": "domain_id", "type": "string"}],
+                        "domain_id_col": "domain_id",
+                        "record_key": ["domain_id"],
+                    },
+                }
+            },
             fold="default-lww",
             domain_id_col="domain_id",
             co_effects={},
@@ -548,7 +561,7 @@ def test_read_table_resolves_current_snapshot_id(
 
     df, sid = local_runner_fx.read_table(bare)
 
-    assert sid == spark_fx._current_snapshot_id(spark, qt)
+    assert sid == spark_fx.current_snapshot_id(spark, qt)
     assert sorted(r["id"] for r in df.collect()) == ["1"]
 
 
@@ -563,7 +576,7 @@ def test_read_table_pin_is_perceived_under_a_concurrent_append(
     bare = _bare(qt)
     seed = spark.createDataFrame([("1", "b1")], ["id", "batch_id"])
     local_runner_fx.append(bare, seed, "b1", None)
-    sid_at_pin = spark_fx._current_snapshot_id(spark, qt)
+    sid_at_pin = spark_fx.current_snapshot_id(spark, qt)
 
     df, sid = local_runner_fx.read_table(bare)
     assert sid == sid_at_pin
@@ -578,7 +591,7 @@ def test_read_table_pin_is_perceived_under_a_concurrent_append(
     # the CURRENT (unpinned) table now has both rows -- proves the second
     # append really did commit, so the assertion above is meaningful
     assert spark.table(qt).count() == 2
-    assert spark_fx._current_snapshot_id(spark, qt) != sid_at_pin
+    assert spark_fx.current_snapshot_id(spark, qt) != sid_at_pin
 
 
 # --- read_batch: current-snapshot, column-object batch_id predicate [S-6] ---
@@ -695,7 +708,7 @@ def test_append_is_exactly_one_commit_r13_harness_self_test(
     new_id, summary = snapshot_delta(spark, qt, before)
     assert_stamped_batch(summary, "b1")
     assert summary.get("added-records") == "1"
-    assert new_id == spark_fx._current_snapshot_id(spark, qt)
+    assert new_id == spark_fx.current_snapshot_id(spark, qt)
 
 
 def test_snapshot_delta_harness_raises_on_zero_new_snapshots(
@@ -738,7 +751,7 @@ def test_resolve_batch_snapshot_hit(
 
     sid = local_runner_fx.resolve_batch_snapshot(bare, "b1", None)
 
-    assert sid == spark_fx._current_snapshot_id(spark, qt)
+    assert sid == spark_fx.current_snapshot_id(spark, qt)
 
 
 def test_resolve_batch_snapshot_miss_returns_none(
@@ -872,7 +885,7 @@ def test_merge_unique_child_of_before_id(
         ordering_cols=("event_time", "source_ts", "content_hash"),
         update_cols=("event_time", "source_ts", "content_hash", "payload"),
     )
-    before_id = spark_fx._current_snapshot_id(spark, qt)
+    before_id = spark_fx.current_snapshot_id(spark, qt)
     assert before_id is None  # zero-snapshot state table, pre-capture
 
     source = spark.createDataFrame([_row("a", _T1, "h1", "a")], _STATE_COLS)
@@ -880,7 +893,7 @@ def test_merge_unique_child_of_before_id(
 
     assert result.snapshot_id is not None
     assert result.snapshot_id != before_id
-    assert result.snapshot_id == spark_fx._current_snapshot_id(spark, qt)
+    assert result.snapshot_id == spark_fx.current_snapshot_id(spark, qt)
 
 
 # --- nvh.40 [F1]: own-commit attribution under a concurrent sibling fold ---
@@ -933,7 +946,7 @@ def test_merge_survives_a_sibling_commit_between_our_commit_and_resolution(
     # "current" (after both our commit AND the sibling's) must NOT be what
     # we attributed to ourselves -- proves the fix isn't accidentally
     # degenerating back to reading "current".
-    assert result.snapshot_id != spark_fx._current_snapshot_id(spark, qt)
+    assert result.snapshot_id != spark_fx.current_snapshot_id(spark, qt)
     rows = sorted((r["domain_id"], r["payload"]) for r in spark.table(qt).collect())
     assert rows == [("a", "our-update-a"), ("b", "sibling-b")]  # both commits really landed
 
@@ -1021,6 +1034,70 @@ def test_merge_unattributable_path_is_distinguishable_from_a_logical_no_op(
     assert unattributable_result == MergeResult(None, None, attributable=False)
 
 
+# --- U-2 (007.1 §7.2 path 10, coordinator wave 1c, same file family as -----
+# 6pg.35): a MISSING marker table at commit-stage read time is a stage
+# failure (retry), never the prior silent `()` degrade -- "there is
+# deliberately no fifth reason code for infrastructure" (§4's resolution-
+# and-probe paragraph). `read_marker_target`'s own tolerant `return ()`
+# (Phase-1 unreachable) and bind's pre-bootstrap probe (`entrypoints/
+# glue_main.py::_committed_tables`) both stay UNCHANGED, deliberately --
+# only the four marker primitives below carry the contract (conveyer-swb.22
+# F-2 extends it from the two reads here to `marker_row_present`/
+# `append_marker_row`, which used to raise a raw, unclassified pyspark
+# `AnalysisException` against a genuinely missing marker table instead).
+
+
+def test_read_marker_completions_raises_on_a_missing_marker_table(
+    local_runner_fx: RunnerFx, unique_table: Callable[[str], str]
+) -> None:
+    never_created = _bare(unique_table("never_created_markers"))
+    with pytest.raises(TransientError, match="does not exist"):
+        local_runner_fx.read_marker_completions(never_created, "feed-1")
+
+
+def test_read_marker_presence_raises_on_a_missing_marker_table(
+    local_runner_fx: RunnerFx, unique_table: Callable[[str], str]
+) -> None:
+    never_created = _bare(unique_table("never_created_markers"))
+    with pytest.raises(TransientError, match="does not exist"):
+        local_runner_fx.read_marker_presence(never_created, "feed-1")
+
+
+def test_marker_row_present_raises_on_a_missing_marker_table(
+    local_runner_fx: RunnerFx, unique_table: Callable[[str], str]
+) -> None:
+    """conveyer-swb.22 F-2: `marker_row_present` used to call `spark.
+    table(...)` directly with no existence guard, so a genuinely missing
+    marker table raised pyspark's raw `[TABLE_OR_VIEW_NOT_FOUND]`
+    `AnalysisException` instead of the documented `TransientError` -- fixed
+    to route through the SAME `_require_marker_table` guard `read_marker_
+    completions`/`read_marker_presence` above already use."""
+    never_created = _bare(unique_table("never_created_markers"))
+    with pytest.raises(TransientError, match="does not exist"):
+        local_runner_fx.marker_row_present(never_created, "batch-1", "commit", "some_table")
+
+
+def test_append_marker_row_raises_on_a_missing_marker_table(
+    local_runner_fx: RunnerFx, unique_table: Callable[[str], str]
+) -> None:
+    """conveyer-swb.22 F-2: `append_marker_row`'s own counterpart -- it used
+    to call `.writeTo(qt).append()` directly with no existence guard,
+    raising the same raw `AnalysisException` on a missing marker table."""
+    never_created = _bare(unique_table("never_created_markers"))
+    write = MarkerRowWrite(
+        batch_id="batch-1",
+        feed_id="feed-1",
+        stage="commit",
+        table_name="some_table",
+        delivery_key="dk-1",
+        delivery_content_hash="dch-1",
+        received_at=_T1,
+        committed_at=_T1,
+    )
+    with pytest.raises(TransientError, match="does not exist"):
+        local_runner_fx.append_marker_row(never_created, write)
+
+
 # --- CommitFailed/Validation/CommitStateUnknown -> TransientError [T-10] ----
 #
 # A genuine concurrent-commit conflict needs a second live writer racing the
@@ -1081,6 +1158,52 @@ def test_is_transient_iceberg_failure_false_for_other_exceptions(class_name: str
 
 def test_is_transient_iceberg_failure_false_for_a_plain_python_exception() -> None:
     assert spark_fx.is_transient_iceberg_failure(ValueError("boom")) is False
+
+
+# --- `_transient_commit_message` -- conveyer-6pg.35 item 1: `append_marker_
+# row`/`append`/`merge`'s three `TransientError` messages interpolated
+# `str(exc)`, contradicting this module's own never-`str(exc)` rule
+# (:319-326) -- a Java stack trace's first line reaching the ledger's
+# `error_message` column plus CloudWatch. Fixed to compose from
+# `java_exception_class_name(exc)` + `qt` only. Directly unit-tested here
+# (no live Spark session, no live py4j gateway needed) rather than through
+# `append`/`merge`/`append_marker_row` themselves, whose own `except`
+# branches stay `pragma: no cover` (module docstring: a genuine local
+# commit conflict needs a second live writer, impractical from one
+# local[2] JVM) -- the same "test the mapping function directly" choice
+# `is_transient_iceberg_failure`'s own tests above already make.
+
+
+def test_transient_commit_message_never_calls_str_on_the_caught_exception() -> None:
+    # `str()` on a real `Py4JJavaError` needs a live py4j gateway to render
+    # (it calls back into the JVM for the full remote stack trace) -- the
+    # duck-typed fake `java_exception` above has none, so `str(fake_exc)`
+    # itself raises `AttributeError`. This is the sharpest possible proof
+    # the fix's message composition never touches `str(exc)`: if it did,
+    # composing the message would raise the same way.
+    fake_exc = Py4JJavaError(
+        "An error occurred while calling o1.append.\n: java.lang.RuntimeException: "
+        "s3://secret-bucket/some/internal/object-path",
+        _FakeJavaException("org.apache.iceberg.exceptions.CommitFailedException"),
+    )
+    with pytest.raises(AttributeError):
+        str(fake_exc)  # the gateway-less fake proves `str()` itself is unsafe here
+    msg = spark_fx._transient_commit_message("append to", "spine_cat.db.t", fake_exc)
+    assert msg == (
+        "append to spine_cat.db.t failed: org.apache.iceberg.exceptions.CommitFailedException"
+    )
+    assert "secret-bucket" not in msg
+    assert "RuntimeException" not in msg
+
+
+def test_transient_commit_message_omits_message_text_for_a_plain_python_exception() -> None:
+    # No `java_exception` attribute -> `java_exception_class_name` returns
+    # "" (defensive), never falling back to `str(exc)`.
+    msg = spark_fx._transient_commit_message(
+        "merge into", "spine_cat.db.t", ValueError("row values leaked here")
+    )
+    assert "row values leaked here" not in msg
+    assert msg == "merge into spine_cat.db.t failed: "
 
 
 def test_append_reraises_a_non_transient_failure_untouched(

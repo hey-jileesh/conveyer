@@ -104,6 +104,15 @@ MUST_FAIL_CASES: list[tuple[str, str, tuple[str, ...]]] = [
         "spine/frames/x.py",
         ("purity-banned-attr:count",),
     ),
+    # [DC2-2] (bead conveyer-6pg.23, B11-local): `.overwrite(` on a state
+    # table, OUTSIDE the one blessed rebuild/swap module -- simulated at a
+    # generic `spine/effects/**` path, deliberately NOT the exempted
+    # `spine/effects/rebuild.py` rel_path.
+    (
+        "fail_effects_state_overwrite.py",
+        "spine/effects/x.py",
+        ("purity-banned-attr:overwrite",),
+    ),
 ]
 
 MUST_PASS_CASES: list[tuple[str, str]] = [
@@ -119,6 +128,14 @@ MUST_PASS_CASES: list[tuple[str, str]] = [
     # `spine/core/reading.py` the allowlist entry names, since the engine
     # keys allowlist membership off `(rel_path, function_name)`.
     ("pass_core_parse_line_try.py", "spine/core/reading.py"),
+    # 006.1 §13.4 item 3 (bead conveyer-6pg.14, B4): the corpus's own
+    # exercise of "the new `sqlglot` dependency, core profile permits it" --
+    # modeled on `spine/core/check_grammar.py`'s real import shape.
+    ("pass_core_check_grammar.py", "spine/core/x.py"),
+    # [DC2-2] (bead conveyer-6pg.23, B11-local): the IDENTICAL `.overwrite(`
+    # shape as the MUST-FAIL case above, but simulated at the ONE blessed
+    # module's own exact rel_path -- `banned_attr_exemption` licenses it.
+    ("pass_effects_rebuild_overwrite.py", "spine/effects/rebuild.py"),
 ]
 
 
@@ -194,6 +211,37 @@ def test_string_sql_exemption_targets_a_real_function(rel_path: str, function_na
     assert string_sql == [], f"unexpected string-SQL violations in {rel_path}: {string_sql}"
 
 
+@pytest.mark.parametrize("rel_path,attr_name", sorted(_CONFIG.banned_attr_exemption))
+def test_banned_attr_exemption_targets_a_real_file_and_stays_clean(
+    rel_path: str, attr_name: str
+) -> None:
+    """007.1 [DC2-2]/[DS2-2] (bead conveyer-6pg.23, B11-local): every
+    `(rel_path, attr_name)` pair in `banned_attr_exemption` still names a
+    real file (not a stale name after a rename), and linting that REAL file
+    reports zero `purity-banned-attr:<attr_name>` violations -- the same
+    "real function, zero real violations" pattern `test_string_sql_
+    exemption_targets_a_real_function` already establishes for the sibling
+    exemption mechanism, applied to this new one."""
+    root = Path(__file__).resolve().parents[2]  # .../conveyer/spine
+    path = root / rel_path
+    assert path.is_file(), f"banned_attr_exemption names a missing file: {rel_path}"
+
+    violations = purity_linter.lint_file(path, root, _CONFIG)
+    banned_attr = [v for v in violations if v.rule == f"purity-banned-attr:{attr_name}"]
+    assert banned_attr == [], f"unexpected banned-attr violations in {rel_path}: {banned_attr}"
+
+
+def test_banned_attr_exemption_is_scoped_to_its_own_file_only() -> None:
+    """The exemption must not blanket-relax the `overwrite` ban across all
+    of `spine/effects/**` -- the IDENTICAL `.overwrite(` shape, simulated
+    at any OTHER rel_path under the same profile, must still fail."""
+    source = _fixture_source("pass_effects_rebuild_overwrite.py")
+    violations = purity_linter.lint_source(source, "spine/effects/not_rebuild.py", _CONFIG)
+    assert any(v.rule == "purity-banned-attr:overwrite" for v in violations), (
+        f"expected the ban to fire outside the exempted file, got {violations}"
+    )
+
+
 @pytest.mark.parametrize(
     "rel_path",
     [
@@ -264,3 +312,59 @@ def test_main_returns_zero_against_the_real_spine_root(capsys: pytest.CaptureFix
 
     assert exit_code == 0
     assert out == ""
+
+
+# --- [DS-4]/[DS2-2] CODEOWNERS (conveyer-6pg.35 item 3; widened by F-1/F-3, --
+# security gate `wf_c9aadeb2-8eb`, this bead conveyer-swb.30) ----------------
+# 006.1 §16.8's approver pair (platform data-architecture owner + security-
+# gate countersign) governs growth of `core/check_grammar.py`/its corpus AND
+# -- 007.1 §15/§16's [DC2-2]/[DS2-2] extension -- growth of THIS linter
+# engine's banned-attribute profile or its per-file exemption list. F-3
+# widens the governed set to the files 006.1 §16.8's own row already NAMED
+# in prose but CODEOWNERS never mechanically covered: the grammar engine
+# itself, its G-07/G-08 corpus tests, and (F-1's own subject this same
+# bead) the per-pipeline IAM policy document the "never database-wide"
+# invariant is expressed in. Asserts the CODEOWNERS artifact covers every
+# governed file identically (never that GitHub actually enforces
+# two-reviewer count today -- this repo has exactly one accredited
+# identity; see the file's own header comment for the recorded gap).
+
+_CODEOWNERS_GOVERNED_PATHS = (
+    "tools/purity_linter.py",
+    "tools/linter_configs/spine.py",
+    "spine/spine/core/check_grammar.py",
+    "spine/tests/unit/test_check_grammar.py",
+    "spine/spine/probes/g08_parity.py",
+    "spine/tests/frames/test_business_checks.py",
+    "spine/terraform/modules/spine-pipeline/iam.tf",
+)
+
+
+def test_codeowners_covers_the_linter_engine_and_config() -> None:
+    repo_root = Path(__file__).resolve().parents[3]  # .../conveyer (repo root)
+    codeowners_path = repo_root / ".github" / "CODEOWNERS"
+    assert codeowners_path.is_file(), "expected .github/CODEOWNERS at the repo root"
+
+    owned: dict[str, list[str]] = {}
+    for line in codeowners_path.read_text(encoding="utf-8").splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        path, *owners = stripped.split()
+        owned[path] = owners
+
+    for governed in _CODEOWNERS_GOVERNED_PATHS:
+        assert governed in owned, f"CODEOWNERS is missing the [DS-4]/[DS2-2] entry: {governed}"
+        assert owned[governed], f"CODEOWNERS lists no owner for {governed}"
+
+    # Every governed file is ONE pair's surface (§15's own framing: "an
+    # exemption is precisely a licensed hole in the construction") -- they
+    # must all carry the IDENTICAL owner set, never allowed to drift apart
+    # into a laxer review bar for any one of them.
+    owner_sets = {governed: set(owned[governed]) for governed in _CODEOWNERS_GOVERNED_PATHS}
+    first_governed, first_owners = next(iter(owner_sets.items()))
+    for governed, owners in owner_sets.items():
+        assert owners == first_owners, (
+            f"CODEOWNERS owner set for {governed!r} ({owners}) drifted from "
+            f"{first_governed!r} ({first_owners}) -- this is one governed pair, not several"
+        )

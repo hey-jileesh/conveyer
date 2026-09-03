@@ -1,0 +1,94 @@
+[
+  {
+    "value": {
+      "effective_date": {
+        "$date": "2026-06-30"
+      }
+    },
+    "canonical": "{\"effective_date\":\"2026-06-30\"}",
+    "sha256": "f1540e8f695d43872a5fed0e989cf2f9772da5db52930382e68583b1ba1c7126"
+  },
+  {
+    "value": {
+      "event_time": {
+        "$timestamp": "2026-01-02T03:04:05-05:00"
+      }
+    },
+    "canonical": "{\"event_time\":\"2026-01-02T08:04:05.000000Z\"}",
+    "sha256": "aaf6dea8c2244a1de6cc48730b48583e84f118b978fe6387ed13597eb1a0f496"
+  },
+  {
+    "value": {
+      "unit_price": {
+        "$decimal": "1.2"
+      }
+    },
+    "canonical": "{\"unit_price\":\"1.2\"}",
+    "sha256": "9039190ed1cc59d5043455e50ab02f22714cf39c368105707d7fa8ff3da3d1cb"
+  },
+  {
+    "value": {
+      "unit_price": {
+        "$decimal": "1.20"
+      }
+    },
+    "canonical": "{\"unit_price\":\"1.20\"}",
+    "sha256": "6b58c0a637b1877e5f3f830115536b2f76aee196cf83a4f1f7fc3686a803481c"
+  },
+  {
+    "value": {
+      "line_seq": 9223372036854775807
+    },
+    "canonical": "{\"line_seq\":9223372036854775807}",
+    "sha256": "3013b55123beceac909818b52d2b8215e79bb161cfbf69cf88e9c55b000b22ca"
+  },
+  {
+    "value": {
+      "line_seq": -9223372036854775808
+    },
+    "canonical": "{\"line_seq\":-9223372036854775808}",
+    "sha256": "ab54c0ead638c4d2a9ee968954aefb213b3781c47eab38ef64940155321f50a3"
+  },
+  {
+    "value": {
+      "adjustment_qty": -7
+    },
+    "canonical": "{\"adjustment_qty\":-7}",
+    "sha256": "b47f9c136e6148873b838a8f377520c188ef3ed75f9ad266804631aa1250c204"
+  },
+  {
+    "value": {
+      "label": "\u00e9"
+    },
+    "canonical": "{\"label\":\"\u00e9\"}",
+    "sha256": "59a69e5a8f92914b2096dd10b10431fe5c21baa7990508f95718e2f40fc718db"
+  },
+  {
+    "value": {
+      "label": "e\u0301"
+    },
+    "canonical": "{\"label\":\"e\u0301\"}",
+    "sha256": "bf1c0db8e2dcab417156b09650994aeebd8c0275198748bccb42f0b97de669c2"
+  },
+  {
+    "value": {
+      "label": "🀄"
+    },
+    "canonical": "{\"label\":\"🀄\"}",
+    "sha256": "9e8b0a8ef08ca64b7a7cb5c81c4a1b4577841742bbeb403870efbecf78795a6e"
+  },
+  {
+    "value": {
+      "label": "�"
+    },
+    "canonical": "{\"label\":\"�\"}",
+    "sha256": "0a2c93041f67be00f9f5ec8fdabf70ce9d16acb054dc482d3e685b048328ca7d"
+  },
+  {
+    "value": {
+      "note": "a\",\"b\":\"c"
+    },
+    "canonical": "{\"note\":\"a\\\",\\\"b\\\":\\\"c\"}",
+    "sha256": "b64ebd65682137d02d5d84be8c76c80d52b548b7a13d8120ccdf3292aba0aada"
+  }
+]

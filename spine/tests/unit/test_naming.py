@@ -132,6 +132,24 @@ def test_qualified_rejects_invalid_identifier_component() -> None:
         naming.qualified("lake.bad table")
 
 
+def test_check_qualified_table_accepts_a_component_at_exactly_the_length_cap() -> None:
+    # F-6 (security gate `wf_c9aadeb2-8eb`, LOW): 255 is the AWS Glue Data
+    # Catalog table/database name limit -- exactly at the cap still admits.
+    value = f"lake.{'a' * 255}"
+    assert naming.check_qualified_table(value) == value
+
+
+def test_check_qualified_table_rejects_a_component_one_over_the_length_cap() -> None:
+    with pytest.raises(ValueError, match="exceed 255 chars"):
+        naming.check_qualified_table(f"lake.{'a' * 256}")
+
+
+def test_check_qualified_table_rejects_an_over_long_database_component_too() -> None:
+    # Every dot-component is checked, not just the trailing one.
+    with pytest.raises(ValueError, match="exceed 255 chars"):
+        naming.check_qualified_table(f"{'a' * 256}.facts")
+
+
 # --- execution_name / rerun grammar -------------------------------------------
 
 
@@ -274,6 +292,61 @@ def test_check_object_uris_rejects_wrong_received_at() -> None:
         )
 
 
+# --- `_format_received_at` overflow guard (conveyer-azr.25, the azr.24 -----
+# arithmetic pre-check idiom applied here too): an aware `received_at` at/
+# near `datetime.min`/`datetime.max` with a UTC offset that walks the
+# instant outside `[MINYEAR, MAXYEAR]` must reject via `ValueError`, never
+# propagate `.astimezone(UTC)`'s bare `OverflowError` -- exercised through
+# the public `check_object_uris` boundary (mirrors `test_canonical.py`'s own
+# choice to test `_timestamp_str`'s identical guard through the public
+# `canonical_json`, never the private helper directly).
+
+
+def test_check_object_uris_rejects_received_at_overflowing_past_minyear() -> None:
+    # An aware value AT `datetime.min` with a positive UTC offset walks the
+    # UTC-converted instant below MINYEAR (there is no year 0).
+    dt = datetime(1, 1, 1, 0, 0, tzinfo=timezone(timedelta(hours=5)))
+    with pytest.raises(ValueError, match="out of representable range"):
+        naming.check_object_uris(
+            feed_id="carrier-a/feed-1",
+            delivery_id=_U5,
+            received_at=dt,
+            object_uris=[],
+            landing_bucket="conveyer-dev-lake",
+        )
+
+
+def test_check_object_uris_rejects_received_at_overflowing_past_maxyear() -> None:
+    # Symmetric edge: an aware value AT `datetime.max` with a negative UTC
+    # offset walks the UTC-converted instant above MAXYEAR.
+    dt = datetime(9999, 12, 31, 23, 59, 59, 999999, tzinfo=timezone(timedelta(hours=-5)))
+    with pytest.raises(ValueError, match="out of representable range"):
+        naming.check_object_uris(
+            feed_id="carrier-a/feed-1",
+            delivery_id=_U5,
+            received_at=dt,
+            object_uris=[],
+            landing_bucket="conveyer-dev-lake",
+        )
+
+
+def test_check_object_uris_accepts_received_at_exactly_at_the_representable_boundary() -> None:
+    # The exact-microsecond boundary (offset consuming the remaining span
+    # EXACTLY) must NOT reject -- the pre-check's `>`/`<` (not `>=`/`<=`)
+    # comparisons are the load-bearing detail (conveyer-azr.24's own
+    # kernel-verified boundary case, reapplied here).
+    offset = timedelta(hours=2)
+    naive = datetime.min + offset
+    dt = naive.replace(tzinfo=timezone(offset))
+    naming.check_object_uris(
+        feed_id="carrier-a/feed-1",
+        delivery_id=_U5,
+        received_at=dt,
+        object_uris=[],
+        landing_bucket="conveyer-dev-lake",
+    )
+
+
 def test_check_object_uris_rejects_one_bad_uri_among_many() -> None:
     fixture = json.loads((_FIXTURES_DIR / "v1-multi-object.json").read_text())
     received_at = datetime.fromisoformat(fixture["received_at"])
@@ -361,3 +434,75 @@ def test_check_object_uris_accepts_single_clean_object_name() -> None:
         object_uris=[_uri_with_suffix(fixture, "some-other-clean-name.csv")],
         landing_bucket="conveyer-dev-lake",
     )
+
+
+# --- `table_slug`/`markers_table`/`table_class_inventory_uri` (007.1 §6.3/
+# §6.5, bead conveyer-6pg.18, B7) -- identifier-grammar-safe table naming,
+# deliberately DIFFERENT from `slug()` (see `table_slug`'s own docstring for
+# why `slug()`'s "--"-joined form must never compose an actual identifier).
+
+
+def test_table_slug_takes_the_trailing_segment() -> None:
+    assert naming.table_slug("pipelines/identity") == "identity"
+
+
+def test_table_slug_is_a_noop_for_a_single_segment_pipeline() -> None:
+    assert naming.table_slug("commissions") == "commissions"
+
+
+def test_table_slug_takes_the_last_segment_of_a_deeper_path() -> None:
+    assert naming.table_slug("a/b/c") == "c"
+
+
+def test_table_slug_never_contains_a_dash_separator_for_the_multi_segment_case() -> None:
+    # The whole point: unlike `slug()`, no NEW "--" is ever introduced by
+    # the join -- `table_slug`'s output is always a legal `check_qualified_
+    # table` identifier component for a pipeline whose trailing segment
+    # itself contains no hyphen.
+    assert "--" not in naming.table_slug("pipelines/identity")
+
+
+def test_table_slug_rejects_a_malformed_pipeline() -> None:
+    with pytest.raises(ValueError):
+        naming.table_slug("Bad/Pipeline")
+
+
+def test_markers_table_derives_db_from_raw_table_and_slug_from_pipeline() -> None:
+    assert (
+        naming.markers_table("conveyer_dev_lake.identity__raw", "pipelines/identity")
+        == "conveyer_dev_lake.identity__markers"
+    )
+
+
+def test_markers_table_output_is_a_legal_qualified_table_identifier() -> None:
+    result = naming.markers_table("conveyer_dev_lake.identity__raw", "pipelines/identity")
+    assert naming.check_qualified_table(result) == result  # does not raise
+
+
+def test_markers_table_rejects_a_malformed_raw_table() -> None:
+    with pytest.raises(ValueError):
+        naming.markers_table("not-a-qualified-table", "pipelines/identity")
+
+
+def test_table_class_inventory_uri_replaces_the_spec_filename() -> None:
+    assert (
+        naming.table_class_inventory_uri(
+            "s3://some-artifacts-bucket/spine/specs/pipelines--identity/pipeline.yaml"
+        )
+        == "s3://some-artifacts-bucket/spine/specs/pipelines--identity/table-classes.json"
+    )
+
+
+def test_table_class_inventory_uri_works_for_file_scheme() -> None:
+    assert (
+        naming.table_class_inventory_uri("file:///tmp/specs/pipelines--identity/pipeline.yaml")
+        == "file:///tmp/specs/pipelines--identity/table-classes.json"
+    )
+
+
+def test_commit_completion_sentinel_is_outside_the_identifier_grammar() -> None:
+    # 007.1 §6.3 answer 1: "by grammar, not by convention" -- proven here
+    # against the SAME `check_qualified_table` a real table name must pass,
+    # not a re-derived regex.
+    with pytest.raises(ValueError):
+        naming.check_qualified_table(f"lake.{naming.COMMIT_COMPLETION_SENTINEL}")

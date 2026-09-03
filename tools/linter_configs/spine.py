@@ -59,7 +59,22 @@ not by the real walk.
   plus a string-SQL review rule [S-6]: f-strings/`format`/`%` feeding
   `where`, `filter`, `selectExpr`, or `spark.sql` are banned — the rendered
   MERGE in `effects/spark.py` is the single hardcoded exemption (by `(file,
-  function)`, the ingestion exemption mechanism).
+  function)`, the ingestion exemption mechanism). **[DC2-2] (007.1 §9.2/§15,
+  bead `conveyer-6pg.23`, B11-local):** a banned attribute name, `overwrite`
+  — RB-2's "no state-table overwrite missing both `validate-from-snapshot-
+  id` and `isolation-level=serializable`" — licensed in exactly ONE file by
+  `banned_attr_exemption` (a `(rel_path, attr_name)` pair set, the per-file
+  exemption mechanism `tools/purity_linter.py` gained THIS bead — it did not
+  exist before): `spine/effects/rebuild.py`, the one blessed rebuild/swap
+  module (the effects layer's sole owner of SQL rendering; that module
+  renders no SQL overwrite of a state table either — `INSERT OVERWRITE` has
+  no construction site in this codebase). Every other file under either
+  path prefix reports `purity-banned-attr:overwrite` on any `.overwrite(`
+  call. `[DS2-2]`: growth of this profile's `banned_attr_names` or of
+  `banned_attr_exemption` carries 006.1 §16.8's [DS-4] approver pattern
+  (platform data-architecture owner + security-gate countersign) — an
+  exemption is a licensed hole in the construction, never an ordinary
+  review.
 * Package-wide (`path_prefixes=(("spine",), ("pipelines",))`, matching
   every file under both of `CONFIG.walk_roots`, F3(b)): a single banned
   import of `awsglue` (I-14, "no awsglue anywhere in spine/") — this is the
@@ -145,12 +160,53 @@ import purity_linter
 # loop turns the generator-exhaustion signal into a plain return, rather
 # than letting `StopIteration` escape as a raised exception -- same
 # `purity-try` shape as `parse_line`'s own `csv.Error` conversion.
+#
+# 006.1 B0 (bead conveyer-6pg.10, n-check-grammar) addition --
+# `check_grammar.py::_parse_expression` needs `try` for the same
+# defects-as-values reason as `parse_line`/`multiline_records`: sqlglot's
+# `parse_one` raises `SqlglotError` (a `ParseError`/`TokenError` subclass)
+# on malformed authored text, including a well-formed-looking but
+# syntactically incomplete fragment (`"a AND"`, sqlglot's default error
+# level raises for this immediately rather than returning a partial tree)
+# -- `_parse_expression` converts that raise into a returned `None`, per
+# `validate_expression`'s own totality contract (§6.4).
+#
+# 006.1 B0 (bead conveyer-6pg.10, n-check-grammar) addition --
+# `model.py::parse_pipeline_spec_yaml` is a plain raise-only helper (not a
+# `@field_validator`/`@model_validator`), same shape as `parse_column_type`:
+# it raises a plain `ValueError` (`bind-defect/duplicate-key: ...`) itself
+# on a genuine duplicate YAML mapping key (§4's strict-loader obligation,
+# S1) -- no `try` involved, just a bare `raise`, exempt for the same
+# raise-only-helper reason as this list's other `model.py` entries.
+# `_check_id_not_reserved`/`_check_reason` are the SAME shape again: plain
+# validator-SUPPORT helpers (K1/[AE-6], K6 -- BOTH of K6's halves, grammar
+# then framework-reserved, folded into the one `_check_reason` function
+# [M7 critique fix]: a separate `_check_reason_grammar` raise-only helper
+# beside `_check_reason` was a needless `_TRY_RAISE_ALLOWLIST` growth,
+# [DS2-2]'s own gate, when one function raising both named codes in
+# sequence needs only the one entry below) shared across `RowCheckModel`/
+# `MembershipCheckModel`/`BatchCheckModel`'s own `@field_validator`s, not
+# themselves decorated -- `_check_pipeline_slug_grammar`'s own precedent,
+# restated once more for the check-kind models.
+#
+# 006.1 B0 (bead conveyer-6pg.10, n-check-grammar) addition -- absorbs
+# `conveyer-azr.25`: `naming.py::_format_received_at` gains the SAME
+# arithmetic-pre-check-then-raise idiom `canonical.py::_timestamp_str`
+# already carries (`conveyer-azr.24`) for the identical `OverflowError`
+# root cause (an aware datetime at/near `datetime.min`/`.max` whose UTC
+# conversion falls outside `[MINYEAR, MAXYEAR]`) -- a bare `raise
+# ValueError(...)`, no `try`, same raise-only-helper shape as this list's
+# other `naming.py` entries.
 _TRY_RAISE_ALLOWLIST: frozenset[tuple[str, str]] = frozenset(
     {
         ("spine/core/model.py", "_check_pipeline_slug_grammar"),
         ("spine/core/model.py", "check_qualified_table"),
         ("spine/core/model.py", "_check_single_ascii_printable"),
+        ("spine/core/model.py", "parse_pipeline_spec_yaml"),
+        ("spine/core/model.py", "_check_id_not_reserved"),
+        ("spine/core/model.py", "_check_reason"),
         ("spine/core/naming.py", "_check_pipeline_slug_grammar"),
+        ("spine/core/naming.py", "_format_received_at"),
         ("spine/core/naming.py", "execution_name"),
         ("spine/core/naming.py", "rerun_execution_name"),
         ("spine/core/naming.py", "check_object_uris"),
@@ -161,6 +217,7 @@ _TRY_RAISE_ALLOWLIST: frozenset[tuple[str, str]] = frozenset(
         ("spine/core/contract.py", "parse_column_type"),
         ("spine/core/reading.py", "parse_line"),
         ("spine/core/reading.py", "multiline_records"),
+        ("spine/core/check_grammar.py", "_parse_expression"),
     }
 )
 
@@ -244,12 +301,17 @@ _FRAMES_TRANSFORMS_BANNED_IMPORT_ROOTS: tuple[str, ...] = (
 # aggregate today (verified: zero real-tree hits), so this ban is safe to
 # add outright — but `_attr_name_violations` (`tools/purity_linter.py`)
 # flags a bare attribute name regardless of receiver, so `F.count(...)`
-# WOULD trip this same rule the day one is genuinely needed. Unlike
-# `try_raise_allowlist`/`string_sql_exemption`, `banned_attr_names` has NO
-# `(file, function)` exemption mechanism yet (`_attr_name_violations` never
-# consults one) — a future bead needing a real `F.count` aggregate under
-# `frames/**` must add that exemption mechanism to `tools/purity_linter.py`
-# first, not silently work around this ban.
+# WOULD trip this same rule the day one is genuinely needed. Historical
+# note, now resolved (007.1 [DC2-2], bead `conveyer-6pg.23`, B11-local):
+# this comment used to record that `banned_attr_names` had NO `(file,
+# function)` exemption mechanism at all — that gap is what B11-local's
+# `.overwrite(` ban (below, `_EFFECTS_STAGES_PROFILE`) needed closed FIRST,
+# and did, in `tools/purity_linter.py`'s own engine (`LinterConfig.
+# banned_attr_exemption`, a `(rel_path, attr_name)` pair set,
+# `_attr_name_violations` now consults it). A real `F.count` aggregate under
+# `frames/**` could use the identical mechanism the day one is genuinely
+# needed — this ban itself is left as-is (no exemption entry exists for
+# `count`, `frames/**` still bans it outright).
 _SPARK_BANNED_ATTR_NAMES: frozenset[str] = frozenset(
     {
         "SparkSession",
@@ -326,14 +388,79 @@ _FRAMES_TRANSFORMS_PROFILE = purity_linter.ScopeProfile(
     string_sql_sinks=_STRING_SQL_SINKS,
 )
 
+# [DC2-2] (007.1 §9.2/§15's final row, bead `conveyer-6pg.23`, B11-local):
+# `.overwrite(` on a state table, missing either `validate-from-snapshot-id`
+# or `isolation-level=serializable`, is the RB-2 "swap that blindly wins"
+# hazard — empirically reconfirmed, this bead's own kernel probe: alone,
+# `validate-from-snapshot-id` is silently ignored by the `OverwriteByFilter`
+# path. `_attr_name_violations` cannot distinguish a well-formed two-option
+# call from a bare one (it flags the ATTRIBUTE NAME alone, not its call
+# arguments — the same best-effort AST posture every other `banned_attr_
+# names` entry already accepts) — banning `overwrite` outright, everywhere
+# under `spine/effects/**`/`spine/stages/**`, and licensing exactly ONE
+# construction site via `_BANNED_ATTR_EXEMPTION` below is therefore §15's
+# own "construction, named [DC2-2]" reading: the ONE place `.overwrite(`
+# may appear at all is `spine/effects/rebuild.py::attempt_state_swap`
+# (the effects layer's sole owner of SQL/write rendering, per that
+# module's own docstring) — every other file under either path prefix
+# reports `purity-banned-attr:overwrite` on ANY `.overwrite(` call,
+# regardless of its options.
+_STATE_OVERWRITE_BANNED_ATTR_NAMES: frozenset[str] = frozenset({"overwrite"})
+
+# [DS2-2] governance note (007.1 §16.1 [DC2-2], carried verbatim in
+# substance): growth of EITHER this profile's `banned_attr_names` OR of
+# `_BANNED_ATTR_EXEMPTION` below is NOT an ordinary code-review change — an
+# exemption is precisely a licensed hole in the construction §15's final
+# row leans on to make RB-2's "no --force path" hold BY CONSTRUCTION, not
+# by discipline. The same approver pattern 006.1 §16.8's [DS-4] names
+# (platform data-architecture owner + security-gate countersign) applies to
+# any PR touching either set — this comment IS that requirement's recorded
+# site, not a substitute for actually routing the review.
+_BANNED_ATTR_EXEMPTION: frozenset[tuple[str, str]] = frozenset(
+    {
+        ("spine/effects/rebuild.py", "overwrite"),
+    }
+)
+
+# [DS2-2] annotation (2026-09-01, bead conveyer-6pg.33 -- erratum note per
+# house convention, design/adr-oq5-batch-progress-grain.md:62's annotation
+# shape adapted to this file's own comment form; the [DS2-2] governance
+# note above stands unaltered): naming two residuals that note leaves
+# implicit.
+#
+# **Path-scope residual.** The `.overwrite(` MECHANICAL ban covers only
+# `_EFFECTS_STAGES_PROFILE`'s two path prefixes (`spine/effects/**`,
+# `spine/stages/**`) -- `spine/bootstrap/**`/`spine/entrypoints/**` carry NO
+# `banned_attr_names` entry for `overwrite` at all, and both directories
+# legitimately use `spark.sql(...)` for real deploy-principal DDL (`CREATE
+# TABLE`/`ALTER TABLE`/`SET TBLPROPERTIES` -- `bootstrap/create_record_
+# tables.py`'s/`create_admission_tables.py`'s own account); a SQL `INSERT
+# OVERWRITE` string authored there would not be caught by this linter at
+# all. This is 007.1 §9.2's OWN "SQL INSERT OVERWRITE ... grep-shaped
+# audit ... detection-in-depth" half of the rule (§9.2, the [DC2-2]
+# construction row), applying VERBATIM -- never a mechanical AST check
+# anywhere in this repo, by that section's own design, not an oversight
+# introduced here; the risk is PRICED (deploy-time DDL under a different,
+# out-of-band-reviewed principal), not silently accepted.
+#
+# **[DS-4] approver-pattern residual.** The "approver pattern ... applies"
+# sentence in the note above is DISCIPLINE, stated plainly here -- a
+# comment recording the requirement, not a mechanical CODEOWNERS route or
+# any other CI-enforced gate. A PR touching `banned_attr_names`/
+# `_BANNED_ATTR_EXEMPTION` above is not blocked by any tooling from merging
+# without the named review; this comment is the audit trail for "was this
+# reviewed," not a gate that makes skipping it impossible.
+
 # "spine/effects/** + spine/stages/**: idiom rules plus a string-SQL review
 # rule" (§12.3) — idiom-class applies to all of spine/** already (engine-wide
-# below); this profile only carries the string-SQL sink names (shared with
-# `_FRAMES_TRANSFORMS_PROFILE` above, see `_STRING_SQL_SINKS`'s own note).
+# below); this profile carries the string-SQL sink names (shared with
+# `_FRAMES_TRANSFORMS_PROFILE` above, see `_STRING_SQL_SINKS`'s own note) plus
+# (B11-local, [DC2-2]) the `.overwrite(` ban above.
 _EFFECTS_STAGES_PROFILE = purity_linter.ScopeProfile(
     name="effects-stages",
     path_prefixes=(("spine", "effects"), ("spine", "stages")),
     string_sql_sinks=_STRING_SQL_SINKS,
+    banned_attr_names=_STATE_OVERWRITE_BANNED_ATTR_NAMES,
 )
 
 # I-14: "no awsglue anywhere in spine/" — a package-wide rule, not scoped to
@@ -376,9 +503,22 @@ _VALIDATOR_DECORATOR_NAMES: frozenset[str] = frozenset(
 )
 
 # TransientError exempted by config as in ingestion (§12.3 last bullet).
+#
+# `LedgerConfig`/`SessionConfig` (bead conveyer-swb.25, M3/F2) — narrow
+# structural-typing `Protocol`s, not dataclasses/pydantic models/enums:
+# `effects/ledger.py::build_catalog`/`build_record_run` and `entrypoints/
+# session.py::catalog_conf`/`build_session` are typed against exactly the
+# few fields they read, so `spine.config.RunnerConfig` AND `entrypoints/
+# rebuild_main.py::RebuildConfig` (two DIFFERENT concrete dataclasses)
+# satisfy them BOTH without either inheriting from the other or from a
+# shared base — the whole point of a `Protocol` over a dataclass here, and
+# the `_is_allowed_class` rule has no other shape for it (a `Protocol` is
+# neither a frozen dataclass, a pydantic `BaseModel`, nor an enum base).
 _CLASS_SHAPE_ALLOWLIST: frozenset[tuple[str, str]] = frozenset(
     {
         ("spine/effects/records.py", "TransientError"),
+        ("spine/effects/ledger.py", "LedgerConfig"),
+        ("spine/entrypoints/session.py", "SessionConfig"),
     }
 )
 
@@ -397,10 +537,19 @@ _CLASS_SHAPE_ALLOWLIST: frozenset[tuple[str, str]] = frozenset(
 # (backticks doubled, `core/merge.py::quote_identifier`'s rule) and the
 # compiler's own rendering of the parsed `ColumnType` (never authored/
 # free-form text) — the §6.7-merge-render precedent this bead follows.
+#
+# 006.1 §13.4 item 1 addition — `frames/business_checks.py::_compiled_expr`
+# (§7.1): the ONE `F.expr(...)` call site business-check row expressions
+# execute through, over `ValidatedExpr.authored_text` (byte-exact — the
+# gatekeeper-accepted, gate-1-re-derived string, never the raw authored
+# `RowCheckModel.expr` field, §6.4's executed-text rule) — the exact
+# `_typed_expr` precedent, restated for the post_check interpreter's own
+# string-SQL sink.
 _STRING_SQL_EXEMPTION: frozenset[tuple[str, str]] = frozenset(
     {
         ("spine/effects/spark.py", "render_merge"),
         ("spine/frames/checks.py", "_typed_expr"),
+        ("spine/frames/business_checks.py", "_compiled_expr"),
     }
 )
 
@@ -431,4 +580,5 @@ CONFIG = purity_linter.LinterConfig(
     validator_decorator_names=_VALIDATOR_DECORATOR_NAMES,
     class_shape_allowlist=_CLASS_SHAPE_ALLOWLIST,
     string_sql_exemption=_STRING_SQL_EXEMPTION,
+    banned_attr_exemption=_BANNED_ATTR_EXEMPTION,
 )

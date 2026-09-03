@@ -97,8 +97,32 @@ locals {
   # property test (naming.py, S5/S12.4) -- this module's `validation` block
   # below re-checks the grammar itself (not injectivity, which is a
   # property over the whole function, not a single value) before any
-  # ARN/name composition, per S5's own instruction.
+  # ARN/name composition, per S5's own instruction. USED for ARN/name/
+  # execution-path composition ONLY (job name, IAM role name) -- NOT for
+  # any Iceberg/Glue TABLE identifier (see `local.table_slug` immediately
+  # below for why).
   slug = replace(var.pipeline, "/", "--")
+
+  # F-1 fix (security gate `wf_c9aadeb2-8eb`, MEDIUM): the pipeline's own
+  # TRAILING `/`-segment -- mirrors `core/naming.py::table_slug` EXACTLY
+  # (`pipeline.rsplit("/", 1)[-1]`), the canonical slug for composing any
+  # Iceberg/Glue TABLE identifier (004.1 S5's own naming table names ONE
+  # slug function for both the ARN/exec-path use above AND the literal
+  # `<slug>__raw` table-name row -- an erratum against that table, per
+  # `naming.table_slug`'s own docstring: `local.slug`'s "--"-joined form is
+  # actively dangerous as an UNQUOTED Iceberg/Spark-SQL identifier, since
+  # "--" opens a line comment there, silently truncating everything after
+  # it). The only deployed pipeline (`envs/dev/main.tf`'s
+  # `local.identity_pipeline = "pipelines/identity"`) is multi-segment, so
+  # this is not a theoretical gap: `local.slug` would have produced
+  # `pipelines--identity__raw` etc. -- a table name the runner
+  # (`core/naming.py`, whose own `raw_table`/`fact_table`/... fields the
+  # deployed spec authors as bare `identity__raw` etc.) never resolves,
+  # an unconditional first-deploy AccessDenied. `tests/unit/
+  # test_pipeline_table_grants_wiring.py` asserts this local's derivation
+  # agrees with `naming.table_slug` for both a multi- and single-segment
+  # probe.
+  table_slug = element(split("/", var.pipeline), length(split("/", var.pipeline)) - 1)
 
   # S5: "State machine | ${p}-spine-<slug>"; "Glue job | ${p}-spine-<slug>"
   # -- the SAME name for both resources (different resource types, no
@@ -117,12 +141,32 @@ locals {
 
   # S5: "Data tables ... tables <slug>__raw, <slug>__quarantine,
   # <slug>__facts, <slug>__state" -- all four, in the lake db, PER-TABLE
-  # ARNs only (I-21/S-5: "never database-wide").
+  # ARNs only (I-21/S-5: "never database-wide"). Plus `<slug>__markers`
+  # (007.1 S6.3/S6.5, `core/naming.py::markers_table`) -- the fifth,
+  # DERIVED (never authored) per-pipeline table: the commit/bind marker
+  # table `effects/spark.py::_require_marker_table`/`append_marker_row`/
+  # `read_marker_completions`/`read_marker_presence` and
+  # `entrypoints/glue_main.py::_committed_tables` all read or write.
+  # Critique finding N1 (gate wf_a0ef7f3b-6aa, bead conveyer-swb.28,
+  # MAJOR): this table had NO Glue-catalog grant at all -- 007.1 S6.3's
+  # "own-slug prefix => zero new IAM objects" claim was false against this
+  # module (pre-existing, predates this bead's own changes; the S6.3 text
+  # itself is erratum'd separately, not edited here). `spine/tests/unit/
+  # test_pipeline_table_grants_wiring.py` derives the expected DERIVED
+  # suffix directly from `core.naming.markers_table` (never hardcodes the
+  # literal "__markers" string) and fails CI if a future naming.py-derived
+  # table suffix is ever added here without a matching Terraform grant.
+  #
+  # F-1 fix: uses `local.table_slug` (the TABLE-NAME slug), NOT `local.
+  # slug` -- see `local.table_slug`'s own comment above. "<slug>" in S5's
+  # literal text is THIS derivation for a table-name row, not the ARN/
+  # exec-path one.
   pipeline_table_names = [
-    "${local.slug}__raw",
-    "${local.slug}__quarantine",
-    "${local.slug}__facts",
-    "${local.slug}__state",
+    "${local.table_slug}__raw",
+    "${local.table_slug}__quarantine",
+    "${local.table_slug}__facts",
+    "${local.table_slug}__state",
+    "${local.table_slug}__markers",
   ]
   pipeline_table_arns = [
     for t in local.pipeline_table_names :

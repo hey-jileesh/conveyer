@@ -67,8 +67,9 @@ any pipeline's spec — no I-23 self-scoping here: bootstrap runs as the
 *deploy principal* naming any pipeline's spec by hand, never the job role
 reading only its own, §4.5), `--catalog` (default `spine_cat`), `--env`
 (required — carried into the Spark app name for log correlation, same
-shape as `glue_main._build_session`'s `appName(f"conveyer-spine-
-{config.env}")`). Deliberately NOT the full `RunnerConfig`/`from_args`
+shape as `entrypoints/session.py::build_session`'s `app_name` kwarg
+(`glue_main.py`'s own call site: `f"conveyer-spine-{config.env}"`)).
+Deliberately NOT the full `RunnerConfig`/`from_args`
 argv contract `create_run_ledger.py` uses (that module's own docstring
 records the resulting "recorded gap" of an under-specified one-shot
 invocation) — this bootstrap needs only these three values, so it parses
@@ -114,10 +115,13 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-import yaml  # type: ignore[import-untyped]
-
 from spine import observability
-from spine.core.model import FRAMEWORK_RAW_COLUMNS, PipelineSpecModel, RawContractModel
+from spine.core.model import (
+    FRAMEWORK_RAW_COLUMNS,
+    PipelineSpecModel,
+    RawContractModel,
+    parse_pipeline_spec_yaml,
+)
 
 if TYPE_CHECKING:
     from pyspark.sql import SparkSession
@@ -141,24 +145,47 @@ def render_column_def(col: ColumnDDL) -> str:
 
 
 def render_create_table_sql(
-    qualified_table: str, columns: tuple[ColumnDDL, ...], *, partition_by: tuple[str, ...]
+    qualified_table: str,
+    columns: tuple[ColumnDDL, ...],
+    *,
+    partition_by: tuple[str, ...],
+    table_class: str,
 ) -> str:
     """Iceberg v2, `partition_by` columns as plain `PARTITIONED BY (...)`
     references — Spark/Iceberg treats a bare column reference as an
     `identity(...)` transform (A-8; empirically verified this bead: the
     resulting table's `DESCRIBE TABLE EXTENDED` partition struct names the
-    column directly, no transform wrapper)."""
+    column directly, no transform wrapper). `table_class` stamps
+    `conveyer.table-class` at CREATE (006.1 §16.3 item 5 -- the
+    provisioning-time class marker C4/F-10 read at bind, §5.2/007.1 F-10:
+    provenance, never protection)."""
     cols_sql = ", ".join(render_column_def(c) for c in columns)
     partition_sql = f" PARTITIONED BY ({', '.join(partition_by)})" if partition_by else ""
     return (
         f"CREATE TABLE {qualified_table} ({cols_sql}) USING iceberg{partition_sql} "
-        "TBLPROPERTIES ('format-version'='2')"
+        f"TBLPROPERTIES ('format-version'='2', 'conveyer.table-class'='{table_class}')"
     )
 
 
 def render_add_columns_sql(qualified_table: str, columns: tuple[ColumnDDL, ...]) -> str:
     cols_sql = ", ".join(render_column_def(c) for c in columns)
     return f"ALTER TABLE {qualified_table} ADD COLUMNS ({cols_sql})"
+
+
+def render_set_table_class_sql(qualified_table: str, table_class: str) -> str:
+    """Idempotent re-stamp for a table that ALREADY exists (§4.4's
+    "present" branch, both raw and quarantine) -- `ALTER TABLE ... SET
+    TBLPROPERTIES` is metadata-only (verified this bead: never bumps the
+    table's snapshot log, `A-14`'s own no-op-DDL invariant stays intact)
+    and safe to re-run unconditionally, which is also this bead's DEV
+    BACKFILL RUNBOOK for a table provisioned before this stamping landed:
+    re-running `bootstrap-admission` against an already-deployed pipeline's
+    raw/quarantine tables backfills `conveyer.table-class` with no separate
+    script or manual `ALTER TABLE` -- the same idempotent call every other
+    redeploy already makes."""
+    return (
+        f"ALTER TABLE {qualified_table} SET TBLPROPERTIES ('conveyer.table-class'='{table_class}')"
+    )
 
 
 # --- §4.1 raw table -----------------------------------------------------------
@@ -201,7 +228,10 @@ def raw_columns_ordered(contract: RawContractModel) -> tuple[ColumnDDL, ...]:
 
 def render_raw_create_table_sql(qualified_table: str, contract: RawContractModel) -> str:
     return render_create_table_sql(
-        qualified_table, raw_columns_ordered(contract), partition_by=("batch_id",)
+        qualified_table,
+        raw_columns_ordered(contract),
+        partition_by=("batch_id",),
+        table_class="raw",
     )
 
 
@@ -275,10 +305,18 @@ def bootstrap_raw_table(
     """Idempotent (A-14): absent -> `CREATE TABLE` from `contract`; present
     -> diff, then EITHER apply the purely-additive `ADD COLUMNS` (missing
     declared columns only) OR raise, naming every non-additive finding —
-    never a partial apply alongside a loud failure in the same call."""
+    never a partial apply alongside a loud failure in the same call. The
+    "present" branch unconditionally re-stamps `conveyer.table-class` AFTER
+    the raise-guard (never on a non-additive diff, never before it) —
+    `render_set_table_class_sql`'s own docstring is this bead's dev backfill
+    runbook (006.1 §16.3 item 5)."""
     expected = raw_columns_ordered(contract)
     if not spark.catalog.tableExists(qualified_table):
-        spark.sql(render_create_table_sql(qualified_table, expected, partition_by=("batch_id",)))
+        spark.sql(
+            render_create_table_sql(
+                qualified_table, expected, partition_by=("batch_id",), table_class="raw"
+            )
+        )
         return
     actual = _actual_columns_by_name(spark, qualified_table)
     declared_names = frozenset(c.name for c in contract.columns)
@@ -291,6 +329,7 @@ def bootstrap_raw_table(
     if diff.missing_declared:
         to_add = tuple(c for c in expected if c.name in diff.missing_declared)
         spark.sql(render_add_columns_sql(qualified_table, to_add))
+    spark.sql(render_set_table_class_sql(qualified_table, "raw"))
 
 
 # --- §4.2 quarantine table (constant, pipeline-independent, D-7) -------------
@@ -315,7 +354,9 @@ QUARANTINE_COLUMNS: tuple[ColumnDDL, ...] = (
 
 
 def render_quarantine_create_table_sql(qualified_table: str) -> str:
-    return render_create_table_sql(qualified_table, QUARANTINE_COLUMNS, partition_by=("batch_id",))
+    return render_create_table_sql(
+        qualified_table, QUARANTINE_COLUMNS, partition_by=("batch_id",), table_class="quarantine"
+    )
 
 
 def _actual_columns_ordered(spark: SparkSession, qualified_table: str) -> tuple[ColumnDDL, ...]:
@@ -330,7 +371,11 @@ def bootstrap_quarantine_table(spark: SparkSession, qualified_table: str) -> Non
     `QUARANTINE_COLUMNS`; present -> assert EXACT equality (name, type,
     nullability, AND order) — no evolution path exists for this table, so
     ANY diff is a loud failure ("a framework upgrade forgot its own
-    migration note", §4.4)."""
+    migration note", §4.4). The "present" branch unconditionally re-stamps
+    `conveyer.table-class` AFTER the exact-equality assertion passes —
+    006.1 §16.3 item 5: the tag is table-property content, not part of the
+    column-level exact-schema comparison `QUARANTINE_COLUMNS` governs, so
+    this leaves that assertion untouched."""
     if not spark.catalog.tableExists(qualified_table):
         spark.sql(render_quarantine_create_table_sql(qualified_table))
         return
@@ -340,6 +385,7 @@ def bootstrap_quarantine_table(spark: SparkSession, qualified_table: str) -> Non
             f"quarantine table {qualified_table} schema drift (constant, versionless by "
             f"design, §4.2): expected {QUARANTINE_COLUMNS!r}, actual {actual!r}"
         )
+    spark.sql(render_set_table_class_sql(qualified_table, "quarantine"))
 
 
 # --- orchestration: both tables for one pipeline spec ------------------------
@@ -381,11 +427,16 @@ def _fetch_spec(uri: str) -> str:
 
 
 def _parse_spec(spec_text: str) -> PipelineSpecModel:
-    """`yaml.safe_load` (never the unsafe loader) + full pydantic parse —
-    the same parser `entrypoints/glue_main.py::_parse_spec` uses (this
-    bead's task framing: "the same `PipelineSpecModel` path as the
-    entrypoint — one parser")."""
-    return PipelineSpecModel(**yaml.safe_load(spec_text))
+    """`core.model.parse_pipeline_spec_yaml` — the same parser
+    `entrypoints/glue_main.py::_parse_spec` uses (this bead's task framing:
+    "the same `PipelineSpecModel` path as the entrypoint — one parser"; now
+    literally the same FUNCTION, `core/model.py`'s strict duplicate-key-
+    rejecting loader, 006.1 §4/S1 — both already depend on `core/model.py`
+    for `PipelineSpecModel` itself, so this adds no new import-graph
+    coupling between bootstrap and the entrypoint, unlike importing FROM
+    `entrypoints/glue_main.py` directly, which this module's own docstring
+    still avoids)."""
+    return parse_pipeline_spec_yaml(spec_text)
 
 
 def _catalog_conf(catalog: str) -> dict[str, str]:
@@ -393,8 +444,8 @@ def _catalog_conf(catalog: str) -> dict[str, str]:
     names only `--spec-uri`/`--catalog`/`--env`; `main()` is the real-AWS
     path, matching `create_run_ledger.main`'s own documented-untested
     shape). No `spark.jars.packages` — Glue 5.0 ships the Iceberg runtime
-    natively (I-1), the same reason `glue_main._catalog_conf` sets none;
-    the local Hadoop-catalog jar-download conf is test-substrate-only
+    natively (I-1), the same reason `entrypoints/session.py::catalog_conf`
+    sets none; the local Hadoop-catalog jar-download conf is test-substrate-only
     (`tests/conftest.py::_iceberg_conf`)."""
     return {
         "spark.sql.extensions": _ICEBERG_EXTENSIONS,
@@ -406,7 +457,7 @@ def _catalog_conf(catalog: str) -> dict[str, str]:
 def _build_session(env: str, catalog: str) -> SparkSession:
     from pyspark.sql import SparkSession  # local import -- keeps this module importable
 
-    # without a live JVM even being reachable (mirrors `glue_main._build_session`).
+    # without a live JVM even being reachable (mirrors `entrypoints/session.py::build_session`).
     builder = SparkSession.builder.appName(f"conveyer-spine-bootstrap-admission-{env}")
     for key, value in _catalog_conf(catalog).items():
         builder = builder.config(key, value)
